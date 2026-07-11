@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Thin launcher — the CLI itself is dist/cli.js (built from src/ by tsc).
+# Kept as a shim so `cast` lands on PATH the same way `rig` does, without
+# requiring a global npm install.
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+command -v node >/dev/null 2>&1 || {
+  printf 'cast: node (>=22.12) is required but was not found.\n' >&2
+  exit 1
+}
+
+if [ ! -f "$ROOT/dist/cli.js" ]; then
+  printf 'cast: %s/dist/cli.js is missing — run the installer, or `npm ci && npm run build` in %s\n' "$ROOT" "$ROOT" >&2
+  exit 1
+fi
+
+exec node "$ROOT/dist/cli.js" "$@"

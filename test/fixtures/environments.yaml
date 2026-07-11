@@ -1,0 +1,8 @@
+environments:
+  prod:
+    server: prod-box
+    s3_destination: s3-backups
+    forbidden_var_patterns: ["^ALLOW_"]
+  staging: { server: staging-vm }
+github_apps:
+  widget: my-github-app

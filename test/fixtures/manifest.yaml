@@ -1,0 +1,31 @@
+project: widget
+environments:
+  prod:
+    applications:
+      core-api:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: /apps/core }
+        port: 3000
+        healthcheck: /health
+        domains: ["https://api.example.com"]
+        env_template: core-api.prod.env.template
+    databases:
+      postgres:
+        type: postgresql
+        version: "17"
+        backup: { frequency: "0 3 * * *", retention: 7 }
+      redis:
+        type: redis
+    services:
+      metabase:
+        type: metabase
+        domains: ["https://metabase.example.com"]
+  staging:
+    applications:
+      core-api:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: /apps/core }
+        port: 3000
+        healthcheck: /health
+        domains: ["http://api.staging.example.com"]
+        env_template: core-api.staging.env.template

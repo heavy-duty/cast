@@ -21,6 +21,14 @@ are decrypted by shelling out to it). Re-run any time to upgrade. Unlike rig —
 which is pure bash so it can run on a bare box — cast runs on **your** machine:
 it is an API client, and a server should never install it.
 
+The installer symlinks `cast` into `~/.local/bin` (or `/usr/local/bin` as root)
+and, if that directory is not already on your `PATH`, appends it to your shell
+profile — `.zshrc`, `.bashrc`/`.bash_profile`, or `config.fish`, whichever your
+`$SHELL` reads — marked `# added by cast-install` and written only once. The
+shell you ran the installer from does not inherit it (a `curl | bash` pipeline
+is a subshell), so open a new shell or `source` the profile it names. Set
+`CAST_NO_MODIFY_PATH=1` to be left alone and wire `PATH` yourself.
+
 ## The two inputs
 
 cast joins a **manifest** (what to deploy) with **state** (where, and with what

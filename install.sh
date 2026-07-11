@@ -32,7 +32,11 @@ NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$NODE_MAJOR" -ge 22 ] || die "node >=22.12 is required (found $(node -v))."
 
 # age is what decrypts the state repo's secrets — apply/diff shell out to it.
-command -v age >/dev/null 2>&1 || warn "age not found — 'cast apply' will fail until it is installed."
+if ! command -v age >/dev/null 2>&1; then
+  warn "age not found — 'cast apply' and 'cast diff' will fail until it is installed."
+  warn "  Debian/Ubuntu: sudo apt install age | Arch: sudo pacman -S age"
+  warn "  Fedora: sudo dnf install age | macOS: brew install age"
+fi
 
 # --- temp workspace ----------------------------------------------------------
 TMPDIR="$(mktemp -d)"
@@ -74,13 +78,59 @@ mkdir -p "$BINDIR"
 ln -sf "$DEST/bin/cast" "$BINDIR/cast"
 log "linked $BINDIR/cast -> $DEST/bin/cast"
 
-# --- PATH check ----------------------------------------------------------------
-case ":$PATH:" in
-  *":$BINDIR:"*) : ;;
-  *)
-    warn "$BINDIR is not on your PATH."
-    warn "  add: export PATH=\"$BINDIR:\$PATH\""
-    ;;
-esac
+# --- wire $BINDIR onto PATH, durably -------------------------------------------
+# `curl | bash` runs in a subshell, so exporting PATH here would die with this
+# process. The only durable place is the user's shell profile — so append there,
+# once, marked. Opt out with CAST_NO_MODIFY_PATH=1 and wire it yourself.
+MARKER='# added by cast-install'
+
+on_path() {
+  case ":$PATH:" in
+    *":$1:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Which file a *login/interactive* shell of this flavour actually reads.
+profile_for_shell() {
+  case "${SHELL##*/}" in
+    zsh) printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+    bash)
+      # macOS terminals start login shells (.bash_profile); Linux does not.
+      if [ "$(uname -s)" = "Darwin" ]; then
+        printf '%s\n' "$HOME/.bash_profile"
+      else
+        printf '%s\n' "$HOME/.bashrc"
+      fi
+      ;;
+    fish) printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ;;
+    *) printf '%s\n' "$HOME/.profile" ;;
+  esac
+}
+
+path_line_for() {
+  case "$1" in
+    */config.fish) printf 'fish_add_path %s\n' "$BINDIR" ;;
+    *) printf 'export PATH="%s:$PATH"\n' "$BINDIR" ;;
+  esac
+}
+
+if on_path "$BINDIR"; then
+  : # already reachable — nothing to wire
+elif [ -n "${CAST_NO_MODIFY_PATH:-}" ]; then
+  warn "$BINDIR is not on your PATH (CAST_NO_MODIFY_PATH set — leaving your profile alone)."
+  warn "  add: $(path_line_for "$(profile_for_shell)")"
+else
+  PROFILE="$(profile_for_shell)"
+  if [ -f "$PROFILE" ] && grep -qF "$MARKER" "$PROFILE"; then
+    log "$PROFILE already puts $BINDIR on PATH — this shell just predates it."
+  else
+    mkdir -p "$(dirname "$PROFILE")"
+    { printf '\n%s\n' "$MARKER"; path_line_for "$PROFILE"; } >>"$PROFILE" \
+      || die "could not write $PROFILE — add this line yourself: $(path_line_for "$PROFILE")"
+    log "wired $BINDIR onto PATH in $PROFILE"
+  fi
+  log "this shell does not have it yet — open a new one, or: source $PROFILE"
+fi
 
 log "done — try: cast --help"

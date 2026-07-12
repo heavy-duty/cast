@@ -123,8 +123,13 @@ manifest. A product-side change must not be able to lower its own guard.
 ## Scripts
 
 Operational helpers, all argument-driven (`scripts/`): register a GitHub App with
-Coolify, dump the Coolify control-plane database age-encrypted to S3, restore a
-database backup into a target container.
+Coolify, restore a database backup into a target container.
+
+**They run where cast runs — off the box.** They drive the Coolify API, or reach a
+box over SSH; none of them expects to be executing *on* a server. Anything that
+belongs on a box, as root, under a scheduler is [rig](https://github.com/heavy-duty/rig)'s
+job, not cast's — including the nightly age-encrypted dump of the control-plane
+database, which is now `rig coolify backup install`.
 
 ## Development
 

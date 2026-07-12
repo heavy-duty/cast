@@ -8,6 +8,66 @@ was born in; the Coolify-source citations were verified against
 
 The command surface itself is in the README; this file is the behavior behind it.
 
+## Team scoping
+
+**A Coolify API token is scoped to exactly one team, and nothing below the team
+scopes it.** `User::createToken` overrides Sanctum's and stamps the session's
+team onto the token (`'team_id' => session('currentTeam')->id`); the API then
+resolves every request through it — `getResourceByUuid($uuid,
+getTeamIdFromToken())`, which walks `resource → environment → project →
+team_id`.
+
+The consequence that matters: **a wrong-team token does not error.**
+`getResourceByUuid` returns `null` on a team mismatch, and `null` is
+indistinguishable from *"this resource does not exist yet"* — which, to `apply`,
+is an invitation to **create** it. An apply run with a token minted under the
+wrong team would not fail loudly; it would provision a duplicate set of
+resources into the wrong team, against whatever server that team owns. That is
+why the team assert is a correctness guarantee and not a hardening nicety, and
+why it is **fail-closed**:
+
+- Every environment in `environments.yaml` **must** declare `team:` (`id`,
+  `name`, or both). A missing team is a schema error — an environment whose
+  token cannot be verified is exactly the failure the binding exists to prevent.
+- Every command that reaches a live Coolify (`apply`, `diff`, `server add`,
+  `smoke`) resolves `GET /teams/current` — the only endpoint that answers *"what
+  team does this token act as?"*, resolved from the token itself
+  (`TeamController@current_team` → `getTeamIdFromToken()`) — and compares it to
+  the binding **before its first read**, aborting on mismatch. Before the first
+  *read*, not merely the first write: a wrong-team `diff` reports "everything is
+  absent", which is the very lie an `apply` would then act on.
+- An unreadable or unauthorized answer aborts too. It is not "no team"; it is an
+  unknown answer to the one question cast must not guess at.
+
+**An Environment is not an auth boundary.** It has no `team_id` of its own (it
+belongs to a project) and no API path scopes by it — Coolify environments are an
+organizational construct. The team is the only boundary there is.
+
+**A server belongs to exactly one team.** There is no pivot table and — unlike
+`GithubApp` — no `is_system_wide` escape hatch; upstream confirms teams cannot
+share a server and defers it to v5 (coollabsio/coolify#1820, #3235). Registering
+a server under the wrong team is not fixable with a PATCH, which is why
+`server add` takes `--env` and inherits the same assert.
+
+**GitHub Apps, unlike servers, *can* be shared across teams** —
+`is_system_wide` is the supported mechanism, on both the read and write side:
+
+```php
+// GithubController@list_github_apps (backs GET /github-apps)
+$githubApps = GithubApp::where(function ($query) use ($teamId) {
+    $query->where('team_id', $teamId)
+        ->orWhere('is_system_wide', true);
+    // …
+```
+
+`POST /github-apps` validates and accepts `is_system_wide` (boolean), stamping
+`team_id` from the token. So **one App flagged system-wide is visible and usable
+from every team, and per-team App duplication is unnecessary.** Note the
+corollary for cast: because `GET /github-apps` deliberately includes other
+teams' system-wide Apps, **resolving a GitHub App by name is not a proxy for
+being in the right team** — which is the second reason the team assert has to be
+explicit.
+
 **`dockercompose` build pack** (compose apps, box-B parity): a manifest
 application whose `build.pack` is `dockercompose` declares
 `build.compose_file` (path to the compose file in the checkout) and

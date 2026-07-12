@@ -47,8 +47,9 @@ infrastructure can be re-pointed at a new Coolify without touching a product.
 **2. A state directory** — private, yours:
 
 ```
-environments.yaml               # bindings: which server each env deploys onto, the S3
-                                #   destination, GitHub App name, smoke target, guards
+environments.yaml               # bindings: the team each env's token must belong to,
+                                #   which server it deploys onto, the S3 destination,
+                                #   GitHub App name, smoke target, guards
 secrets/<repo>.<env>.env.age    # age-encrypted values for the ${…} placeholders
 .coolify.env                    # COOLIFY_BASE_URL + COOLIFY_ACCESS_TOKEN (never commit)
 ```
@@ -60,8 +61,9 @@ Pass it with `--state <dir>`, or set `CAST_STATE`. Defaults to the cwd.
 ```sh
 cast apply <org>/<repo> --env <env> [--path <dir>] [--hostname-overlay <file>]
 cast diff  <org>/<repo> --env <env> [--full]
-cast server add <name> --ip <ip> --key <file> [--user root] [--port 22]
-cast smoke
+cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
+cast smoke --env <env>
+cast team [--env <env>]
 ```
 
 - **`apply`** — idempotent create-or-update of every manifest resource, then
@@ -76,6 +78,13 @@ cast smoke
   endpoint still *upserts* rather than replacing. Run it after every Coolify
   upgrade — `apply`'s never-delete guarantee rests on that behavior, and the
   published OpenAPI does not describe it accurately.
+- **`team`** — prints the team the configured token acts as. With `--env`, also
+  checks it against that environment's `team:` binding and exits non-zero on a
+  mismatch — the dry run for "would `apply` refuse?", answered without touching
+  anything.
+
+Every command that reaches a live Coolify takes an `--env`, because every one of
+them first asserts the token's team (below).
 
 `--hostname-overlay` swaps domains for a pre-flight run against temporary
 hostnames; re-applying **without** it is the cutover.
@@ -102,6 +111,41 @@ password manager and pass it per apply.
 The state directory holds ciphertext. It must never hold the identity that opens
 it.
 
+## Teams: the one assert cast makes before it touches anything
+
+Coolify API tokens are **team-scoped**, and a token pointed at another team's
+resources **does not error**. The API resolves what the token cannot see to
+`null` — and to a tool like cast, `null` is indistinguishable from *"this
+resource does not exist yet"*, which is an invitation to create it. An `apply`
+run with a wrong-team token would not fail; it would silently provision a
+**duplicate set of resources into the wrong team**, on whatever server that team
+owns. Silent, mutating, discovered late.
+
+So every environment declares the team its token must belong to, and cast
+refuses to do anything at all until it has checked:
+
+```yaml
+environments:
+  prod:
+    server: prod-box
+    team: { id: 1, name: heavy-duty }
+```
+
+Give `id`, `name`, or both — both are compared when both are given. `id` is the
+true identity (names can be renamed); `name` is what makes the file readable.
+Run `cast team` to print the values for the token you currently have configured.
+
+The check is **fail-closed**: an environment with no `team:` is one whose token
+cannot be verified, so it is a schema error, not a warning. It runs before the
+first *read*, not merely before the first write — an unasserted `diff` against
+the wrong team would report "everything is absent", which is precisely the lie
+that an `apply` would then act on.
+
+Nothing below the team scopes a token. A Coolify environment has no team of its
+own (it hangs off a project) and no API path scopes by one: **Coolify
+environments are an organizational construct, not an auth boundary.** The team
+is the only boundary there is, so it is the one cast asserts.
+
 ## Guarding an environment
 
 An environment may refuse variables by name pattern:
@@ -110,6 +154,7 @@ An environment may refuse variables by name pattern:
 environments:
   prod:
     server: prod-box
+    team: { id: 1, name: heavy-duty }
     forbidden_var_patterns: ["^ALLOW_"]
 ```
 

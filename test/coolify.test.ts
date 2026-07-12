@@ -36,6 +36,23 @@ describe("CoolifyClient", () => {
     const c = new CoolifyClient("https://coolify.test", "tok", mockFetch({}));
     await expect(c.get("/projects")).rejects.toThrow(/GET \/projects → 404/);
   });
+  it("reads the token's team from /teams/current", async () => {
+    const c = new CoolifyClient(
+      "https://coolify.test",
+      "tok",
+      mockFetch({
+        "GET /api/v1/teams/current": {
+          id: 1,
+          name: "heavy-duty",
+          personal_team: false,
+        },
+      }),
+    );
+    await expect(c.currentTeam()).resolves.toEqual({
+      id: 1,
+      name: "heavy-duty",
+    });
+  });
   it("reads version as plain text, not JSON", async () => {
     const fetchImpl = vi.fn(
       async () => new Response("4.1.2", { status: 200 }),

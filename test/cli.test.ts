@@ -32,4 +32,26 @@ describe("infra cli", () => {
     expect(r.code).not.toBe(0);
     expect(r.output).toMatch(/usage: cast (apply|diff)/i);
   });
+  // Both of these reach a live Coolify and mutate — `server add` registers a
+  // server into the token's team (permanently: a server belongs to exactly one
+  // team), and `smoke` writes env vars onto a live app. Neither may run without
+  // an environment to assert the token's team against.
+  it("refuses server add without --env, exit non-zero", () => {
+    const r = runCli([
+      "server",
+      "add",
+      "prod-box",
+      "--ip",
+      "10.0.0.1",
+      "--key",
+      "/tmp/k",
+    ]);
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/--env/);
+  });
+  it("refuses smoke without --env, exit non-zero", () => {
+    const r = runCli(["smoke"]);
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/--env/);
+  });
 });

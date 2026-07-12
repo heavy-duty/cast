@@ -18,14 +18,21 @@ import { desiredFromManifest, resolveCheckout } from "./resolve.js";
 import { decryptSecrets, keyFileFor, secretsFileFor } from "./secrets.js";
 import { serverAdd } from "./server.js";
 import { smoke } from "./smoke.js";
+import { assertTeam, formatTeam } from "./team.js";
 
 const USAGE = `usage: cast apply <org>/<repo> --env <env> [--path <dir>] [--hostname-overlay <file>]
        cast diff  <org>/<repo> --env <env> [--full]
-       cast server add <name> --ip <ip> --key <file> [--user root] [--port 22]
-       cast smoke
+       cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
+       cast smoke --env <env>
+       cast team [--env <env>]
 
   --state <dir>   the state checkout holding environments.yaml, secrets/ and
-                  .coolify.env  (default: $CAST_STATE, else the cwd)`;
+                  .coolify.env  (default: $CAST_STATE, else the cwd)
+  --env <env>     the environment to act on. Every command that reaches a live
+                  Coolify takes one, because every one of them first asserts
+                  the token belongs to that environment's declared team.
+                  \`cast team\` alone (no --env) reports the token's team
+                  without needing a binding — use it to fill environments.yaml.`;
 
 // cast is stateless: every instance-scoped input is read from the state
 // directory it is pointed at, never from a location the tool itself knows.
@@ -248,6 +255,14 @@ async function main(): Promise<number> {
     }
     const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
     const client = new CoolifyClient(baseUrl, token);
+    // Fail-closed, before the first live read — not merely before the first
+    // write. A wrong-team token makes fetchLive come back empty (the API
+    // resolves what it cannot see to null), so an unasserted `diff` would
+    // cheerfully report "everything is absent" and an unasserted `apply`
+    // would then create all of it in the wrong team. The read is already
+    // the lie; gate it, not just the write.
+    const team = await assertTeam(client, binding.team, envName);
+    console.log(`team ${formatTeam(team)} ✓`);
     const mode = command === "apply" || values.full ? "full" : "structural";
     const live = await fetchLive(client, repoShort, envName);
     if (mode === "full") {
@@ -306,19 +321,34 @@ async function main(): Promise<number> {
       options: {
         ip: { type: "string" },
         key: { type: "string" },
+        env: { type: "string" },
         user: { type: "string" },
         port: { type: "string" },
         state: { type: "string" },
       },
     });
-    if (!positionals[0] || !values.ip || !values.key) {
+    // --env is required: a server is registered under the token's team and
+    // belongs to exactly one team forever (Coolify has no pivot and no
+    // is_system_wide escape hatch for servers). Registering it under the
+    // wrong team is not a mistake you fix with a PATCH — you delete and
+    // re-add. So it takes the same assert as every other command, against
+    // the team of the environment the server is being registered to serve.
+    if (!positionals[0] || !values.ip || !values.key || !values.env) {
       console.error(USAGE);
       return 2;
     }
-    const { baseUrl, token } = loadCoolifyEnv(
-      join(stateDirFrom(values.state), ".coolify.env"),
-    );
-    await serverAdd(new CoolifyClient(baseUrl, token), {
+    const stateDir = stateDirFrom(values.state);
+    const binding = loadBindings(join(stateDir, "environments.yaml"))
+      .environments[values.env];
+    if (!binding) {
+      console.error(`environment ${values.env} not in environments.yaml`);
+      return 2;
+    }
+    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
+    const client = new CoolifyClient(baseUrl, token);
+    const team = await assertTeam(client, binding.team, values.env);
+    console.log(`team ${formatTeam(team)} ✓`);
+    await serverAdd(client, {
       name: positionals[0],
       ip: values.ip,
       keyFile: values.key,
@@ -331,12 +361,27 @@ async function main(): Promise<number> {
     const { values } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: { state: { type: "string" } },
+      options: { state: { type: "string" }, env: { type: "string" } },
     });
+    // smoke writes: it POSTs two env vars onto the live smoke_target app and
+    // deletes them again. That is a mutation, so it takes the assert like any
+    // other. Without it, a wrong-team token that happened to own an app of
+    // the same name would have that app written to instead.
+    if (!values.env) {
+      console.error(USAGE);
+      return 2;
+    }
     const stateDir = stateDirFrom(values.state);
     const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
     const client = new CoolifyClient(baseUrl, token);
     const bindings = loadBindings(join(stateDir, "environments.yaml"));
+    const binding = bindings.environments[values.env];
+    if (!binding) {
+      console.error(`environment ${values.env} not in environments.yaml`);
+      return 2;
+    }
+    const team = await assertTeam(client, binding.team, values.env);
+    console.log(`team ${formatTeam(team)} ✓`);
     if (!bindings.smoke_target) {
       console.error(
         "environments.yaml: smoke_target (app name) required for smoke",
@@ -354,6 +399,33 @@ async function main(): Promise<number> {
       return 2;
     }
     await smoke(client, target.uuid);
+    return 0;
+  }
+  if (command === "team") {
+    const { values } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: { state: { type: "string" }, env: { type: "string" } },
+    });
+    const stateDir = stateDirFrom(values.state);
+    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
+    const client = new CoolifyClient(baseUrl, token);
+    // Read-only, and the one command that deliberately does NOT require a
+    // team binding: it is how you discover the values to write into
+    // environments.yaml in the first place. Asserting here would be circular.
+    // With --env it also checks the binding, which makes it the dry run for
+    // "will apply refuse?" — ask the question without touching anything.
+    const actual = await client.currentTeam();
+    console.log(`token's team: ${formatTeam(actual)}`);
+    if (!values.env) return 0;
+    const binding = loadBindings(join(stateDir, "environments.yaml"))
+      .environments[values.env];
+    if (!binding) {
+      console.error(`environment ${values.env} not in environments.yaml`);
+      return 2;
+    }
+    await assertTeam(client, binding.team, values.env);
+    console.log(`matches the team ${values.env} expects ✓`);
     return 0;
   }
   console.error(USAGE);

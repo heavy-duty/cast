@@ -1,5 +1,9 @@
 type Json = Record<string, unknown> | unknown[] | null;
 
+// The team a token acts as. Coolify's `Team` model carries more than this
+// (description, personal_team, timestamps); cast only ever needs identity.
+export type Team = { id: number; name: string };
+
 // Thrown by req/reqText on a non-2xx response. `status` lets callers narrow
 // handling (e.g. "treat 404 as absent, rethrow everything else") via
 // `instanceof HttpError` without parsing the message string; the message
@@ -62,6 +66,28 @@ export class CoolifyClient {
 
   async version(): Promise<string> {
     return this.reqText("GET", "/version");
+  }
+
+  // The team this TOKEN acts as — the question every mutation depends on
+  // (see team.ts for why). GET /teams/current resolves it from the token
+  // itself, not from a session: TeamController@current_team calls
+  // getTeamIdFromToken() and 404s if that team is gone
+  // (coollabsio/coolify v4.1.2). It is the only endpoint that answers it.
+  async currentTeam(): Promise<Team> {
+    const raw = (await this.get("/teams/current")) as Record<
+      string,
+      unknown
+    > | null;
+    const id = raw?.id;
+    const name = raw?.name;
+    // A shape we can't read is not "no team" — it's an unknown answer to the
+    // one question we must not guess at. Fail rather than degrade.
+    if (typeof id !== "number" || typeof name !== "string") {
+      throw new Error(
+        `GET /teams/current returned no usable team identity: ${JSON.stringify(raw)}`,
+      );
+    }
+    return { id, name };
   }
 
   private async resolve(

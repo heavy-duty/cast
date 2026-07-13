@@ -135,4 +135,64 @@ describe("loadBindings", () => {
     expect(b.environments.prod.forbidden_var_patterns).toEqual(["^ALLOW_"]);
     expect(b.environments.staging.forbidden_var_patterns).toBeUndefined();
   });
+  it("carries an environment's expected team through", () => {
+    const b = loadBindings(`${FIX}environments.yaml`);
+    expect(b.environments.prod.team).toEqual({ id: 1, name: "heavy-duty" });
+  });
+  // Fail-closed at the schema: an environment with no declared team is one
+  // whose token cannot be verified, and an unverifiable target is exactly the
+  // duplicate-into-the-wrong-team failure the binding exists to prevent.
+  it("rejects an environment with no team", () => {
+    expect(() =>
+      loadBindings(`${FIX}environments.yaml`, {
+        overrideText: `
+environments:
+  prod: { server: prod-box }
+github_apps: { widget: my-github-app }
+`,
+      }),
+    ).toThrow(/team/);
+  });
+  it("rejects a team that names neither id nor name", () => {
+    expect(() =>
+      loadBindings(`${FIX}environments.yaml`, {
+        overrideText: `
+environments:
+  prod: { server: prod-box, team: {} }
+github_apps: { widget: my-github-app }
+`,
+      }),
+    ).toThrow(/at least one of/);
+  });
+  // Coolify's Root Team is id 0 (app/Models/User.php @ v4.1.2) — the team a
+  // single-admin instance keeps everything in. Rejecting it would make the id
+  // check unusable on exactly the topology that most needs it.
+  it("accepts team id 0, the Root Team", () => {
+    const b = loadBindings(`${FIX}environments.yaml`, {
+      overrideText: `
+environments:
+  prod: { server: prod-box, team: { id: 0, name: Root Team } }
+github_apps: { widget: my-github-app }
+`,
+    });
+    expect(b.environments.prod.team).toEqual({ id: 0, name: "Root Team" });
+  });
+  it("accepts a team given by id alone, or by name alone", () => {
+    const byId = loadBindings(`${FIX}environments.yaml`, {
+      overrideText: `
+environments:
+  prod: { server: prod-box, team: { id: 2 } }
+github_apps: { widget: my-github-app }
+`,
+    });
+    expect(byId.environments.prod.team).toEqual({ id: 2 });
+    const byName = loadBindings(`${FIX}environments.yaml`, {
+      overrideText: `
+environments:
+  prod: { server: prod-box, team: { name: heavy-duty } }
+github_apps: { widget: my-github-app }
+`,
+    });
+    expect(byName.environments.prod.team).toEqual({ name: "heavy-duty" });
+  });
 });

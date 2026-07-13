@@ -1,8 +1,11 @@
 environments:
   prod:
     server: prod-box
+    team: { id: 1, name: heavy-duty }
     s3_destination: s3-backups
     forbidden_var_patterns: ["^ALLOW_"]
-  staging: { server: staging-vm }
+  staging:
+    server: staging-vm
+    team: { id: 1, name: heavy-duty }
 github_apps:
   widget: my-github-app

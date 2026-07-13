@@ -60,9 +60,10 @@ Pass it with `--state <dir>`, or set `CAST_STATE`. Defaults to the cwd.
 ## Commands
 
 ```sh
-cast apply   <org>/<repo> --env <env> [--path <dir>] [--hostname-overlay <file>]
-cast diff    <org>/<repo> --env <env> [--full]
-cast capture <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
+cast apply     <org>/<repo> --env <env> [--path <dir>] [--hostname-overlay <file>]
+cast diff      <org>/<repo> --env <env> [--full]
+cast capture   <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
+cast inventory <org>/<repo> --env <env>
 cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
 cast smoke --env <env>
 cast team [--env <env>]
@@ -75,6 +76,12 @@ cast team [--env <env>]
   default branch).
 - **`diff`** — reports drift, manifest → Coolify. Structural by default; `--full`
   also compares env vars. Exits non-zero when dirty, so CI can gate on it.
+- **`inventory`** — what is actually *on* a box, and how it lines up with the
+  manifest: resources and env var **keys** (never values), sorted into
+  on-both / manifest-only / box-only. Needs no store, no age key, and no
+  recipient — it runs *before* adoption, which is the point of it. A document,
+  read by a person; nothing here is consumed by `apply`. See *Adopting a
+  hand-built instance*.
 - **`capture`** — the adoption path: reads a hand-built instance's live env and
   writes the environment's age store from it. See *Adopting a hand-built
   instance* below.
@@ -155,8 +162,26 @@ assert. It is the most consequential input to any run, and the least visible.
 ## Adopting a hand-built instance
 
 cast is otherwise scoped to the steady state: manifest → Coolify, forever.
-`capture` is the one-way-in — it bootstraps an environment's age store from an
-instance that was built by hand, before any manifest existed.
+Adoption is the one way in, and it has two verbs and a fixed order:
+
+**`inventory` → you read it → a manifest PR → `capture` → `apply`**
+
+**Look before you adopt.** A box nobody declared does not use your vocabulary:
+its project is called whatever someone typed, its environment is Coolify's
+default (`production`, not `prod`), and its resources are named by whoever
+clicked *New Resource* that afternoon. `inventory` shows you both sides at once,
+so those differences arrive together, as a document — instead of one at a time,
+as refusals from a verb that is already halfway through a migration.
+
+```sh
+cast inventory heavy-duty/incubator --env prod --instance legacy \
+  --project Incubator --environment production
+```
+
+It never reads a value, needs no store and no key, and its output is **not**
+desired state. What you do with it is decide, resource by resource and key by
+key, what the manifest should *gain* and what is cruft that must not travel —
+and land that as a manifest PR. Only then:
 
 ```sh
 CAST_CAPTURE_ADMIN_EMAIL=me@example.com \
@@ -177,6 +202,32 @@ values off the instance, and classifies every name:
 
 Then it prints a plan of **names and provenance — never values** — and waits for
 you to type the environment's name.
+
+Before any of that, it checks that the resources the manifest names **exist**.
+An absent resource reads back exactly like one with no env vars set: every name
+it declares reports *missing*, and `--override` would then have you hand-carry
+values that are sitting right there under a different name — writing a perfectly
+valid store while the actual finding (the manifest and the box disagree about
+what this thing is called) is never discovered. So a resource that isn't there
+refuses, and names what is. `inventory` is how you reconcile it.
+
+### Three names that are not yours
+
+A hand-built box names things without asking you, at three levels, and cast takes
+each as a coordinate to *read* with — never as a reason to rename anything of
+yours:
+
+| flag | when |
+| --- | --- |
+| `--project <name>` | the project isn't named after the repo (`Incubator`, not `incubator`) |
+| `--environment <name>` | the environment isn't named after `--env` (Coolify's default is `production`, not `prod`) |
+| — | a resource isn't named after the manifest's → **refuses**; reconcile with `inventory` first |
+
+`--env` stays **ours**: it selects the manifest block, the `environments.yaml`
+binding, the age key, the store path. `--environment` is *theirs*, on the wire,
+and nothing else. Collapsing the two lets a box that is being deleted next week
+name the environment of the box that replaces it — `apply` creates the
+environment from that value, so it would be inherited permanently.
 
 The mapping is not mechanical, and that is the whole design. A `DATABASE_URL`
 copied off the source box points at the *source box's* Postgres: confidently

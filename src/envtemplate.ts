@@ -61,6 +61,17 @@ export function templateRefs(
   );
 }
 
+// Every env var key a template declares — refs and literals alike. `capture`
+// only cares about the ${...} refs (the secrets); `inventory` needs all of them,
+// because the question it answers is "what does the manifest put on this
+// resource, and what does the box actually have?", and a literal the manifest
+// sets (a feature flag, NODE_ENV) is just as much a difference as a secret.
+//
+// Same parser as everything else in this file — see parseTemplate.
+export function templateKeys(text: string): string[] {
+  return parseTemplate(text).map(({ key }) => key);
+}
+
 // An environment may forbid variables by name pattern, declared as
 // `environments.<env>.forbidden_var_patterns` in the state repo. The rule is
 // PRESENCE, not value: a forbidden var set to "false" still refuses the apply,

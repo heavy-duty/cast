@@ -6,9 +6,16 @@ import { parseArgs } from "node:util";
 import { parse as parseYaml } from "yaml";
 import { type Executor, applyHostnameOverlay, applyPlan } from "./apply.js";
 import { githubAppNameFor, loadBindings } from "./bindings.js";
-import { type LiveEnvs, classify, renderCapturePlan } from "./capture.js";
+import {
+  type LiveEnvs,
+  absentResources,
+  classify,
+  renderAbsentResources,
+  renderCapturePlan,
+} from "./capture.js";
 import {
   type CoolifyInstance,
+  DEFAULT_INSTANCE,
   assertWritable,
   formatInstance,
   loadInstance,
@@ -21,8 +28,10 @@ import {
   renderDiff,
 } from "./diff.js";
 import { assertEnvVarPolicy } from "./envtemplate.js";
+import { type LiveResource, reconcile, renderInventory } from "./inventory.js";
 import {
   desiredFromManifest,
+  manifestResources,
   requiredSecrets,
   resolveCheckout,
 } from "./resolve.js";
@@ -36,9 +45,10 @@ import { serverAdd } from "./server.js";
 import { smoke } from "./smoke.js";
 import { assertTeam, formatTeam } from "./team.js";
 
-const USAGE = `usage: cast apply   <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--hostname-overlay <file>]
-       cast diff    <org>/<repo> --env <env> [--full] [--project <name>]
-       cast capture <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--generated <NAME>] [--override <NAME>] [--force]
+const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--hostname-overlay <file>]
+       cast diff      <org>/<repo> --env <env> [--full] [--project <name>] [--environment <name>]
+       cast capture   <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--generated <NAME>] [--override <NAME>] [--force]
+       cast inventory <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>]
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
        cast smoke --env <env>
        cast team [--env <env>]
@@ -63,6 +73,13 @@ const USAGE = `usage: cast apply   <org>/<repo> --env <env> [--path <dir>] [--pr
                   whatever someone typed; \`diff\` refuses rather than reporting an
                   absent project as an empty one, and this is how you point it at
                   the real name.
+  --environment <name>
+                  the Coolify environment to act on, when it is not named after
+                  --env (the default). Same problem as --project, one level down:
+                  a box built by hand has whatever Coolify defaulted to, which is
+                  \`production\`, not \`prod\`. This changes ONLY the name on the
+                  wire — --env still selects the manifest block, the
+                  environments.yaml binding, the age key and the store path.
 
 capture (adopt a hand-built instance into the age secret store):
   --generated <NAME>   force NAME to the \`pending-coolify-generated\` placeholder,
@@ -311,7 +328,12 @@ export async function fetchLive(
 // exists next to it.
 export function renderAbsentTarget(
   lookup: Extract<LiveLookup, { found: false }>,
-  ctx: { orgRepo: string; overridden: boolean; verb?: string },
+  ctx: {
+    orgRepo: string;
+    overridden: boolean;
+    envOverridden?: boolean;
+    verb?: string;
+  },
 ): string {
   // `capture` takes the same position as `diff`, and for the same reason: it
   // is only ever a claim about something that already exists. Against an
@@ -321,6 +343,7 @@ export function renderAbsentTarget(
   const origin = ctx.overridden
     ? "--project"
     : `derived from the repo slug ${ctx.orgRepo}`;
+  const envOrigin = ctx.envOverridden ? "--environment" : "derived from --env";
   const head =
     lookup.missing === "project"
       ? [
@@ -332,10 +355,10 @@ export function renderAbsentTarget(
       : [
           `refusing to ${verb}: project "${lookup.project}" has no environment "${lookup.environment}"`,
           "",
-          `  looked for:  environment "${lookup.environment}" in project "${lookup.project}"`,
-          "  note:        cast names environments after --env, so a project built by",
-          "               hand in the Coolify UI may well use a different name for the",
-          "               same tier (Coolify's own default is `production`).",
+          `  looked for:  environment "${lookup.environment}" in project "${lookup.project}"  (${envOrigin})`,
+          "  note:        a project built by hand in the Coolify UI may well use a",
+          "               different name for the same tier — Coolify's own default is",
+          "               `production`, not `prod`.",
         ];
   return [
     ...head,
@@ -347,7 +370,12 @@ export function renderAbsentTarget(
     "",
     lookup.missing === "project"
       ? "Pass --project <name> if this instance names it differently."
-      : "Re-run with --env naming the environment as it exists here.",
+      : // NOT "rename your environment to match the box". The box does not get to
+        // name our environments: --env selects the manifest block, the binding, the
+        // age key and the store path, and a hand-built box being evicted next week
+        // must not decide any of them. --environment is the coordinate for reading
+        // it, and it changes nothing on our side of the line.
+        "Pass --environment <name> if this instance names it differently.",
   ].join("\n");
 }
 
@@ -439,6 +467,7 @@ async function main(): Promise<number> {
         path: { type: "string" },
         state: { type: "string" },
         project: { type: "string" },
+        environment: { type: "string" },
         instance: { type: "string" },
         "hostname-overlay": { type: "string" },
         full: { type: "boolean", default: false },
@@ -458,6 +487,14 @@ async function main(): Promise<number> {
     // whatever someone typed. --project overrides that one, and nothing else —
     // secrets stay keyed by the repo (a state-repo convention we own).
     const projectName = values.project ?? repoShort;
+    // Exactly the same split, one level down. `--env` is OUR name for the
+    // environment: it selects the manifest block, the environments.yaml
+    // binding, the age key, the store path, the team to assert. `--environment`
+    // is THEIR name for it on the wire, and nothing else. Collapsing the two
+    // (as cast did until now) means a box built by hand in someone's UI gets to
+    // name our environment — and since apply creates the environment from this
+    // value, a legacy box's accident would be inherited by the new one forever.
+    const coolifyEnv = values.environment ?? envName;
     const checkout = resolveCheckout(orgRepo, {
       env: envName,
       path: values.path,
@@ -499,7 +536,7 @@ async function main(): Promise<number> {
     const team = await assertTeam(client, binding.team, envName);
     console.log(`team ${formatTeam(team)} ✓`);
     const mode = command === "apply" || values.full ? "full" : "structural";
-    const lookup = await fetchLive(client, projectName, envName);
+    const lookup = await fetchLive(client, projectName, coolifyEnv);
     // apply and diff take opposite (and both correct) positions on absence:
     // apply is *allowed* to be the thing that brings a project into existence,
     // so [] is a legitimate starting point. diff is only ever a claim about
@@ -511,6 +548,7 @@ async function main(): Promise<number> {
         renderAbsentTarget(lookup, {
           orgRepo,
           overridden: values.project !== undefined,
+          envOverridden: values.environment !== undefined,
         }),
       );
       return 2;
@@ -530,7 +568,10 @@ async function main(): Promise<number> {
     );
     const exec = buildExecutor(client, {
       projectName,
-      envName,
+      // The name the environment gets ON COOLIFY when apply creates it — so an
+      // apply that adopts an existing hand-named environment writes into that
+      // one, rather than creating a second environment beside it.
+      envName: coolifyEnv,
       serverUuid,
       githubAppUuid,
       s3DestinationUuid: binding.s3_destination,
@@ -553,6 +594,7 @@ async function main(): Promise<number> {
         state: { type: "string" },
         path: { type: "string" },
         project: { type: "string" },
+        environment: { type: "string" },
         instance: { type: "string" },
         generated: { type: "string", multiple: true },
         override: { type: "string", multiple: true },
@@ -568,6 +610,11 @@ async function main(): Promise<number> {
     const stateDir = stateDirFrom(values.state);
     const repoShort = orgRepo.split("/")[1];
     const projectName = values.project ?? repoShort;
+    // Their name for the environment, on the wire. The store below stays keyed
+    // by OUR name (--env) — capture is the verb most likely to be pointed at a
+    // hand-built box, and the store it writes must not inherit that box's
+    // vocabulary.
+    const coolifyEnv = values.environment ?? envName;
     const store = secretsFileFor(stateDir, repoShort, envName);
     // Never overwrite a store by accident. `apply` never deletes; the verb
     // that WRITES the store gets the same disposition, because the thing it
@@ -623,22 +670,43 @@ async function main(): Promise<number> {
     // as "every secret is missing" against a box that is fine.
     const team = await assertTeam(client, binding.team, envName);
     console.log(`team ${formatTeam(team)} ✓`);
-    const lookup = await fetchLive(client, projectName, envName);
+    const lookup = await fetchLive(client, projectName, coolifyEnv);
     if (!lookup.found) {
       console.error(
         renderAbsentTarget(lookup, {
           orgRepo,
           overridden: values.project !== undefined,
+          envOverridden: values.environment !== undefined,
           verb: "capture",
         }),
       );
       return 2;
     }
+    // Databases hold no manifest-templated env of their own — their URL is what
+    // the APPS reference, and that name is generated, not captured.
+    const envBearing = lookup.live.filter((l) => l.kind !== "database");
+    // Before reading a single env: does every resource the manifest requires a
+    // secret FROM actually exist here? An absent resource reads back exactly
+    // like one with no env vars set — every name it declares reports MISSING —
+    // and the suggested remedy for MISSING (--override) would then have the
+    // operator hand-carry values that are sitting right there under a different
+    // name, burying the real finding. Same lie as the absent project, one level
+    // deeper. See absentResources.
+    const absent = absentResources(
+      required,
+      envBearing.map((l) => l.name),
+    );
+    if (absent.length > 0) {
+      console.error(
+        renderAbsentResources(absent, lookup.live, {
+          project: projectName,
+          environment: coolifyEnv,
+        }),
+      );
+      return 2;
+    }
     const liveEnvs: LiveEnvs = {};
-    for (const l of lookup.live) {
-      // Databases hold no manifest-templated env of their own — their URL is
-      // what the APPS reference, and that name is generated, not captured.
-      if (l.kind === "database") continue;
+    for (const l of envBearing) {
       liveEnvs[l.name] = await fetchEnv(client, l);
     }
     const classification = classify(
@@ -675,6 +743,81 @@ async function main(): Promise<number> {
     console.log(
       `wrote ${store} — ${classification.plan.length} name(s), encrypted to ${recipient}`,
     );
+    return 0;
+  }
+  if (command === "inventory") {
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: {
+        env: { type: "string" },
+        state: { type: "string" },
+        path: { type: "string" },
+        project: { type: "string" },
+        environment: { type: "string" },
+        instance: { type: "string" },
+      },
+    });
+    const orgRepo = positionals[0];
+    const envName = values.env;
+    if (!orgRepo || !envName) {
+      console.error(USAGE);
+      return 2;
+    }
+    const stateDir = stateDirFrom(values.state);
+    const repoShort = orgRepo.split("/")[1];
+    const projectName = values.project ?? repoShort;
+    const coolifyEnv = values.environment ?? envName;
+    const bindings = loadBindings(join(stateDir, "environments.yaml"));
+    const binding = bindings.environments[envName];
+    if (!binding) {
+      console.error(`environment ${envName} not in environments.yaml`);
+      return 2;
+    }
+    // Deliberately NOT resolveCheckout's prod ban, no secrets, no age key, no
+    // age_recipient: inventory runs BEFORE any store exists — that is the whole
+    // point of it — and it reads nothing it could leak. A read token is enough.
+    const checkout = resolveCheckout(orgRepo, {
+      env: envName,
+      path: values.path,
+    });
+    const manifest = manifestResources(checkout, envName);
+    const { client } = openCoolify(stateDir, values.instance, binding);
+    // Read-only instances are exactly what this verb is for. It still takes the
+    // team assert: a wrong-team token reads back nothing, and "nothing" would
+    // render here as "the box is empty" — the same lie, dressed as a report.
+    const team = await assertTeam(client, binding.team, envName);
+    console.log(`team ${formatTeam(team)} ✓`);
+    const lookup = await fetchLive(client, projectName, coolifyEnv);
+    if (!lookup.found) {
+      console.error(
+        renderAbsentTarget(lookup, {
+          orgRepo,
+          overridden: values.project !== undefined,
+          envOverridden: values.environment !== undefined,
+          verb: "inventory",
+        }),
+      );
+      return 2;
+    }
+    const live: LiveResource[] = [];
+    for (const l of lookup.live) {
+      // Keys, never values — see renderInventory. Databases carry no env of
+      // their own worth reconciling (their URL is what the apps reference).
+      const envKeys =
+        l.kind === "database" ? [] : Object.keys(await fetchEnv(client, l));
+      live.push({ kind: l.kind, name: l.name, envKeys });
+    }
+    console.log(
+      renderInventory(reconcile(manifest, live), {
+        orgRepo,
+        env: envName,
+        instance: values.instance ?? binding.instance ?? DEFAULT_INSTANCE,
+        project: projectName,
+        environment: coolifyEnv,
+      }),
+    );
+    // Always 0: this is a report, not a gate. `diff` is the gate.
     return 0;
   }
   if (command === "server" && rest[0] === "add") {

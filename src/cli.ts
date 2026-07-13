@@ -32,6 +32,17 @@ import {
   computeDiff,
   renderDiff,
 } from "./diff.js";
+import {
+  type DraftProject,
+  assertEmptyTarget,
+  draftResourcesFrom,
+  emitDraft,
+  planDraft,
+  renderAmbiguousEnvironments,
+  renderDraftPlan,
+  renderNoRecipient,
+  renderRepoWithDraft,
+} from "./draft.js";
 import { assertEnvVarPolicy } from "./envtemplate.js";
 import {
   type LiveResource,
@@ -62,6 +73,7 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
        cast capture   <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--generated <NAME>] [--override <NAME>] [--force]
        cast inventory <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--resource <m>=<l>]
        cast inventory --env <env> [--instance <name>]     # no repo: SWEEP the whole instance
+       cast inventory --env <env> --emit-draft <dir> [--recipient age1…] [--no-secrets]
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
        cast smoke [<org>/<repo>] --env <env>
        cast team [--env <env>]
@@ -107,7 +119,27 @@ capture (adopt a hand-built instance into the age secret store):
   --override <NAME>    supply NAME yourself instead of copying the source's value.
                        The VALUE is read from \$CAST_CAPTURE_<NAME>, never from the
                        command line — argv is visible in \`ps\`. Repeatable.
-  --force              overwrite an existing store (refused by default).`;
+  --force              overwrite an existing store (refused by default).
+
+inventory --emit-draft (write down what a box has, as a PROPOSAL):
+  --emit-draft <dir>   emit what the sweep saw as a draft of cast's own inputs — a
+                       manifest per project, env templates, an environments.yaml
+                       carrying the \`projects:\` registry, an age store per project,
+                       and UNCAPTURED.md. Into a NEW directory, always: a draft is a
+                       proposal, reviewed by a human and landed as a PR, and \`apply\`
+                       never reads one. SWEEP MODE ONLY — with a repo there is already
+                       a manifest, and a manifest regenerated from a live box would
+                       overwrite a reviewed spec with that box's accumulated cruft.
+  --recipient age1…    the age recipient the draft's stores are encrypted to. Defaults
+                       to the environment's \`age_recipient\` binding.
+  --no-secrets         emit no stores. Required when no recipient is available: cast
+                       will not silently drop the values it read off the box.
+  --environment <name> a TIEBREAK, not a filter: which environment to draft for a
+                       project that has resources in more than one (cast refuses to
+                       pick). A project with only one populated environment is drafted
+                       from it either way — filtering the instance by an environment
+                       name would drop whole projects out of a blueprint that claims to
+                       describe the box.`;
 
 // cast is stateless: every instance-scoped input is read from the state
 // directory it is pointed at, never from a location the tool itself knows.
@@ -479,7 +511,7 @@ export function aliasLive<T extends { name: string }>(
 // capture.
 async function fetchEnv(
   client: CoolifyClient,
-  l: Live,
+  l: Pick<Live, "kind" | "uuid">,
 ): Promise<Record<string, string>> {
   const base = l.kind === "database" ? "databases" : `${l.kind}s`;
   const envs = (await client.get(`/${base}/${l.uuid}/envs`).catch((err) => {
@@ -887,12 +919,26 @@ async function main(): Promise<number> {
         environment: { type: "string" },
         resource: { type: "string", multiple: true },
         instance: { type: "string" },
+        "emit-draft": { type: "string" },
+        recipient: { type: "string" },
+        "no-secrets": { type: "boolean", default: false },
       },
     });
     const orgRepo = positionals[0];
     const envName = values.env;
     if (!envName) {
       console.error(USAGE);
+      return 2;
+    }
+    const draftDir = values["emit-draft"];
+    // A draft is emitted from the SWEEP, and only from the sweep. With a repo,
+    // inventory is reconciling against a manifest that already exists — which is
+    // exactly the case where a draft must not be written: for a declared project
+    // the manifest IS the truth, and one regenerated from a live box would let
+    // that box's accumulated cruft overwrite the reviewed spec. Adoption is
+    // one-way, so the two flags cannot be combined at all.
+    if (draftDir && orgRepo) {
+      console.error(renderRepoWithDraft(orgRepo, draftDir));
       return 2;
     }
     const stateDir = stateDirFrom(values.state);
@@ -908,6 +954,28 @@ async function main(): Promise<number> {
     // made inventory a discovery verb that needed you to have already
     // discovered.
     if (!orgRepo) {
+      // Both refusals BEFORE the first live call. A draft that is going to be
+      // refused should be refused before an operator watches a whole instance be
+      // swept for it — and, more to the point, before cast reads every env var on
+      // a box it is then not going to write down.
+      const recipient = values.recipient ?? sweepBinding.age_recipient;
+      if (draftDir) {
+        try {
+          assertEmptyTarget(draftDir);
+        } catch (err) {
+          console.error(err instanceof Error ? err.message : String(err));
+          return 2;
+        }
+        // No recipient, no store — and cast will not make that decision quietly.
+        // Silently skipping the secrets would emit a draft that LOOKS complete: a
+        // manifest, templates full of ${REF}s, and nothing anywhere holding a
+        // single value. You would find out when `apply` refused, having already
+        // deleted the box the values were on.
+        if (!recipient && !values["no-secrets"]) {
+          console.error(renderNoRecipient(envName));
+          return 2;
+        }
+      }
       const { instance, client } = openCoolify(
         stateDir,
         values.instance,
@@ -918,8 +986,9 @@ async function main(): Promise<number> {
       // truthfully reports that it is empty.
       const team = await assertTeam(client, sweepBinding.team, envName);
       console.log(`team ${formatTeam(team)} ✓`);
+      const live = await client.projects();
       const projects: SweepProject[] = [];
-      for (const p of await client.projects()) {
+      for (const p of live) {
         const environments: SweepEnvironment[] = [];
         for (const name of await client.environments(p.uuid)) {
           const found = await fetchLive(client, p.name, name);
@@ -936,6 +1005,122 @@ async function main(): Promise<number> {
         renderSweep(projects, {
           instance: instance.name,
           baseUrl: instance.baseUrl,
+        }),
+      );
+      if (!draftDir) return 0;
+
+      // --- The draft (#27) ---
+      //
+      // The sweep above is a DOCUMENT. This is the same reading, written into the
+      // shape of cast's own inputs — and it is still a proposal, not desired
+      // state. See draft.ts for the boundary that lets this verb exist at all.
+      //
+      // A project with resources in TWO environments cannot be drafted without
+      // picking one, and cast does not pick: a blueprint of half a box, silently
+      // chosen, is the failure mode this whole issue is about. --environment says
+      // which.
+      //
+      // --environment is a TIEBREAK here, not a filter. A project with resources
+      // in exactly one environment has no tie to break, and is drafted from it
+      // whatever the flag says — filtering the instance by an environment NAME
+      // would drop the projects that most need drafting (the third-party sites,
+      // each sitting in its own Coolify-default `production`) out of a blueprint
+      // that claims to describe the box.
+      const populatedIn = (p: SweepProject) =>
+        p.environments.filter((e) => e.resources.length > 0);
+      const pick = (p: SweepProject) => {
+        const populated = populatedIn(p);
+        return populated.length === 1
+          ? populated[0]
+          : populated.find((e) => e.name === values.environment);
+      };
+      const ambiguous = projects.filter(
+        (p) => populatedIn(p).length > 1 && !pick(p),
+      );
+      if (ambiguous.length > 0) {
+        console.error(
+          renderAmbiguousEnvironments(
+            ambiguous.map((p) => ({
+              name: p.name,
+              environments: populatedIn(p).map(
+                (e) => `${e.name} (${e.resources.length})`,
+              ),
+            })),
+            envName,
+          ),
+        );
+        return 2;
+      }
+      const draftProjects: DraftProject[] = [];
+      for (const p of live) {
+        const swept = projects.find((s) => s.name === p.name);
+        const populated = swept ? populatedIn(swept) : [];
+        const chosen = swept ? pick(swept) : undefined;
+        const others = populated
+          .filter((e) => e.name !== chosen?.name)
+          .map((e) => ({ name: e.name, resources: e.resources.length }));
+        if (!chosen) {
+          // Not drafted — and SAID, in UNCAPTURED.md, rather than left out of a
+          // blueprint that a reader would take for the whole box.
+          draftProjects.push({
+            name: p.name,
+            coolifyEnv: "(none)",
+            resources: [],
+            unreadable: [],
+            otherEnvironments: others,
+            skipReason: "every environment on it is empty",
+          });
+          continue;
+        }
+        // The RAW environment document, not fetchLive's projection: the uncaptured
+        // pass's whole job is to notice fields cast has no home for, and it cannot
+        // notice what a projection has already thrown away.
+        const raw = (await client.get(
+          `/projects/${p.uuid}/${chosen.name}`,
+        )) as Record<string, unknown> | null;
+        const { resources, unreadable } = draftResourcesFrom(raw ?? {});
+        for (const r of resources) {
+          // Databases hold no manifest-templated env of their own — their URL is
+          // what the APPS reference, and that name is generated, not captured.
+          if (r.kind === "database") continue;
+          r.env = await fetchEnv(client, { kind: r.kind, uuid: r.uuid });
+        }
+        draftProjects.push({
+          name: p.name,
+          coolifyEnv: chosen.name,
+          resources,
+          unreadable,
+          otherEnvironments: others,
+        });
+      }
+      // Which GitHub App clones a repo is NOT a property of any resource — no
+      // field Coolify returns about an application says so. What the instance can
+      // answer is which Apps exist; with exactly one, there is no other it could
+      // be. Best-effort: an instance that will not list them still gets a draft,
+      // with a REVIEW marker where the binding goes.
+      const githubApps = (await client.get("/github-apps").catch(() => [])) as
+        | Array<{ name?: unknown }>
+        | undefined;
+      const draftCtx = {
+        env: envName,
+        instance: instance.name,
+        baseUrl: instance.baseUrl,
+        team,
+        server: sweepBinding.server,
+        githubApps: (Array.isArray(githubApps) ? githubApps : [])
+          .map((a) => a?.name)
+          .filter((n): n is string => typeof n === "string"),
+        recipient,
+        generatedAt: new Date().toISOString(),
+      };
+      const storeRecipient = values["no-secrets"] ? undefined : recipient;
+      const plan = planDraft(draftProjects, draftCtx);
+      const written = emitDraft(draftDir, plan, { recipient: storeRecipient });
+      console.log(
+        renderDraftPlan(plan, draftCtx, {
+          dir: draftDir,
+          recipient: storeRecipient,
+          written,
         }),
       );
       return 0;

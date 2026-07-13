@@ -344,6 +344,111 @@ the plan. There is no `--yes`: a store written without someone reading the
 provenance column is the outcome the verb exists to prevent. A closed stdin
 aborts rather than hanging.
 
+## Drafts (`inventory --emit-draft`)
+
+`inventory` with no repo sweeps an instance. `--emit-draft <dir>` writes that
+sweep down as a draft of cast's **own inputs** — a manifest per project, env
+templates, an `environments.yaml` carrying the `projects:` registry, an age store
+per project, and `UNCAPTURED.md`.
+
+**A draft is a PROPOSAL. It is never desired state, and `apply` never reads it.**
+
+    sweep → emit draft → a human reads it → manifest PR → capture → apply
+
+Same shape as `terraform import` → HCL. Every other rule in this section follows
+from that one, and each is enforced rather than merely stated:
+
+| refusal | why |
+| --- | --- |
+| a **non-empty** target directory | emitted over a repo that has a manifest, a draft would overwrite a reviewed spec with a live box's accumulated cruft — the one direction nobody reviews. **Adoption is one-way.** |
+| an **existing manifest** at the path it would write | the same invariant, once more at the file (`assertNoExistingManifest`). For a declared project the manifest *is* the truth; `cast inventory <org>/<repo>` reconciles it instead. |
+| `--emit-draft` with a **repo positional** | with a repo, inventory reconciles against a manifest that already exists — exactly the case where a draft must not be written. |
+| **no age recipient** (and no `--no-secrets`) | a draft whose store was silently skipped *looks complete*: a manifest, templates full of `${REF}`s, and not one value anywhere. You would find out when `apply` refused, some time after the box those values were on stopped existing. |
+| a project with **two populated environments** | a draft carries one environment per project. Picking would emit a blueprint of *half a box* that says nothing about the other half. `--environment` breaks the tie — as a **tiebreak, not a filter**: a project with one populated environment is drafted from it either way, or filtering by name would drop whole projects (each client site sits alone in Coolify's default `production`) out of a blueprint that claims to describe the box. |
+
+**Provider-generated names are placeheld, never copied.** This is `capture`'s
+discipline (see above), applied to a verb that has no manifest to tell it which
+names are generated — so it decides **by name**, in two families:
+
+1. Coolify's per-instance magic vars — `SERVICE_FQDN_*`, `SERVICE_URL_*`,
+   `SERVICE_PASSWORD_*`, `SERVICE_USER_*`, `SERVICE_BASE64_*`.
+2. Any name carrying a **datastore** word (`DATABASE`, `DB`, `POSTGRES`, `PG`,
+   `REDIS`, `MONGO`, …) *and* a **connection** word (`URL`, `URI`, `DSN`, `HOST`,
+   `PORT`, `PASSWORD`, `USER`, …) as underscore-delimited segments —
+   `DATABASE_URL`, `UMAMI_DATABASE_URL`, `REDIS_URL_PROD`, `DB_HOST`.
+
+Each such name is written as the literal `pending-coolify-generated`, listed in
+the run's disposition table, and declared under the emitted manifest's
+`generated_secrets:` — so a later `capture` placeholds it again with no flag to
+remember. **Its live value is not written into any artifact.**
+
+The rule errs **wide**, deliberately, because the two errors are not symmetric:
+
+- over-match a real secret → it is placeheld, reported, and you put the value
+  back. Noisy, recoverable, **loud**.
+- under-match a generated one → it is copied, and a box rebuilt from the draft
+  comes up **working**, reading and writing the *source box's* database, until
+  the day that box is deleted. Silent, unrecoverable, **quiet**.
+
+It is a name-pattern rule, not a promise: a var that points at the source box
+under a name cast does not recognize **will** be copied. The disposition table
+(names and provenance, **never values** — same contract as the capture plan) is
+what a reviewer reads to catch it.
+
+**Every other live var becomes a `${REF}`**, with its value in the age store —
+never a template literal. cast cannot know which of a box's vars are secret
+(nobody wrote it down, which is why the verb exists), and the two mistakes are
+again asymmetric: a non-secret in an encrypted store is untidy, a live API key
+written as a literal into a manifest is a key in a git repo. One name carrying
+**different values** on two resources is not a conflict cast resolves (one store
+holds one value per name — see `capture`'s CONFLICT refusal): both are kept,
+under `<RESOURCE>_<KEY>` refs, and the split is reported.
+
+**`UNCAPTURED.md` is a first-class output, emitted on every run.** cast cannot
+express everything a Coolify holds, and a blueprint that omits those things
+without saying so is worse than no blueprint — in a disaster you would trust it
+and rebuild a *different box*. Per resource, it names what was seen and could not
+be written: `destination_id` (which Docker network — no destinations API in 4.1.2
+to resolve it to the UUID `destination_uuid:` wants, #21), service hostnames (no
+flat `domains` on a Coolify 4.1.2 service), Basic Auth / custom Traefik labels,
+build and deploy command overrides, backup schedules (not exposed on a database's
+GET — **a rebuild has no backups until you declare them**), database kinds cast
+does not model (MySQL, MariaDB, MongoDB, KeyDB, Dragonfly, ClickHouse — named,
+never silently dropped), env var names a cast template cannot express, and
+applications whose build pack the manifest has no vocabulary for (left *out* of
+the manifest rather than fabricated into the nearest pack).
+
+It also carries the table below, because that is the file someone will be reading
+at the worst possible moment.
+
+### What a blueprint still cannot restore
+
+| | |
+| --- | --- |
+| control plane | `rig coolify install` ✅ |
+| structure | draft → manifest PR → `apply` ✅ |
+| secret **values** | the age store + your key ✅ |
+| **data** | Coolify's DB backups → S3 ✅ (a separate path) |
+| **the GitHub App private key** | ❌ re-create by hand |
+| **S3 access keys** | ❌ re-mint by hand |
+
+The last two are not in the state repo — correctly, it holds no live credentials
+— and cannot be regenerated from it. A DR runbook that does not say so is not a
+runbook.
+
+**What the box cannot tell you, and cast therefore does not invent:** the
+`<org>/<repo>` slug comes from an application's git remote (the only place a live
+box knows it), so a project with **no application** — a lone service — has no repo
+on the box at all. cast writes the bare project name as the registry key, and the
+registry's own parse-time refusal (*"a registry key has no meaning without its
+org"*) then stops the file being used until a human supplies it. That refusal is
+the design: the alternatives are inventing an org, or leaving the project out of
+the registry — and a project missing from the registry is one every fleet run
+skips **in silence**. Likewise `github_apps`: nothing Coolify returns about an
+application says which App cloned it, so cast binds every repo to the instance's
+only GitHub App when there is exactly one (there is no other it could be), and
+writes a `REVIEW-…` marker when there is not.
+
 ## Cloning a private manifest
 
 `resolveCheckout` resolves git credentials **inside cast**, in a fixed order —

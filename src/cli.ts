@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { parse as parseYaml } from "yaml";
 import { type Executor, applyHostnameOverlay, applyPlan } from "./apply.js";
-import { loadBindings } from "./bindings.js";
+import { githubAppNameFor, loadBindings } from "./bindings.js";
 import { loadCoolifyEnv } from "./config.js";
 import { CoolifyClient, HttpError } from "./coolify.js";
 import {
@@ -20,8 +20,8 @@ import { serverAdd } from "./server.js";
 import { smoke } from "./smoke.js";
 import { assertTeam, formatTeam } from "./team.js";
 
-const USAGE = `usage: cast apply <org>/<repo> --env <env> [--path <dir>] [--hostname-overlay <file>]
-       cast diff  <org>/<repo> --env <env> [--full]
+const USAGE = `usage: cast apply <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--hostname-overlay <file>]
+       cast diff  <org>/<repo> --env <env> [--full] [--project <name>]
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
        cast smoke --env <env>
        cast team [--env <env>]
@@ -32,7 +32,13 @@ const USAGE = `usage: cast apply <org>/<repo> --env <env> [--path <dir>] [--host
                   Coolify takes one, because every one of them first asserts
                   the token belongs to that environment's declared team.
                   \`cast team\` alone (no --env) reports the token's team
-                  without needing a binding — use it to fill environments.yaml.`;
+                  without needing a binding — use it to fill environments.yaml.
+  --project <name>
+                  the Coolify project to act on, when it is not named after the
+                  repo (the default). A project built by hand in the UI is called
+                  whatever someone typed; \`diff\` refuses rather than reporting an
+                  absent project as an empty one, and this is how you point it at
+                  the real name.`;
 
 // cast is stateless: every instance-scoped input is read from the state
 // directory it is pointed at, never from a location the tool itself knows.
@@ -142,20 +148,53 @@ export function projectLiveFields(
   };
 }
 
-async function fetchLive(
+// The live side of a diff/apply is either "here are the resources" or "the
+// thing I was told to look at does not exist" — and those two must NOT collapse
+// into the same value.
+//
+// They used to: both returned []. That is right for `apply` (a first apply
+// legitimately creates the project and its environment) and quietly wrong for
+// `diff`, because computeDiff(desired, []) means "every desired resource is
+// missing" — rendered as a confident full-create plan. So a diff pointed at a
+// project name that does not exist reports a CLEAN-LOOKING plan that verified
+// nothing at all. Same shape of lie as the wrong-team token in team.ts: an
+// unverifiable read that answers "absent" and invites a create.
+//
+// Keeping the distinction in the type is what lets each caller take its own
+// (opposite, and both correct) position on absence.
+export type LiveLookup =
+  | { found: true; live: Live[] }
+  | {
+      found: false;
+      missing: "project";
+      project: string;
+      available: string[];
+    }
+  | {
+      found: false;
+      missing: "environment";
+      project: string;
+      environment: string;
+    };
+
+export async function fetchLive(
   client: CoolifyClient,
   projectName: string,
   envName: string,
-): Promise<Live[]> {
-  // List resources inside <projectName>/<envName>; tolerate a missing
-  // project (first apply creates it) or a missing environment (first apply
-  // into a project that doesn't have this environment yet) by returning [].
+): Promise<LiveLookup> {
   const projects = (await client.get("/projects")) as Array<{
     uuid: string;
     name: string;
   }>;
   const project = projects.find((p) => p.name === projectName);
-  if (!project) return [];
+  if (!project) {
+    return {
+      found: false,
+      missing: "project",
+      project: projectName,
+      available: projects.map((p) => p.name),
+    };
+  }
   // GET /projects/{uuid}/{environment_name_or_uuid} eager-loads exactly
   // these relations (app/Http/Controllers/Api/ProjectController.php
   // @environment_details, coollabsio/coolify v4.1.2): applications,
@@ -181,7 +220,14 @@ async function fetchLive(
     redis?: Array<Record<string, unknown>>;
     services?: Array<Record<string, unknown>>;
   } | null;
-  if (!env) return [];
+  if (!env) {
+    return {
+      found: false,
+      missing: "environment",
+      project: projectName,
+      environment: envName,
+    };
+  }
   const map = (
     kind: ResourceKind,
     items: Array<Record<string, unknown>> = [],
@@ -193,12 +239,56 @@ async function fetchLive(
       fields: projectLiveFields(kind, i),
       env: undefined, // populated per-resource below only in full mode by caller
     }));
+  return {
+    found: true,
+    live: [
+      ...map("application", env.applications),
+      ...map("database", env.postgresqls),
+      ...map("database", env.redis),
+      ...map("service", env.services),
+    ],
+  };
+}
+
+// Why `diff` refuses instead of reporting an empty live side: see LiveLookup.
+// The message has one job — make it impossible to read "absent" as "empty" —
+// so it names what was looked for, where the name came from, and what actually
+// exists next to it.
+export function renderAbsentTarget(
+  lookup: Extract<LiveLookup, { found: false }>,
+  ctx: { orgRepo: string; overridden: boolean },
+): string {
+  const origin = ctx.overridden
+    ? "--project"
+    : `derived from the repo slug ${ctx.orgRepo}`;
+  const head =
+    lookup.missing === "project"
+      ? [
+          `refusing to diff: no project named "${lookup.project}" exists in this team`,
+          "",
+          `  looked for:  project "${lookup.project}"  (${origin})`,
+          `  exists here: ${lookup.available.join(", ") || "(no projects at all)"}`,
+        ]
+      : [
+          `refusing to diff: project "${lookup.project}" has no environment "${lookup.environment}"`,
+          "",
+          `  looked for:  environment "${lookup.environment}" in project "${lookup.project}"`,
+          "  note:        cast names environments after --env, so a project built by",
+          "               hand in the Coolify UI may well use a different name for the",
+          "               same tier (Coolify's own default is `production`).",
+        ];
   return [
-    ...map("application", env.applications),
-    ...map("database", env.postgresqls),
-    ...map("database", env.redis),
-    ...map("service", env.services),
-  ];
+    ...head,
+    "",
+    "An absent target reads back exactly like an empty one, so continuing would diff",
+    'it as "nothing exists — create everything": a clean-looking report that verified',
+    "nothing. `apply` may create a target; `diff` may only ever describe one that is",
+    "already there.",
+    "",
+    lookup.missing === "project"
+      ? "Pass --project <name> if this instance names it differently."
+      : "Re-run with --env naming the environment as it exists here.",
+  ].join("\n");
 }
 
 async function main(): Promise<number> {
@@ -215,6 +305,7 @@ async function main(): Promise<number> {
         env: { type: "string" },
         path: { type: "string" },
         state: { type: "string" },
+        project: { type: "string" },
         "hostname-overlay": { type: "string" },
         full: { type: "boolean", default: false },
       },
@@ -227,6 +318,12 @@ async function main(): Promise<number> {
     }
     const stateDir = stateDirFrom(values.state);
     const repoShort = orgRepo.split("/")[1];
+    // The Coolify project name and the secrets-file key are different things
+    // that happen to default to the same string. Only the former is a name
+    // some other system chose: a project built by hand in the UI is called
+    // whatever someone typed. --project overrides that one, and nothing else —
+    // secrets stay keyed by the repo (a state-repo convention we own).
+    const projectName = values.project ?? repoShort;
     const checkout = resolveCheckout(orgRepo, {
       env: envName,
       path: values.path,
@@ -264,7 +361,23 @@ async function main(): Promise<number> {
     const team = await assertTeam(client, binding.team, envName);
     console.log(`team ${formatTeam(team)} ✓`);
     const mode = command === "apply" || values.full ? "full" : "structural";
-    const live = await fetchLive(client, repoShort, envName);
+    const lookup = await fetchLive(client, projectName, envName);
+    // apply and diff take opposite (and both correct) positions on absence:
+    // apply is *allowed* to be the thing that brings a project into existence,
+    // so [] is a legitimate starting point. diff is only ever a claim about
+    // something that already exists — for it, absence is not an empty diff, it
+    // is the absence of anything to diff against, and reporting a full-create
+    // plan would launder that into a pass. See LiveLookup.
+    if (!lookup.found && command === "diff") {
+      console.error(
+        renderAbsentTarget(lookup, {
+          orgRepo,
+          overridden: values.project !== undefined,
+        }),
+      );
+      return 2;
+    }
+    const live = lookup.found ? lookup.live : [];
     if (mode === "full") {
       for (const l of live) {
         const envs = (await client
@@ -296,10 +409,10 @@ async function main(): Promise<number> {
     if (command === "diff") return report.clean ? 0 : 1;
     const serverUuid = await client.serverUuid(binding.server);
     const githubAppUuid = await client.githubAppUuid(
-      bindings.github_apps[repoShort],
+      githubAppNameFor(bindings, orgRepo),
     );
     const exec = buildExecutor(client, {
-      projectName: repoShort,
+      projectName,
       envName,
       serverUuid,
       githubAppUuid,

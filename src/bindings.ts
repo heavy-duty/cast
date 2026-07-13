@@ -46,12 +46,48 @@ const BindingsSchema = z
         })
         .strict(),
     ),
+    // Keyed by the repo the App clones for. Prefer the FULL `<org>/<repo>`
+    // slug; a bare `<repo>` key still resolves (see githubAppNameFor) so
+    // existing state files keep working.
     github_apps: z.record(z.string()),
     smoke_target: z.string().optional(),
   })
   .strict();
 
 export type Bindings = z.infer<typeof BindingsSchema>;
+
+// Resolve the Coolify GitHub App name for a repo, full slug first.
+//
+// The short name alone is not a key: `<repo>` is only unique *within* an org,
+// so `heavy-duty/incubator` and `acme/incubator` collapse onto one entry and
+// whichever App is bound there gets used to clone BOTH — silently, because a
+// wrong-but-existing App resolves to a real uuid and the create succeeds. The
+// full slug is the thing that actually identifies a repo, so it wins.
+//
+// The bare-`<repo>` fallback is kept deliberately: it is what every state file
+// written before this used, and dropping it would break them for no gain. A
+// short key is unambiguous right up until a second org shows up, which is
+// precisely when the full-slug key it falls back from starts winning instead.
+export function githubAppNameFor(bindings: Bindings, orgRepo: string): string {
+  const repoShort = orgRepo.split("/")[1] ?? orgRepo;
+  const name = bindings.github_apps[orgRepo] ?? bindings.github_apps[repoShort];
+  if (!name) {
+    throw new Error(
+      [
+        `no GitHub App bound for ${orgRepo}`,
+        "",
+        `  looked for:  github_apps["${orgRepo}"], then github_apps["${repoShort}"]`,
+        `  bound repos: ${Object.keys(bindings.github_apps).join(", ") || "(none)"}`,
+        "",
+        "Add it to environments.yaml, keyed by the full slug:",
+        "",
+        "  github_apps:",
+        `    ${orgRepo}: <the App's name in Coolify>`,
+      ].join("\n"),
+    );
+  }
+  return name;
+}
 
 export function loadBindings(
   path: string,

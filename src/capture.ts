@@ -77,7 +77,11 @@ export function renderAbsentResources(
     "finding is not that the secrets are missing — it is that the manifest and this",
     "box disagree about what these resources are called.",
     "",
-    "Reconcile the names first (`cast inventory` shows both sides), then capture.",
+    "`cast inventory` shows both sides. Then map them at the call site:",
+    "",
+    ...absent.map(
+      (name) => `    --resource ${name}="<what this box calls it>"`,
+    ),
   ].join("\n");
 }
 

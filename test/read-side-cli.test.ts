@@ -291,3 +291,97 @@ describe("cast inventory (#19)", () => {
     expect(r.output).toContain("inventory — heavy-duty/incubator staging");
   });
 });
+
+describe("--resource (the third name, #23)", () => {
+  it("captures from a resource the box calls something else", async () => {
+    const f = fixture((await stubCoolify("Incubator Stack v2")).url);
+    const r = await run(
+      "capture",
+      [
+        ...base(f),
+        "--project",
+        "Incubator",
+        "--environment",
+        "production",
+        "--resource",
+        "core=Incubator Stack v2",
+        "--override",
+        "ADMIN_EMAIL",
+      ],
+      {
+        stdin: "staging\n",
+        env: { CAST_CAPTURE_ADMIN_EMAIL: "operator@example.com" },
+      },
+    );
+    expect(r.code).toBe(0);
+    expect(existsSync(f.store)).toBe(true);
+  });
+
+  it("shows the box's own name beside ours, and diffs the KEYS of the pair", async () => {
+    const f = fixture((await stubCoolify("Incubator Stack v2")).url);
+    const r = await run("inventory", [
+      ...base(f),
+      "--project",
+      "Incubator",
+      "--environment",
+      "production",
+      "--resource",
+      "core=Incubator Stack v2",
+    ]);
+    expect(r.code).toBe(0);
+    // Matched — and the box's name is still there. A document that renamed the
+    // box's resources to our vocabulary and never mentioned theirs would be
+    // useless against the UI it describes.
+    expect(r.output).toContain('← "Incubator Stack v2" on the box');
+    // The finding that only becomes visible once they are PAIRED: a var the box
+    // carries that the manifest has never heard of.
+    expect(r.output).toContain("box only:");
+    expect(r.output).toContain("LEFTOVER_FROM_2019");
+  });
+
+  it("tells you what to map, when nothing matched but the box is full", async () => {
+    const f = fixture((await stubCoolify("Incubator Stack v2")).url);
+    const r = await run("inventory", [
+      ...base(f),
+      "--project",
+      "Incubator",
+      "--environment",
+      "production",
+    ]);
+    expect(r.code).toBe(0);
+    // Not "the box is empty" — which is how a full-create plan gets laundered
+    // into a pass. It is a naming gap, and the fix is printed.
+    expect(r.output).toContain("NOTHING matched");
+    expect(r.output).toContain('--resource core="<what this box calls it>"');
+  });
+
+  it("refuses an alias for a resource the manifest never declared", async () => {
+    const f = fixture((await stubCoolify("Incubator Stack v2")).url);
+    const r = await run("inventory", [
+      ...base(f),
+      "--project",
+      "Incubator",
+      "--environment",
+      "production",
+      "--resource",
+      "cores=Incubator Stack v2",
+    ]);
+    // A typo here would be silent and expensive: the alias maps nothing, the
+    // real resource is looked up under its own name, and the run refuses with
+    // no hint that the flag missed.
+    expect(r.code).not.toBe(0);
+    expect(r.output).toContain('declares no resource named "cores"');
+    expect(r.output).toContain("core");
+  });
+
+  it("refuses --resource on apply — it is a read-side coordinate", async () => {
+    const f = fixture((await stubCoolify("Incubator Stack v2")).url);
+    const r = await run("apply", [
+      ...base(f),
+      "--resource",
+      "core=Incubator Stack v2",
+    ]);
+    expect(r.code).toBe(2);
+    expect(r.output).toContain("read-side coordinate");
+  });
+});

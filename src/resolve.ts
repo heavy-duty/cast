@@ -6,6 +6,127 @@ import type { Desired } from "./diff.js";
 import { type ResolvedEnv, resolveTemplate } from "./envtemplate.js";
 import { loadManifest } from "./manifest.js";
 
+// How cast authenticated (or failed to authenticate) a clone.
+//
+//   gh      — `gh` is installed and holds a token; borrowed as a credential
+//             helper for this invocation only
+//   token   — GITHUB_TOKEN / GH_TOKEN in the environment (the CI path)
+//   ambient — neither; whatever git's own credential helper does, if anything
+export type GitAuth = {
+  source: "gh" | "token" | "ambient";
+  configArgs: string[];
+  env: Record<string, string>;
+};
+
+// A credential helper reads the token from the ENVIRONMENT at run time. The
+// alternatives both leak it: a token in the clone URL shows up in `ps` and in
+// git's own error messages, and `http.extraheader` additionally persists into
+// the clone's .git/config. What lands in argv here is the literal text
+// `$CAST_GIT_TOKEN`, never its value.
+const TOKEN_HELPER =
+  '!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=$CAST_GIT_TOKEN"; }; f';
+
+// `gh auth login` alone does NOT wire git's credential helper — that is
+// `gh auth setup-git`, a separate act most people never run. So being logged
+// into `gh` does not make `git clone` work, which is exactly the trap #13
+// fell into. Borrowing gh as a helper for this one invocation closes that gap
+// without mutating the operator's global git config.
+const GH_HELPER = "!gh auth git-credential";
+
+function ghHasToken(): boolean {
+  try {
+    // A local keyring/config read, not a network call. We never keep the
+    // value — the helper re-reads it inside git.
+    execFileSync("gh", ["auth", "token"], { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Resolve clone credentials INSIDE cast, in a fixed order, rather than leaving
+// it to whatever the ambient git config happens to do. `credential.helper=`
+// (empty) first RESETS the inherited helper list — otherwise a helper
+// configured globally is consulted before ours and silently decides the
+// outcome, which is the same "the connection target is implicit in a file's
+// contents" problem #14 is about.
+export function resolveGitAuth(
+  env: NodeJS.ProcessEnv = process.env,
+  hasGh: () => boolean = ghHasToken,
+): GitAuth {
+  if (hasGh()) {
+    return {
+      source: "gh",
+      configArgs: [
+        "-c",
+        "credential.helper=",
+        "-c",
+        `credential.helper=${GH_HELPER}`,
+      ],
+      env: {},
+    };
+  }
+  const token = env.GITHUB_TOKEN || env.GH_TOKEN;
+  if (token) {
+    return {
+      source: "token",
+      configArgs: [
+        "-c",
+        "credential.helper=",
+        "-c",
+        `credential.helper=${TOKEN_HELPER}`,
+      ],
+      env: { CAST_GIT_TOKEN: token },
+    };
+  }
+  return { source: "ambient", configArgs: [], env: {} };
+}
+
+// GitHub answers "you cannot see this" with a 404, not a 403 — so a private
+// repo you lack access to and a repo that does not exist are the same message
+// on the wire. The failure text must not pick one; it has to name both, and
+// name the credential cast actually used, or the operator debugs the wrong
+// half. (The original bug reported *the repository* when the real fault was
+// cast's missing credentials.)
+export function cloneFailureMessage(
+  orgRepo: string,
+  auth: GitAuth,
+  stderr: string,
+): string {
+  const detail = stderr.trim();
+  const tail = detail
+    ? ["", "git said:", ...detail.split("\n").map((l) => `  ${l}`)]
+    : [];
+  if (auth.source === "ambient") {
+    return [
+      `cannot clone ${orgRepo}: no GitHub credentials.`,
+      "",
+      "cast looked for, in order:",
+      "  1. `gh` — not installed, or not logged in (`gh auth token` failed)",
+      "  2. GITHUB_TOKEN / GH_TOKEN — not set in the environment",
+      "  3. git's own credential helper — did not supply credentials either",
+      "",
+      "Run `gh auth login`, or set GITHUB_TOKEN. (`gh auth setup-git` also works,",
+      "but cast borrows `gh` as a credential helper on its own, so logging in is",
+      "enough — you do not need to change your global git config.)",
+      ...tail,
+    ].join("\n");
+  }
+  const used =
+    auth.source === "gh"
+      ? "`gh` (borrowed as a credential helper for this clone)"
+      : "GITHUB_TOKEN / GH_TOKEN from the environment";
+  return [
+    `cannot clone ${orgRepo}: authenticated with ${used}, and GitHub still refused.`,
+    "",
+    "GitHub answers 'you cannot see this' with a 404, so this is one of:",
+    `  - ${orgRepo} does not exist (check the slug)`,
+    "  - it is private and this credential has no access to it",
+    "  - the credential is expired, or lacks the `repo` scope",
+    ...tail,
+  ].join("\n");
+}
+
 export function resolveCheckout(
   orgRepo: string,
   opts: { env: string; path?: string },
@@ -17,13 +138,36 @@ export function resolveCheckout(
   }
   if (opts.path) return opts.path;
   const dir = mkdtempSync(join(tmpdir(), "infra-checkout-"));
-  execFileSync(
-    "git",
-    ["clone", "--depth", "1", `https://github.com/${orgRepo}.git`, dir],
-    {
-      stdio: "pipe",
-    },
-  );
+  const auth = resolveGitAuth();
+  try {
+    execFileSync(
+      "git",
+      [
+        ...auth.configArgs,
+        "clone",
+        "--depth",
+        "1",
+        `https://github.com/${orgRepo}.git`,
+        dir,
+      ],
+      {
+        stdio: "pipe",
+        env: {
+          ...process.env,
+          ...auth.env,
+          // Belt and braces: whatever credential path we took, git may NEVER
+          // fall through to its interactive username/password prompt. GitHub
+          // stopped accepting passwords there years ago, so it cannot succeed
+          // — it can only hang cast, or (in the original report) hand back an
+          // error about the repository that hides the real fault.
+          GIT_TERMINAL_PROMPT: "0",
+        },
+      },
+    );
+  } catch (err) {
+    const stderr = String((err as { stderr?: Buffer | string })?.stderr ?? "");
+    throw new Error(cloneFailureMessage(orgRepo, auth, stderr));
+  }
   return dir;
 }
 

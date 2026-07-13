@@ -69,6 +69,7 @@ cast diff      <org>/<repo> --env <env> [--full]
 cast diff      --env <env> --all [--full]       # no repo: EVERY registered project
 cast capture   <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
 cast inventory <org>/<repo> --env <env>
+cast inventory --env <env> [--emit-draft <dir> [--recipient age1…] [--no-secrets]]
 cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
 cast smoke     <org>/<repo> --env <env> [--project <name>] [--environment <name>]
 cast team [--env <env>]
@@ -91,6 +92,12 @@ cast team [--env <env>]
   no age key, and no recipient — it runs *before* adoption, which is the point of
   it. A document, read by a person; nothing here is consumed by `apply`. See
   *Adopting a hand-built instance*.
+- **`inventory --emit-draft <dir>`** — the sweep, written down as a **draft of
+  cast's own inputs**: a manifest per project, env templates, an
+  `environments.yaml` with the registry, an age store, and `UNCAPTURED.md`. A
+  **proposal**, never desired state — `apply` does not read it. It is how a
+  project that has *no* manifest gets its first one, and how you take a
+  point-in-time blueprint of a box. See *Drafting a box that was never declared*.
 - **`capture`** — the adoption path: reads a hand-built instance's live env and
   writes the environment's age store from it. See *Adopting a hand-built
   instance* below.
@@ -322,6 +329,126 @@ fails loudly rather than recreating on un-updatable drift), the `dockercompose`
 build pack, the hostname-overlay shapes, and the places Coolify 4.1.2 does not
 cooperate — each citation verified against `coollabsio/coolify` v4.1.2 and the
 vendored OpenAPI in `reference/`. Read it before changing `apply`.
+
+## Drafting a box that was never declared
+
+`inventory` can see a whole instance. `--emit-draft` makes it **write down what
+it sees**, in the shape of cast's own inputs:
+
+```sh
+cast inventory --env prod --instance box-b --emit-draft ./draft --recipient age1…
+```
+
+```
+draft/
+  environments.yaml                    # bindings as far as they can be read — with the projects: registry
+  incubator/.infra/manifest.yaml       # one per project
+  incubator/.infra/env/*.env.template
+  la-familia/.infra/manifest.yaml      # …including the client sites nobody ever declared
+  secrets/<project>.<env>.env.age      # encrypted to a recipient you name
+  UNCAPTURED.md                        # ← the important file
+```
+
+Two uses: **bootstrapping a project that has no manifest** (the third-party sites
+on the box being drained were never declared, and never will be unless something
+writes the first draft — hand-transcribing them from a UI is exactly the work
+cast exists to eliminate), and **a point-in-time blueprint** you could rebuild an
+instance from.
+
+### A draft is a PROPOSAL
+
+**It is never desired state, and `apply` never reads it.** It is emitted,
+reviewed by a human, and lands in a repo as a PR — the same shape as
+`terraform import` → HCL:
+
+**sweep → emit draft → you read it → manifest PR → `capture` → `apply`**
+
+That boundary is the only reason the verb is allowed to exist, and it is
+enforced, not merely documented:
+
+- It **never emits into a repo that already has a manifest.** For a declared
+  project the manifest *is* the truth, and one regenerated from a live box would
+  let that box's accumulated cruft overwrite the reviewed spec — in the one
+  direction nobody reviews. Adoption is one-way. A non-empty target directory is
+  refused, and so is writing a manifest over an existing one.
+- `--emit-draft` is **sweep-mode only**. With a repo, `inventory` is reconciling
+  against a manifest that already exists, which is exactly the case where a draft
+  must not be written. Refused.
+
+### Two things would make a draft actively dangerous
+
+**1. Copied provider-generated values.** A `DATABASE_URL` read off the source
+points at the *source box's* Postgres. Emit it, rebuild elsewhere, and the new
+box comes up **working** — reading and writing the old box's database. You find
+out the day the old box is deleted. Same for `REDIS_URL`, and for Coolify's own
+magic vars (`SERVICE_FQDN_*`, `SERVICE_URL_*`, `SERVICE_PASSWORD_*`), which are
+generated per-instance and mean nothing anywhere else.
+
+So the draft applies **`capture`'s discipline**: a provider-generated name is
+**placeheld** with the same `pending-coolify-generated` literal, its live value
+is not written into any artifact, and it is listed for disposition. The emitted
+manifest declares it under `generated_secrets:`, so a later `capture` placeholds
+it again with no flag to remember. A draft that is confidently wrong in four
+entries out of seventeen is worse than one that is obviously incomplete.
+
+The rule is **by name** — two families: Coolify's `SERVICE_*` magic vars, and any
+name carrying a *datastore* word (`DATABASE`, `DB`, `POSTGRES`, `REDIS`, …) and a
+*connection* word (`URL`, `HOST`, `PASSWORD`, …) as segments. It errs **wide** on
+purpose, because the two errors are not symmetric: over-matching a real secret
+placeholds it loudly and you put it back, while under-matching a generated one
+copies it silently and rebuilds a box that quietly uses a dead machine's
+database. Every value cast read is printed with its disposition — names and
+provenance, never values — and a var that points at the source box under a name
+cast does not recognize **will** have been copied. Read the table.
+
+Every other live var becomes a `${REF}`, with its value in the **age store** —
+never a literal in a committed file. cast cannot know which of a box's vars are
+secret (nobody wrote it down; that is why this verb exists), and a live API key
+written as a literal is a key in a git repo. Move the plainly-not-secret ones
+back to literals yourself, in review.
+
+The store is encrypted to a recipient you **name** — `--recipient age1…`, or the
+environment's `age_recipient` binding. With neither, cast **refuses**: a draft
+whose secrets were silently skipped looks complete and holds not one value.
+`--no-secrets` says so deliberately.
+
+**2. Silent losses.** cast cannot express everything a Coolify holds:
+destinations (which Docker network a resource sits on — no API at all in 4.1.2),
+service hostnames (they live per-container on `service.applications[].fqdn`),
+Basic Auth and custom Traefik labels, the *Include Source Commit in Build*
+toggle, whole database kinds (a MySQL is invisible to cast's manifest), backup
+schedules, and anything else configured in the UI with no manifest field.
+
+A blueprint that omits these **without saying so** is worse than no blueprint,
+because in a disaster you would trust it and rebuild a *different box*. So
+**`UNCAPTURED.md` is a first-class output**, listing per resource every live
+setting cast saw and could not express — and it is **written on every run**, even
+when it has little to say.
+
+### What a blueprint still cannot restore
+
+Worth stating plainly, because "rebuild from the repo" is routinely over-claimed:
+
+| | |
+| --- | --- |
+| control plane | `rig coolify install` ✅ |
+| structure | draft → manifest PR → `apply` ✅ |
+| secret **values** | the age store + your key ✅ |
+| **data** | Coolify's DB backups → S3 ✅ (a separate path) |
+| **the GitHub App private key** | ❌ re-create by hand |
+| **S3 access keys** | ❌ re-mint by hand |
+
+The last two are **not in the repo** — correctly; it holds no live credentials —
+and cannot be regenerated from it. A DR runbook has to say so. The same table is
+emitted into every `UNCAPTURED.md`, because that is the file someone will be
+reading at the worst possible moment.
+
+One project per Coolify environment: a project with resources in **two**
+populated environments is a tie cast will not break (picking would emit a
+blueprint of half a box), so it refuses and `--environment <name>` says which. It
+is a tiebreak, not a filter — a project with only one populated environment is
+drafted from it either way, which is what keeps the client sites (each alone in
+Coolify's default `production`) in a blueprint that claims to describe the box.
 
 ## Secrets, and attended applies
 

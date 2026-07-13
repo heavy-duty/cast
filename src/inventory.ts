@@ -23,13 +23,20 @@ import type { ManifestResource } from "./resolve.js";
 
 export type LiveResource = {
   kind: string;
+  // The MANIFEST's name for it, once --resource has aliased it. Without an
+  // alias, whatever the box calls it.
   name: string;
+  // What the box calls it, when that differs. Kept, and printed: a document
+  // that renamed the box's resources to our vocabulary and then never mentioned
+  // theirs would be unusable against the UI it describes.
+  sourceName?: string;
   envKeys: string[];
 };
 
 export type Matched = {
   kind: string;
   name: string;
+  sourceName?: string;
   // Declared by the manifest, absent from the box.
   manifestOnlyKeys: string[];
   // On the box, and the manifest knows nothing about it. Either something the
@@ -68,6 +75,7 @@ export function reconcile(
     matched.push({
       kind: m.kind === l.kind ? m.kind : `${m.kind} / ${l.kind} on the box`,
       name: m.name,
+      ...(l.sourceName ? { sourceName: l.sourceName } : {}),
       manifestOnlyKeys: sorted(m.envKeys.filter((k) => !boxKeys.has(k))),
       boxOnlyKeys: sorted(l.envKeys.filter((k) => !manifestKeys.has(k))),
       sharedKeys: sorted(m.envKeys.filter((k) => boxKeys.has(k))),
@@ -109,7 +117,11 @@ export function renderInventory(
     lines.push("    (nothing matched — see both lists below)");
   }
   for (const m of rec.matched) {
-    lines.push(bullet(m.kind, m.name));
+    lines.push(
+      m.sourceName
+        ? `${bullet(m.kind, m.name)}   ← "${m.sourceName}" on the box`
+        : bullet(m.kind, m.name),
+    );
     if (m.sharedKeys.length > 0) {
       lines.push(`      both:          ${m.sharedKeys.join(", ")}`);
     }
@@ -150,6 +162,22 @@ export function renderInventory(
       (n, m) => n + m.manifestOnlyKeys.length + m.boxOnlyKeys.length,
       0,
     );
+  // Nothing matched, yet the box is full of resources: that is a NAMING gap, not
+  // an empty box — and it is the single most likely thing to be looking at you
+  // here. Say so, rather than leaving a reader to conclude the box has nothing
+  // (which is how "create everything" gets laundered into a pass).
+  if (rec.matched.length === 0 && rec.boxOnly.length > 0) {
+    lines.push(
+      "",
+      "NOTHING matched — and yet this box has resources. That is almost always a",
+      "naming difference, not an empty box: a box built by hand names things for a",
+      "human reading a UI, not for a manifest. Map them and re-run:",
+      "",
+      ...rec.manifestOnly.map(
+        (m) => `    --resource ${m.name}="<what this box calls it>"`,
+      ),
+    );
+  }
   lines.push(
     "",
     drift === 0

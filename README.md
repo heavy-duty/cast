@@ -221,7 +221,15 @@ yours:
 | --- | --- |
 | `--project <name>` | the project isn't named after the repo (`Incubator`, not `incubator`) |
 | `--environment <name>` | the environment isn't named after `--env` (Coolify's default is `production`, not `prod`) |
-| — | a resource isn't named after the manifest's → **refuses**; reconcile with `inventory` first |
+| `--resource <manifest>=<live>` | a resource isn't named after the manifest's (`core` is `Incubator Stack v2` over there). Repeatable |
+
+All three are **read-side only** — `diff`, `capture`, `inventory`. They are
+arguments to a one-off read, never manifest fields: a manifest that recorded a
+legacy box's names would carry a dead machine's vocabulary forever. And `apply`
+refuses `--resource` outright, because it creates resources under the manifest's
+own names — an alias there could only mean *adopt the existing one instead*,
+which is a different operation and would otherwise silently create a duplicate
+beside the resource you were pointing at.
 
 `--env` stays **ours**: it selects the manifest block, the `environments.yaml`
 binding, the age key, the store path. `--environment` is *theirs*, on the wire,

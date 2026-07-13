@@ -80,6 +80,12 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
                   \`production\`, not \`prod\`. This changes ONLY the name on the
                   wire — --env still selects the manifest block, the
                   environments.yaml binding, the age key and the store path.
+  --resource <manifest-name>=<live-name>
+                  the same problem, one level further down: a hand-built box
+                  names resources for a human reading a UI ("Incubator Stack v2"),
+                  a manifest names them for a diff (\`core\`). Repeatable. Read-side
+                  only (\`diff\`, \`capture\`, \`inventory\`) — \`apply\` creates under the
+                  manifest's names and refuses this flag.
 
 capture (adopt a hand-built instance into the age secret store):
   --generated <NAME>   force NAME to the \`pending-coolify-generated\` placeholder,
@@ -379,6 +385,68 @@ export function renderAbsentTarget(
   ].join("\n");
 }
 
+// The third name a hand-built box does not share with you: the RESOURCE.
+//
+// `--project` and `--environment` are coordinates for finding the target;
+// `--resource` is the coordinate for finding the things inside it. A box built
+// by hand names its resources for humans reading a UI ("Incubator Stack v2"),
+// while a manifest names them for machines reading a diff (`core`). Neither is
+// wrong, and neither gets to overwrite the other — so the mapping is stated at
+// the call site and applied at the boundary.
+//
+// It is deliberately NOT a manifest field: a manifest that recorded its own
+// legacy names would carry a dead box's vocabulary forever, which is the exact
+// failure #17 exists to prevent. This is an argument to a one-off read.
+export function parseResourceAliases(
+  pairs: string[],
+  declared: string[],
+): Record<string, string> {
+  const alias: Record<string, string> = {};
+  for (const pair of pairs) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0 || eq === pair.length - 1) {
+      throw new Error(
+        `--resource expects <manifest-name>=<live-name>, got "${pair}"`,
+      );
+    }
+    const from = pair.slice(0, eq).trim();
+    const to = pair.slice(eq + 1).trim();
+    // A typo here would be silent and expensive: the alias would map nothing,
+    // the manifest's real resource would still be looked up under its own name,
+    // and the run would refuse (or capture) with no hint that the flag missed.
+    if (!declared.includes(from)) {
+      throw new Error(
+        [
+          `--resource ${from}=${to}: the manifest declares no resource named "${from}"`,
+          "",
+          `  declares:  ${declared.join(", ") || "(nothing)"}`,
+          "",
+          "The left side is the MANIFEST's name; the right side is what this box",
+          "calls the same thing.",
+        ].join("\n"),
+      );
+    }
+    alias[from] = to;
+  }
+  return alias;
+}
+
+// Rename live resources to the manifest's vocabulary, once, at the boundary.
+// Everything downstream — computeDiff, classify, reconcile — then matches by
+// name as it always has, and none of them needs to know a box was involved.
+export function aliasLive<T extends { name: string }>(
+  live: T[],
+  alias: Record<string, string>,
+): Array<T & { sourceName?: string }> {
+  const toManifestName = new Map(
+    Object.entries(alias).map(([manifest, box]) => [box, manifest]),
+  );
+  return live.map((l) => {
+    const manifestName = toManifestName.get(l.name);
+    return manifestName ? { ...l, name: manifestName, sourceName: l.name } : l;
+  });
+}
+
 // A live resource's env vars, by key. `real_value` is the decrypted one and
 // needs a token with read:sensitive; `value` is what a lesser token sees.
 //
@@ -468,6 +536,7 @@ async function main(): Promise<number> {
         state: { type: "string" },
         project: { type: "string" },
         environment: { type: "string" },
+        resource: { type: "string", multiple: true },
         instance: { type: "string" },
         "hostname-overlay": { type: "string" },
         full: { type: "boolean", default: false },
@@ -477,6 +546,25 @@ async function main(): Promise<number> {
     const envName = values.env;
     if (!orgRepo || !envName) {
       console.error(USAGE);
+      return 2;
+    }
+    // Up front, before a clone or a decrypt or a single call: `apply` creates
+    // resources under the MANIFEST's names, so an alias there would have to mean
+    // "adopt the existing resource called X instead" — updating in place rather
+    // than creating. That is a different operation, nobody has asked for it, and
+    // guessing at it would silently create a duplicate beside the very resource
+    // the operator was pointing at.
+    if (command === "apply" && (values.resource?.length ?? 0) > 0) {
+      console.error(
+        [
+          "refusing to apply: --resource is a read-side coordinate",
+          "",
+          "It exists so `diff`, `capture` and `inventory` can READ a box whose",
+          "resources are named differently. `apply` creates resources under the",
+          "manifest's own names, so an alias here would have to mean 'adopt the",
+          "existing one instead' — which is not what this flag does.",
+        ].join("\n"),
+      );
       return 2;
     }
     const stateDir = stateDirFrom(values.state);
@@ -553,7 +641,15 @@ async function main(): Promise<number> {
       );
       return 2;
     }
-    const live = lookup.found ? lookup.live : [];
+    const aliases = parseResourceAliases(
+      values.resource ?? [],
+      desired.map((d) => d.name),
+    );
+    // Without this, a diff against a box that names things differently reports
+    // every manifest resource as "to create" and every live one as unknown —
+    // the D-237 lie by another route: a confident full-create plan that verified
+    // nothing, against a box that has all of it under other names.
+    const live = lookup.found ? aliasLive(lookup.live, aliases) : [];
     if (mode === "full") {
       for (const l of live) {
         l.env = await fetchEnv(client, l);
@@ -595,6 +691,7 @@ async function main(): Promise<number> {
         path: { type: "string" },
         project: { type: "string" },
         environment: { type: "string" },
+        resource: { type: "string", multiple: true },
         instance: { type: "string" },
         generated: { type: "string", multiple: true },
         override: { type: "string", multiple: true },
@@ -682,9 +779,14 @@ async function main(): Promise<number> {
       );
       return 2;
     }
+    const aliases = parseResourceAliases(
+      values.resource ?? [],
+      manifestResources(checkout, envName).map((r) => r.name),
+    );
+    const aliased = aliasLive(lookup.live, aliases);
     // Databases hold no manifest-templated env of their own — their URL is what
     // the APPS reference, and that name is generated, not captured.
-    const envBearing = lookup.live.filter((l) => l.kind !== "database");
+    const envBearing = aliased.filter((l) => l.kind !== "database");
     // Before reading a single env: does every resource the manifest requires a
     // secret FROM actually exist here? An absent resource reads back exactly
     // like one with no env vars set — every name it declares reports MISSING —
@@ -755,6 +857,7 @@ async function main(): Promise<number> {
         path: { type: "string" },
         project: { type: "string" },
         environment: { type: "string" },
+        resource: { type: "string", multiple: true },
         instance: { type: "string" },
       },
     });
@@ -800,13 +903,27 @@ async function main(): Promise<number> {
       );
       return 2;
     }
+    // With --resource, inventory stops reporting "these five are missing / these
+    // five are unknown" and starts reporting what you actually want to know:
+    // for each PAIR, which env keys differ. The report keeps the box's own name
+    // beside ours, because losing it would make the document unusable against
+    // the UI it describes.
+    const inventoryAliases = parseResourceAliases(
+      values.resource ?? [],
+      manifest.map((r) => r.name),
+    );
     const live: LiveResource[] = [];
-    for (const l of lookup.live) {
+    for (const l of aliasLive(lookup.live, inventoryAliases)) {
       // Keys, never values — see renderInventory. Databases carry no env of
       // their own worth reconciling (their URL is what the apps reference).
       const envKeys =
         l.kind === "database" ? [] : Object.keys(await fetchEnv(client, l));
-      live.push({ kind: l.kind, name: l.name, envKeys });
+      live.push({
+        kind: l.kind,
+        name: l.name,
+        envKeys,
+        ...(l.sourceName ? { sourceName: l.sourceName } : {}),
+      });
     }
     console.log(
       renderInventory(reconcile(manifest, live), {

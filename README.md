@@ -51,6 +51,8 @@ environments.yaml               # bindings: the team each env's token must belon
                                 #   which server it deploys onto, the S3 destination,
                                 #   GitHub App name, guards — and, per project,
                                 #   the destination it deploys onto + its smoke target
+                                #   …plus `projects:`, the registry: which projects
+                                #   exist, and in which environments
 secrets/<repo>.<env>.env.age    # age-encrypted values for the ${…} placeholders
 .coolify.env                    # COOLIFY_BASE_URL + COOLIFY_ACCESS_TOKEN (never commit)
 .coolify/<name>.env             # …the same, for a NAMED instance (see below)
@@ -356,6 +358,54 @@ Nothing below the team scopes a token. A Coolify environment has no team of its
 own (it hangs off a project) and no API path scopes by one: **Coolify
 environments are an organizational construct, not an auth boundary.** The team
 is the only boundary there is, so it is the one cast asserts.
+
+## The registry: which projects exist
+
+`environments.yaml` says where things deploy *to*, and how a project you have
+already named is placed once it is there. Until the `projects:` block, nothing in
+it said **which projects exist at all** — "every project" was a thing the
+operator remembered:
+
+```yaml
+projects:
+  heavy-duty/incubator:
+    environments: [prod, staging]
+  acme/client-site:
+    environments: [prod]
+```
+
+Keyed by the **full `<org>/<repo>` slug**, and the key *is* the repo — there is
+no `repo:` field inside, because a second place to write the same string is a
+second place for it to be wrong. Unlike `github_apps`, a bare `<repo>` key is
+**refused** rather than resolved: this block is new, so it has no state files in
+the wild to keep working, and a bare `<repo>` is unique only *within* an org —
+which is exactly why it is not a key. `environments:` lists **our** environment
+names (the values `--env` takes), never Coolify's.
+
+The block is optional; a state file written before it loads unchanged.
+
+**It has to be true, so cast checks that it is — at parse time, for every verb.**
+Two ways it could quietly stop being true, both refused:
+
+- an environment name that no `environments:` block defines (a typo). The project
+  is real and its environment imaginary, so a fleet run visits nothing for it,
+  reports nothing, and exits clean.
+- an `environments.<env>.projects.<repo>` binding — a destination, a smoke target
+  — in an environment the registry does not register that project for. The two
+  blocks then describe two different fleets: state real enough for a direct
+  `cast apply` to use, invisible to every fleet run. (Checked only when
+  `projects:` is present.)
+
+Both refusals defend one failure: **a silently skipped project reads exactly like
+a clean one.** Silence is the one report that must never be ambiguous.
+
+What it unlocks, neither of which was possible without a list to iterate:
+
+- **fleet operations** — `cast diff --all` / `apply --all` over every project in
+  an environment.
+- **rebuild-from-state** — "restore this Coolify from the state repo" cannot even
+  be *attempted* without knowing what was on it. The registry is the difference
+  between a documented recovery and an archaeology exercise.
 
 ## Two projects, one box: destinations
 

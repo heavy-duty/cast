@@ -158,6 +158,51 @@ softened by an implementation detail):
   refuses `--path` combined with `--env prod`: prod always reads the default
   branch, so a feature-branch checkout can never reach it.
 
+## The registry (`projects:`)
+
+The top-level `projects:` block is the list of **which projects exist**, and in
+which environments. It is the only place that says so: `environments:` says where
+things deploy to, `environments.<env>.projects.<repo>` says how an already-named
+project is placed, `github_apps` says how to clone one you have already named.
+
+```yaml
+projects:
+  heavy-duty/incubator:
+    environments: [prod, staging]
+```
+
+- **Keyed by the full `<org>/<repo>` slug, with no bare-`<repo>` fallback.** The
+  key is the repo; there is no `repo:` field. `github_apps` and
+  `environments.<env>.projects` accept a bare key because state files in the wild
+  are written that way; this block is new and has none, so it requires the slug —
+  a bare `<repo>` is unique only *within* an org.
+- **`environments:` names OUR environments** — the keys of the `environments:`
+  block, the values `--env` takes — never Coolify's. Non-empty.
+- **Optional.** A state file with no `projects:` block loads unchanged, and
+  `projectsIn` reports `[]` for every environment.
+
+**Validated at parse time, so every verb refuses a registry that lies.** Two
+refusals, both defending the same failure — *a silently skipped project reads
+exactly like a clean one*, which makes silence, the most common report there is,
+ambiguous:
+
+1. **An environment that does not exist** (a typo in `projects.<slug>.environments`)
+   is an error naming the unknown environment and listing the known ones. Left
+   alone, the project would be registered into an environment no command can
+   visit: a fleet run skips it, reports nothing, exits clean.
+2. **A binding the registry does not register.** Every
+   `environments.<env>.projects.<slug>` key must be a project the registry
+   registers *for that environment*. Otherwise the two blocks describe two
+   different fleets: a `destination_uuid` or `smoke_target` real enough for a
+   direct `cast apply <repo> --env <env>` to act on, and invisible to every
+   fleet run over that environment. Enforced **only when `projects:` is
+   present**, so pre-registry state files keep loading.
+
+The registry is what makes two things possible, neither of which can be attempted
+without a list to iterate: **fleet operations** (`--all`), and
+**rebuild-from-state** — restoring a Coolify from the state repo, which is
+otherwise an assumption, since you cannot restore what you cannot enumerate.
+
 ## Placement (destinations)
 
 A **destination** is the Docker network a resource is created on. It is declared

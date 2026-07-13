@@ -182,7 +182,7 @@ export function renderInventory(
       `inventory — ${ctx.orgRepo} ${ctx.env}`,
       "",
       `  looked in:    project "${ctx.project}", environment "${ctx.environment}"`,
-      `  found:        NOTHING. Not one resource.`,
+      "  found:        NOTHING. Not one resource.",
       "",
       "This environment is EMPTY — so there is nothing here to reconcile, and the",
       "manifest's list below would just be the manifest talking to itself.",
@@ -196,9 +196,7 @@ export function renderInventory(
       "",
       `    cast inventory --env ${ctx.env} --instance ${ctx.instance}`,
       "",
-      "(The manifest declares: " +
-        rec.manifestOnly.map((m) => m.name).join(", ") +
-        ".)",
+      `(The manifest declares: ${rec.manifestOnly.map((m) => m.name).join(", ")}.)`,
     ].join("\n");
   }
   const lines = [

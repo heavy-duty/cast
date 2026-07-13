@@ -1081,8 +1081,10 @@ async function main(): Promise<number> {
     }
     // Resolved against the instance-wide application list, not the project's:
     // that is what it did before this change and it is not this change's job to
-    // alter which app gets written to. It does mean two projects with an app of
-    // the same name are a coin flip — filed separately.
+    // alter which app gets written to. It does mean the name is not actually a
+    // coordinate — one project's `core` and another's, or prod's and staging's
+    // on the same instance, are a coin flip. See #29; fixing it needs the
+    // read-side coordinates (--project/--environment) smoke does not yet have.
     const apps = (await client.get("/applications")) as Array<{
       uuid: string;
       name: string;

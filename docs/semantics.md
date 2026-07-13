@@ -199,9 +199,89 @@ ambiguous:
    present**, so pre-registry state files keep loading.
 
 The registry is what makes two things possible, neither of which can be attempted
-without a list to iterate: **fleet operations** (`--all`), and
+without a list to iterate: **fleet operations** (`--all`, below), and
 **rebuild-from-state** — restoring a Coolify from the state repo, which is
 otherwise an assumption, since you cannot restore what you cannot enumerate.
+
+## Fleet runs (`--all`)
+
+`cast diff --env <env> --all` and `cast apply --env <env> --all` act on **every
+project the registry lists for that environment**, in place of the `<org>/<repo>`
+positional. The projects are visited in the registry's sorted order
+(`projectsIn`) — a fleet report a human reads top to bottom, and CI diffs, must
+not reshuffle because someone appended a project.
+
+**One implementation.** `--all` loops the *same* per-project path the single-repo
+form runs (checkout → secrets → desired → bindings → team-asserted client → live
+read → diff → optionally apply). There is deliberately no second, parallel fleet
+code path: two implementations of "what a project run is" would drift, and drift
+is the thing this tool exists to catch.
+
+**The instance and the team are asserted once, before the first project's first
+read.** One `--env` means one instance and one team for the whole run, so the
+gate lands where it always did — strictly before the first live read, which is
+already the lie a wrong-team token tells (see *Team scoping*).
+
+### Fails closed on the aggregate
+
+**A registered project cast cannot reach is an ERROR, never a skip.** "Cannot
+reach" is every way a project can fail to answer: the clone failing, the manifest
+carrying no block for this environment, the secret store being absent or
+undecryptable, the Coolify project or environment being absent
+(`LiveLookup.found === false`), and any HTTP error. They collapse into one
+outcome because only one thing about them matters downstream — **this project was
+not read** — and a silently skipped project reads exactly like a clean one. That
+is the failure of #12/#18/#22 at fleet scale, and it would make *silence*, the
+most common report there is, the least trustworthy one.
+
+So the aggregate reports **coverage** (registered / read / clean / drifted /
+unreachable), and the exit code ranks an unread project above a drifted one:
+
+| verb | exit | meaning |
+|---|---|---|
+| `diff --all` | `0` | every registered project was **read**, and every one is clean |
+| `diff --all` | `1` | every one was read, and at least one has drift |
+| `diff --all` | `2` | a project could not be read. **Outranks drift**: an unreadable project is not a diff result, it is the absence of one |
+| `apply --all` | `0` | every registered project applied |
+| `apply --all` | `≠0` | anything else |
+
+`fleetExitCode` defaults to `2` on any coverage shape it does not recognize — an
+exit code is the only part of the report CI reads, so an unrecognized shape must
+fail rather than pass.
+
+### Opposite dispositions on failure, both deliberate
+
+- **`diff --all` runs every project to completion.** A read that stops early hides
+  the drift in the projects it never reached; a read that continues costs nothing.
+- **`apply --all` stops at the first failure**, and reports which projects were
+  applied and which were **not touched**. A write that continues costs everything:
+  the next project's apply would be a guess about whether the last one broke
+  something it depends on. `apply` is idempotent, so re-running after the fix is a
+  no-op over the projects that already applied.
+
+`apply` keeps its usual position on an absent Coolify project — it *creates* it,
+exactly as a single-project `apply` does (see *the read side*, and `LiveLookup`).
+Only `diff` treats absence as unreachable, because `diff` may only ever describe a
+target that already exists.
+
+### Two refusals
+
+- **An empty or absent registry refuses** (exit 2). `projectsIn` answers `[]` both
+  for a state file with no `projects:` block and for one whose registry names
+  nothing in this environment; to a fleet run they are the same thing — *nothing
+  to iterate* — and "0 projects, clean" is precisely the sentence this feature
+  exists to make impossible. The refusal names what was looked for, distinguishes
+  an unmigrated state file from a registry pointed elsewhere, and prints the YAML
+  to write.
+- **`--all` is mutually exclusive** with the repo positional and with every
+  single-project coordinate: `--path`, `--project`, `--environment`, `--resource`,
+  `--hostname-overlay`. Each names ONE project's checkout, ONE project's Coolify
+  name, ONE box's resource names — none is true of the project beside it.
+  Fleet-wide they are meaningless at best and dangerous at worst: `--project X`
+  across a registry points every project at the same Coolify project, which on
+  `diff` is a false report and on `apply` is every manifest in the fleet written
+  into one project. The refusal names the offending flag and says what applying it
+  fleet-wide would have done.
 
 ## Placement (destinations)
 

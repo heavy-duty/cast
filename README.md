@@ -64,7 +64,9 @@ Pass it with `--state <dir>`, or set `CAST_STATE`. Defaults to the cwd.
 
 ```sh
 cast apply     <org>/<repo> --env <env> [--path <dir>] [--hostname-overlay <file>]
+cast apply     --env <env> --all                # no repo: EVERY registered project
 cast diff      <org>/<repo> --env <env> [--full]
+cast diff      --env <env> --all [--full]       # no repo: EVERY registered project
 cast capture   <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
 cast inventory <org>/<repo> --env <env>
 cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
@@ -79,6 +81,9 @@ cast team [--env <env>]
   default branch).
 - **`diff`** — reports drift, manifest → Coolify. Structural by default; `--full`
   also compares env vars. Exits non-zero when dirty, so CI can gate on it.
+- **`--all`** — on `apply`/`diff`, act on **every project the registry lists for
+  this environment** instead of one named repo. See *The whole environment at
+  once* below.
 - **`inventory`** — what is actually *on* a box. **With no repo it sweeps the
   instance** (every project, every environment, every resource — no manifest
   involved); with a repo it reconciles, showing resources and env var **keys**
@@ -411,10 +416,76 @@ a clean one.** Silence is the one report that must never be ambiguous.
 What it unlocks, neither of which was possible without a list to iterate:
 
 - **fleet operations** — `cast diff --all` / `apply --all` over every project in
-  an environment.
+  an environment (below).
 - **rebuild-from-state** — "restore this Coolify from the state repo" cannot even
   be *attempted* without knowing what was on it. The registry is the difference
   between a documented recovery and an archaeology exercise.
+
+## The whole environment at once: `--all`
+
+Every other cast verb is single-project, so *"do this to the whole instance"* was
+a shell loop the operator wrote from memory — **and the project they forgot is the
+one that drifted.** `--all` iterates the registry instead:
+
+```sh
+cast diff  --env prod --all      # every project registered for prod
+cast apply --env prod --all
+```
+
+It runs the **same per-project path** the single-repo form runs (there is one
+implementation of what a project run *is*), reports each project under its own
+heading, and then prints an aggregate that leads with **coverage**:
+
+```
+fleet diff — prod
+
+  registered:   3  (heavy-duty/incubator, acme/client-site, acme/landing)
+  read:         2 of 3
+  clean:        1  heavy-duty/incubator
+  drift:        1  acme/landing
+  UNREACHABLE:  1  acme/client-site
+                   acme/client-site: refusing to diff: no project named "client-site" …
+```
+
+**A registered project cast cannot reach is an ERROR, not a skip** — the clone
+failing, no manifest block for this environment, a missing or undecryptable
+store, an absent Coolify project or environment, any HTTP error. A skipped
+project reads exactly like a clean one, which would make the one report you get
+most often (silence) the one you cannot trust. So the fleet **fails closed**: a
+clean fleet diff means *every* project was read, not that the ones cast happened
+to look at were fine.
+
+| | |
+|---|---|
+| `diff --all` exit 0 | every registered project was **read**, and every one is clean |
+| `diff --all` exit 1 | every one was read, and at least one has drift |
+| `diff --all` exit 2 | a project could not be read — **outranks drift**, because an unread project is not a diff result, it is the absence of one |
+| `apply --all` exit 0 | every registered project applied |
+| `apply --all` non-zero | anything else |
+
+The two verbs take opposite dispositions on failure, and both are deliberate:
+
+- **`diff --all` runs every project to completion.** Stopping early would hide the
+  drift in the projects it never reached — a partial read is exactly the report
+  this flag exists to make impossible.
+- **`apply --all` stops at the first failure**, and says which projects it
+  applied and which it did not touch. Continuing to *mutate* a fleet after an
+  unexplained failure is not a thing cast gets to do. `apply` is idempotent, so
+  re-running after a fix is a no-op over the ones that already applied.
+
+**An empty or absent registry refuses** (exit 2). `--all` over a state file with
+no `projects:` block does *not* print "0 projects, clean" and exit 0 — an empty
+fleet reading as a clean fleet is the whole failure this feature is against. The
+refusal names what it looked for and prints the YAML to write.
+
+**`--all` is mutually exclusive** with the repo positional and with every
+single-project coordinate — `--path`, `--project`, `--environment`, `--resource`,
+`--hostname-overlay`. Each of those names ONE project's checkout, ONE project's
+Coolify name, ONE box's resource names; fleet-wide they are meaningless at best
+and dangerous at worst (`--project X` applied to every project in the registry
+would point them all at the same Coolify project — a false report on `diff`, and
+on `apply` every manifest in the fleet written into one project). The refusal
+names the offending flag.
 
 ## Two projects, one box: destinations
 

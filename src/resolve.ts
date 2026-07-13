@@ -132,17 +132,32 @@ export function cloneFailureMessage(
   ].join("\n");
 }
 
+// Holds for every verb that reads a manifest (apply, diff, capture, inventory):
+// a feature-branch checkout must not be able to decide what prod runs, nor which
+// secret names land in prod's store.
+//
+// The rule is a value, not only a throw inside resolveCheckout, because the CLI
+// refuses this combination UP FRONT — before it opens a state file, a store or a
+// Coolify. A flag pairing that can never be honored must not need the rest of the
+// invocation to be well-formed in order to be caught (it used to be caught late,
+// and only by accident of resolveCheckout running before the bindings load). One
+// rule, one string, two call sites — never two spellings of the same refusal.
+export const PATH_IN_PROD_REFUSAL =
+  "refuses --path with --env prod: prod always reads the default branch";
+
+export function refusesPathInProd(opts: {
+  env: string;
+  path?: string;
+}): boolean {
+  return opts.path !== undefined && opts.env === "prod";
+}
+
 export function resolveCheckout(
   orgRepo: string,
   opts: { env: string; path?: string },
 ): string {
-  if (opts.path && opts.env === "prod") {
-    // Holds for every verb that reads a manifest (apply, and now capture): a
-    // feature-branch checkout must not be able to decide what prod runs, nor
-    // which secret names land in prod's store.
-    throw new Error(
-      "refuses --path with --env prod: prod always reads the default branch",
-    );
+  if (refusesPathInProd(opts)) {
+    throw new Error(PATH_IN_PROD_REFUSAL);
   }
   if (opts.path) return opts.path;
   const dir = mkdtempSync(join(tmpdir(), "infra-checkout-"));

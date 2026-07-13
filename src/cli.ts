@@ -6,9 +6,11 @@ import { parseArgs } from "node:util";
 import { parse as parseYaml } from "yaml";
 import { type Executor, applyHostnameOverlay, applyPlan } from "./apply.js";
 import {
+  type Bindings,
   githubAppNameFor,
   loadBindings,
   projectBindingFor,
+  projectsIn,
   smokeTargetFor,
 } from "./bindings.js";
 import {
@@ -34,6 +36,16 @@ import {
 } from "./diff.js";
 import { assertEnvVarPolicy } from "./envtemplate.js";
 import {
+  type ProjectOutcome,
+  fleetConflict,
+  fleetExitCode,
+  renderEmptyRegistry,
+  renderFleetApply,
+  renderFleetConflict,
+  renderFleetDiff,
+  renderProjectHeading,
+} from "./fleet.js";
+import {
   type LiveResource,
   type SweepEnvironment,
   type SweepProject,
@@ -42,8 +54,10 @@ import {
   renderSweep,
 } from "./inventory.js";
 import {
+  PATH_IN_PROD_REFUSAL,
   desiredFromManifest,
   manifestResources,
+  refusesPathInProd,
   requiredSecrets,
   resolveCheckout,
 } from "./resolve.js";
@@ -58,7 +72,9 @@ import { smoke } from "./smoke.js";
 import { assertTeam, formatTeam } from "./team.js";
 
 const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--hostname-overlay <file>]
+       cast apply     --env <env> --all                   # no repo: EVERY registered project
        cast diff      <org>/<repo> --env <env> [--full] [--project <name>] [--environment <name>]
+       cast diff      --env <env> --all [--full]          # no repo: EVERY registered project
        cast capture   <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--generated <NAME>] [--override <NAME>] [--force]
        cast inventory <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--resource <m>=<l>]
        cast inventory --env <env> [--instance <name>]     # no repo: SWEEP the whole instance
@@ -99,6 +115,20 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
                   a manifest names them for a diff (\`core\`). Repeatable. Read-side
                   only (\`diff\`, \`capture\`, \`inventory\`) — \`apply\` creates under the
                   manifest's names and refuses this flag.
+  --all           (\`apply\`/\`diff\`) act on EVERY project the \`projects:\` registry
+                  lists for this environment, instead of one named repo — the loop
+                  the operator used to write from memory, and the project they
+                  forgot is the one that drifted. Reports per project and fails
+                  CLOSED on the aggregate: a registered project cast cannot reach
+                  is an ERROR, never a skip, because a skipped project reads
+                  exactly like a clean one. \`diff --all\` runs every project to
+                  completion and exits 2 if any could not be read (which outranks
+                  drift's 1 — an unread project is not a diff result); \`apply --all\`
+                  stops at the first failure and says what it did and did not
+                  touch. An empty (or absent) registry refuses. Mutually exclusive
+                  with the repo positional and with every single-project
+                  coordinate: --path, --project, --environment, --resource,
+                  --hostname-overlay.
 
 capture (adopt a hand-built instance into the age secret store):
   --generated <NAME>   force NAME to the \`pending-coolify-generated\` placeholder,
@@ -541,6 +571,168 @@ async function confirmCapture(envName: string): Promise<boolean> {
   return answer?.trim() === envName;
 }
 
+// Everything ONE project run needs that is the same for every project in a
+// fleet run: the instance it talks to (one client, one asserted team), the
+// bindings, the environment. The single-project coordinates are here too and are
+// always undefined under --all — the refusal above is what guarantees that, and
+// it is why this one function can serve both paths without a branch inside it.
+type ProjectRunContext = {
+  command: "apply" | "diff";
+  stateDir: string;
+  envName: string;
+  bindings: Bindings;
+  binding: Bindings["environments"][string];
+  client: CoolifyClient;
+  mode: "structural" | "full";
+  path?: string;
+  projectOverride?: string;
+  environmentOverride?: string;
+  resources: string[];
+  hostnameOverlay?: string;
+};
+
+// What one project's run came to. `absent` is the one failure this function
+// RETURNS rather than throws, because it is the one the caller has always
+// handled itself (renderAbsentTarget, exit 2) — everything else throws, and the
+// fleet loop turns a throw into an unreachable project.
+type ProjectResult =
+  | { status: "clean" }
+  | { status: "drift" }
+  | { status: "applied"; mutated: string[] }
+  | { status: "absent"; message: string };
+
+// ONE project, end to end: checkout → secrets → desired → bindings → live →
+// diff → (apply). There is exactly one implementation of what a project run IS,
+// and both `cast diff <repo>` and `cast diff --all` call it — a second, parallel
+// fleet path would be a second thing to keep true, and the two would drift the
+// first time either was touched. That drift is the whole subject of this tool.
+async function runProject(
+  ctx: ProjectRunContext,
+  orgRepo: string,
+): Promise<ProjectResult> {
+  const repoShort = orgRepo.split("/")[1];
+  // The Coolify project name and the secrets-file key are different things
+  // that happen to default to the same string. Only the former is a name
+  // some other system chose: a project built by hand in the UI is called
+  // whatever someone typed. --project overrides that one, and nothing else —
+  // secrets stay keyed by the repo (a state-repo convention we own).
+  const projectName = ctx.projectOverride ?? repoShort;
+  // Exactly the same split, one level down. `--env` is OUR name for the
+  // environment: it selects the manifest block, the environments.yaml
+  // binding, the age key, the store path, the team to assert. `--environment`
+  // is THEIR name for it on the wire, and nothing else. Collapsing the two
+  // (as cast did until now) means a box built by hand in someone's UI gets to
+  // name our environment — and since apply creates the environment from this
+  // value, a legacy box's accident would be inherited by the new one forever.
+  const coolifyEnv = ctx.environmentOverride ?? ctx.envName;
+  const checkout = resolveCheckout(orgRepo, {
+    env: ctx.envName,
+    path: ctx.path,
+  });
+  const store = secretsFileFor(ctx.stateDir, repoShort, ctx.envName);
+  // Named, rather than left to `age` to fail on. A registered project whose
+  // store was never written is a project a fleet run cannot read — and under
+  // --all the headline of this message is what the summary carries, so it has to
+  // say which project and which file rather than "Command failed: age -d".
+  if (!existsSync(store)) {
+    throw new Error(
+      [
+        `no secret store for ${orgRepo} in ${ctx.envName}`,
+        "",
+        `  looked for:  ${store}`,
+        "",
+        "The manifest's ${…} refs are resolved from that store, so there is nothing to",
+        "diff or apply without it. `cast capture` writes one from a live box.",
+      ].join("\n"),
+    );
+  }
+  const secrets = decryptSecrets(store, keyFileFor(ctx.envName));
+  let { desired, resolvedEnvs, backupSchedules } = desiredFromManifest(
+    checkout,
+    ctx.envName,
+    secrets,
+  );
+  assertEnvVarPolicy(
+    ctx.envName,
+    resolvedEnvs,
+    ctx.binding.forbidden_var_patterns,
+  );
+  // Keyed by the REPO, not by --project: --project is the name Coolify's own
+  // UI happens to use for this project, and cast's state is keyed by the name
+  // WE own (same split as the secrets file — see the --project note above).
+  const projectBinding = projectBindingFor(ctx.bindings, ctx.envName, orgRepo);
+  if (ctx.hostnameOverlay) {
+    desired = applyHostnameOverlay(
+      desired,
+      parseYaml(readFileSync(ctx.hostnameOverlay, "utf8")),
+    );
+  }
+  const lookup = await fetchLive(ctx.client, projectName, coolifyEnv);
+  // apply and diff take opposite (and both correct) positions on absence:
+  // apply is *allowed* to be the thing that brings a project into existence,
+  // so [] is a legitimate starting point. diff is only ever a claim about
+  // something that already exists — for it, absence is not an empty diff, it
+  // is the absence of anything to diff against, and reporting a full-create
+  // plan would launder that into a pass. See LiveLookup.
+  //
+  // That split holds under --all unchanged: a fleet diff counts an absent
+  // project as UNREACHABLE (it read nothing, so it may claim nothing), while a
+  // fleet apply creates it, exactly as a single apply would.
+  if (!lookup.found && ctx.command === "diff") {
+    return {
+      status: "absent",
+      message: renderAbsentTarget(lookup, {
+        orgRepo,
+        overridden: ctx.projectOverride !== undefined,
+        envOverridden: ctx.environmentOverride !== undefined,
+      }),
+    };
+  }
+  const aliases = parseResourceAliases(
+    ctx.resources,
+    desired.map((d) => d.name),
+  );
+  // Without this, a diff against a box that names things differently reports
+  // every manifest resource as "to create" and every live one as unknown —
+  // the D-237 lie by another route: a confident full-create plan that verified
+  // nothing, against a box that has all of it under other names.
+  const live = lookup.found ? aliasLive(lookup.live, aliases) : [];
+  if (ctx.mode === "full") {
+    for (const l of live) {
+      l.env = await fetchEnv(ctx.client, l);
+    }
+  }
+  const report = computeDiff(desired, live, ctx.mode, {
+    declaredDestination: projectBinding?.destination_uuid,
+  });
+  console.log(renderDiff(report));
+  if (ctx.command === "diff")
+    return report.clean ? { status: "clean" } : { status: "drift" };
+  const serverUuid = await ctx.client.serverUuid(ctx.binding.server);
+  const githubAppUuid = await ctx.client.githubAppUuid(
+    githubAppNameFor(ctx.bindings, orgRepo),
+  );
+  const exec = buildExecutor(ctx.client, {
+    projectName,
+    // The name the environment gets ON COOLIFY when apply creates it — so an
+    // apply that adopts an existing hand-named environment writes into that
+    // one, rather than creating a second environment beside it.
+    envName: coolifyEnv,
+    serverUuid,
+    githubAppUuid,
+    destinationUuid: projectBinding?.destination_uuid,
+    s3DestinationUuid: ctx.binding.s3_destination,
+    backupSchedules,
+  });
+  const { mutated } = await applyPlan(report, desired, exec);
+  console.log(
+    mutated.length === 0
+      ? "no-op (clean)"
+      : `applied + redeployed: ${mutated.join(", ")}`,
+  );
+  return { status: "applied", mutated };
+}
+
 async function main(): Promise<number> {
   const [command, ...rest] = process.argv.slice(2);
   if (command === "-h" || command === "--help" || command === "help") {
@@ -561,12 +753,39 @@ async function main(): Promise<number> {
         instance: { type: "string" },
         "hostname-overlay": { type: "string" },
         full: { type: "boolean", default: false },
+        all: { type: "boolean", default: false },
       },
     });
     const orgRepo = positionals[0];
     const envName = values.env;
-    if (!orgRepo || !envName) {
+    // --all IS the target, so it replaces the positional rather than joining it.
+    if (!envName || (!orgRepo && !values.all)) {
       console.error(USAGE);
+      return 2;
+    }
+    // Before anything is read: --all names a fleet, and every coordinate below
+    // names ONE project's checkout, ONE project's Coolify name, ONE box's
+    // resource names. See SINGLE_PROJECT_COORDINATES — each refusal says which
+    // flag it was and what applying it fleet-wide would actually do.
+    if (values.all) {
+      const conflict = fleetConflict({
+        "<org>/<repo>": orgRepo,
+        "--path": values.path,
+        "--project": values.project,
+        "--environment": values.environment,
+        "--resource": values.resource,
+        "--hostname-overlay": values["hostname-overlay"],
+      });
+      if (conflict) {
+        console.error(renderFleetConflict(command, conflict));
+        return 2;
+      }
+    }
+    // A checkout cannot decide what prod runs. Refused here, before a state file
+    // is opened, and enforced again where it is actually honored (resolveCheckout)
+    // — same rule, same string, no second spelling of it.
+    if (refusesPathInProd({ env: envName, path: values.path })) {
+      console.error(PATH_IN_PROD_REFUSAL);
       return 2;
     }
     // Up front, before a clone or a decrypt or a single call: `apply` creates
@@ -589,50 +808,23 @@ async function main(): Promise<number> {
       return 2;
     }
     const stateDir = stateDirFrom(values.state);
-    const repoShort = orgRepo.split("/")[1];
-    // The Coolify project name and the secrets-file key are different things
-    // that happen to default to the same string. Only the former is a name
-    // some other system chose: a project built by hand in the UI is called
-    // whatever someone typed. --project overrides that one, and nothing else —
-    // secrets stay keyed by the repo (a state-repo convention we own).
-    const projectName = values.project ?? repoShort;
-    // Exactly the same split, one level down. `--env` is OUR name for the
-    // environment: it selects the manifest block, the environments.yaml
-    // binding, the age key, the store path, the team to assert. `--environment`
-    // is THEIR name for it on the wire, and nothing else. Collapsing the two
-    // (as cast did until now) means a box built by hand in someone's UI gets to
-    // name our environment — and since apply creates the environment from this
-    // value, a legacy box's accident would be inherited by the new one forever.
-    const coolifyEnv = values.environment ?? envName;
-    const checkout = resolveCheckout(orgRepo, {
-      env: envName,
-      path: values.path,
-    });
-    const secrets = decryptSecrets(
-      secretsFileFor(stateDir, repoShort, envName),
-      keyFileFor(envName),
-    );
-    let { desired, resolvedEnvs, backupSchedules } = desiredFromManifest(
-      checkout,
-      envName,
-      secrets,
-    );
-    const bindings = loadBindings(join(stateDir, "environments.yaml"));
+    const bindingsPath = join(stateDir, "environments.yaml");
+    const bindings = loadBindings(bindingsPath);
     const binding = bindings.environments[envName];
     if (!binding) {
       console.error(`environment ${envName} not in environments.yaml`);
       return 2;
     }
-    assertEnvVarPolicy(envName, resolvedEnvs, binding.forbidden_var_patterns);
-    // Keyed by the REPO, not by --project: --project is the name Coolify's own
-    // UI happens to use for this project, and cast's state is keyed by the name
-    // WE own (same split as the secrets file — see the --project note above).
-    const projectBinding = projectBindingFor(bindings, envName, orgRepo);
-    if (values["hostname-overlay"]) {
-      desired = applyHostnameOverlay(
-        desired,
-        parseYaml(readFileSync(values["hostname-overlay"], "utf8")),
+    // The fleet, or the one repo that was named. `projectsIn` is the ONLY place
+    // "every project" comes from: a registry that does not list a project is a
+    // registry that has never heard of it, and cast does not go looking for one
+    // behind the operator's back.
+    const targets = values.all ? projectsIn(bindings, envName) : [orgRepo];
+    if (values.all && targets.length === 0) {
+      console.error(
+        renderEmptyRegistry(command, envName, bindings, bindingsPath),
       );
+      return 2;
     }
     const { instance, client } = openCoolify(
       stateDir,
@@ -646,68 +838,85 @@ async function main(): Promise<number> {
     // cheerfully report "everything is absent" and an unasserted `apply`
     // would then create all of it in the wrong team. The read is already
     // the lie; gate it, not just the write.
+    //
+    // Hoisted OUT of runProject deliberately, and it changes nothing about when
+    // it lands: the instance is one instance and the team is one team for the
+    // whole run, so asserting once here is asserting strictly before the FIRST
+    // project's first read. Re-asserting per project would be the same call with
+    // the same answer, N times.
     const team = await assertTeam(client, binding.team, envName);
     console.log(`team ${formatTeam(team)} ✓`);
-    const mode = command === "apply" || values.full ? "full" : "structural";
-    const lookup = await fetchLive(client, projectName, coolifyEnv);
-    // apply and diff take opposite (and both correct) positions on absence:
-    // apply is *allowed* to be the thing that brings a project into existence,
-    // so [] is a legitimate starting point. diff is only ever a claim about
-    // something that already exists — for it, absence is not an empty diff, it
-    // is the absence of anything to diff against, and reporting a full-create
-    // plan would launder that into a pass. See LiveLookup.
-    if (!lookup.found && command === "diff") {
-      console.error(
-        renderAbsentTarget(lookup, {
-          orgRepo,
-          overridden: values.project !== undefined,
-          envOverridden: values.environment !== undefined,
-        }),
-      );
-      return 2;
+    const ctx: ProjectRunContext = {
+      command,
+      stateDir,
+      envName,
+      bindings,
+      binding,
+      client,
+      mode: command === "apply" || values.full ? "full" : "structural",
+      path: values.path,
+      projectOverride: values.project,
+      environmentOverride: values.environment,
+      resources: values.resource ?? [],
+      hostnameOverlay: values["hostname-overlay"],
+    };
+    if (!values.all) {
+      const result = await runProject(ctx, targets[0]);
+      if (result.status === "absent") {
+        console.error(result.message);
+        return 2;
+      }
+      if (command === "diff") return result.status === "clean" ? 0 : 1;
+      return 0;
     }
-    const aliases = parseResourceAliases(
-      values.resource ?? [],
-      desired.map((d) => d.name),
-    );
-    // Without this, a diff against a box that names things differently reports
-    // every manifest resource as "to create" and every live one as unknown —
-    // the D-237 lie by another route: a confident full-create plan that verified
-    // nothing, against a box that has all of it under other names.
-    const live = lookup.found ? aliasLive(lookup.live, aliases) : [];
-    if (mode === "full") {
-      for (const l of live) {
-        l.env = await fetchEnv(client, l);
+    const outcomes: ProjectOutcome[] = [];
+    for (const [i, repo] of targets.entries()) {
+      console.log(renderProjectHeading(repo, i + 1, targets.length));
+      try {
+        const result = await runProject(ctx, repo);
+        if (result.status === "absent") {
+          console.error(result.message);
+          outcomes.push({
+            repo,
+            status: "unreachable",
+            message: result.message,
+          });
+        } else if (result.status === "applied") {
+          outcomes.push({ repo, status: "applied", mutated: result.mutated });
+        } else {
+          outcomes.push({ repo, status: result.status });
+        }
+      } catch (err) {
+        // Every way a project can fail to answer — a clone that will not clone,
+        // a manifest with no block for this environment, a store that will not
+        // decrypt, a 500 from Coolify — arrives here, and NONE of them is a skip.
+        // The single-project path lets these throw to main's handler; a fleet run
+        // cannot, or the first bad project would take the rest of the report with
+        // it (`diff`) or leave it un-summarized (`apply`).
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(message);
+        outcomes.push({ repo, status: "unreachable", message });
+      }
+      // `diff --all` runs every project to completion: stopping early hides the
+      // drift in the projects it never reached, and a partial read is exactly the
+      // report this flag exists to make impossible. `apply --all` does the
+      // opposite and stops — continuing to MUTATE a fleet after an unexplained
+      // failure is not a thing cast gets to do. The two dispositions differ
+      // because a read that continues costs nothing and a write that continues
+      // costs everything.
+      if (
+        command === "apply" &&
+        outcomes[outcomes.length - 1].status === "unreachable"
+      ) {
+        break;
       }
     }
-    const report = computeDiff(desired, live, mode, {
-      declaredDestination: projectBinding?.destination_uuid,
-    });
-    console.log(renderDiff(report));
-    if (command === "diff") return report.clean ? 0 : 1;
-    const serverUuid = await client.serverUuid(binding.server);
-    const githubAppUuid = await client.githubAppUuid(
-      githubAppNameFor(bindings, orgRepo),
-    );
-    const exec = buildExecutor(client, {
-      projectName,
-      // The name the environment gets ON COOLIFY when apply creates it — so an
-      // apply that adopts an existing hand-named environment writes into that
-      // one, rather than creating a second environment beside it.
-      envName: coolifyEnv,
-      serverUuid,
-      githubAppUuid,
-      destinationUuid: projectBinding?.destination_uuid,
-      s3DestinationUuid: binding.s3_destination,
-      backupSchedules,
-    });
-    const { mutated } = await applyPlan(report, desired, exec);
     console.log(
-      mutated.length === 0
-        ? "no-op (clean)"
-        : `applied + redeployed: ${mutated.join(", ")}`,
+      command === "diff"
+        ? renderFleetDiff(envName, targets, outcomes)
+        : renderFleetApply(envName, targets, outcomes),
     );
-    return 0;
+    return fleetExitCode(command, targets, outcomes);
   }
   if (command === "capture") {
     const { values, positionals } = parseArgs({

@@ -368,9 +368,14 @@ export function smokeTargetFor(
 // registry is a set; this returns it as one.
 //
 // `[]` when there is no registry, which is every state file written before this
-// block existed. That is the honest answer for "which projects are registered
-// here" when nothing is registered anywhere — and it makes a fleet verb over an
-// unmigrated state file a clean no-op rather than a crash.
+// block existed. That is the honest answer to "which projects are registered
+// here" when nothing is registered anywhere — and it is emphatically NOT a
+// licence to do nothing with it: the fleet verbs REFUSE on an empty list (#26,
+// renderEmptyRegistry). An earlier draft of this comment guessed that `[]` would
+// make `--all` over an unmigrated state file "a clean no-op rather than a crash",
+// which is precisely backwards — "0 projects, clean" is a clean fleet's report
+// printed over a fleet nobody looked at. There is no honest no-op here; there is
+// only a refusal that says what it looked for.
 export function projectsIn(bindings: Bindings, envName: string): string[] {
   const registry = bindings.projects;
   if (!registry) return [];

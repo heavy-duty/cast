@@ -33,6 +33,54 @@ export type Classification = {
   conflicts: Array<{ ref: string; values: Site[] }>;
 };
 
+// The manifest resources that no resource of that name exists for on the source.
+//
+// This is the absent-target lie (#12/D-237) one level deeper in the tree, and it
+// fails in exactly the same way: a resource that is ABSENT reads back
+// identically to one that is PRESENT with no env vars set. Every name it
+// declares reports MISSING, the run refuses, and the message tells the operator
+// to supply each of them with --override — which would "work", writing a
+// perfectly valid store, while the real finding (the manifest and the box
+// disagree about what this resource is called) is never discovered and the
+// operator hand-carries values that were sitting right there under another name.
+//
+// So: refuse on the RESOURCE first, and only report per-name MISSING for
+// resources that were actually found — where it means what it says.
+export function absentResources(
+  required: RequiredSecret[],
+  liveNames: Iterable<string>,
+): string[] {
+  const live = new Set(liveNames);
+  const declared = new Set(required.map((r) => r.resource));
+  return [...declared].filter((name) => !live.has(name)).sort();
+}
+
+export function renderAbsentResources(
+  absent: string[],
+  live: Array<{ kind: string; name: string }>,
+  ctx: { project: string; environment: string },
+): string {
+  const width = Math.max(0, ...live.map((l) => l.kind.length));
+  return [
+    `refusing to capture: the manifest declares ${absent.length} resource(s) that do not exist here`,
+    "",
+    `  looked in:   project "${ctx.project}", environment "${ctx.environment}"`,
+    `  looked for:  ${absent.join(", ")}`,
+    "  exists here:",
+    ...(live.length > 0
+      ? live.map((l) => `    ${l.kind.padEnd(width)}  ${l.name}`)
+      : ["    (nothing at all)"]),
+    "",
+    "A resource that is absent reads back exactly like one with no env vars set:",
+    "every name it declares reports MISSING, and --override would then have you",
+    "hand-carry values that are sitting right there under a different name. The",
+    "finding is not that the secrets are missing — it is that the manifest and this",
+    "box disagree about what these resources are called.",
+    "",
+    "Reconcile the names first (`cast inventory` shows both sides), then capture.",
+  ].join("\n");
+}
+
 function groupByRef(required: RequiredSecret[]): Map<string, Site[]> {
   const byRef = new Map<string, Site[]>();
   for (const { ref, resource, key } of required) {

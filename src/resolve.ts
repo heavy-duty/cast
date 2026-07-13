@@ -6,6 +6,7 @@ import type { Desired } from "./diff.js";
 import {
   type ResolvedEnv,
   resolveTemplate,
+  templateKeys,
   templateRefs,
 } from "./envtemplate.js";
 import { loadManifest } from "./manifest.js";
@@ -243,6 +244,55 @@ export function requiredSecrets(
     );
   }
   return { required, generated };
+}
+
+// What the manifest declares for an environment, as names only — no secrets, no
+// age key, no store. `inventory` runs BEFORE any of those exist (that is the
+// point of it: you read the box before you can possibly have adopted it), so it
+// must be able to describe the manifest side without resolving a single value.
+export type ManifestResource = {
+  kind: "application" | "database" | "service";
+  name: string;
+  envKeys: string[];
+};
+
+export function manifestResources(
+  checkoutDir: string,
+  envName: string,
+): ManifestResource[] {
+  const manifest = loadManifest(join(checkoutDir, ".infra", "manifest.yaml"));
+  const envSpec = manifest.environments[envName];
+  if (!envSpec) {
+    throw new Error(
+      `environment ${envName} not in manifest (has: ${Object.keys(manifest.environments).join(", ") || "none"})`,
+    );
+  }
+  const keysOf = (resource: string, template?: string): string[] => {
+    if (!template) return [];
+    const file = join(checkoutDir, ".infra", "env", template);
+    if (!existsSync(file))
+      throw new Error(
+        `env template missing: ${file} (referenced by ${resource})`,
+      );
+    return templateKeys(readFileSync(file, "utf8"));
+  };
+  return [
+    ...Object.entries(envSpec.applications).map(([name, app]) => ({
+      kind: "application" as const,
+      name,
+      envKeys: keysOf(name, app.env_template),
+    })),
+    ...Object.entries(envSpec.databases ?? {}).map(([name]) => ({
+      kind: "database" as const,
+      name,
+      envKeys: [],
+    })),
+    ...Object.entries(envSpec.services ?? {}).map(([name, svc]) => ({
+      kind: "service" as const,
+      name,
+      envKeys: keysOf(name, svc.env_template),
+    })),
+  ];
 }
 
 export function desiredFromManifest(

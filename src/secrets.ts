@@ -22,6 +22,27 @@ export function decryptSecrets(
   return secrets;
 }
 
+// Write an environment's secret store, encrypted to its recipient.
+//
+// The plaintext goes to age on STDIN and the ciphertext straight to `file`: it
+// is never a temp file, never reaches the terminal, and never lands in shell
+// history. The hand-run recipe this replaces assembled /dev/shm/prod.env and
+// relied on remembering to `shred -u` it afterwards — a step that is invisible
+// when it is skipped.
+export function encryptSecrets(
+  recipient: string,
+  file: string,
+  vars: Record<string, string>,
+): void {
+  const plaintext = `${Object.entries(vars)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n")}\n`;
+  execFileSync("age", ["-r", recipient, "-o", file], {
+    input: plaintext,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+}
+
 // The age identity for an environment, resolved without cast knowing anything
 // about your environment names:
 //

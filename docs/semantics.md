@@ -158,6 +158,132 @@ softened by an implementation detail):
   refuses `--path` combined with `--env prod`: prod always reads the default
   branch, so a feature-branch checkout can never reach it.
 
+## Instance selection
+
+**The Coolify a command talks to is an explicit, named value** — not a property
+of whatever `<state>/.coolify.env` happens to contain at the moment. Resolution
+order, highest first:
+
+1. `--instance <name>` → `<state>/.coolify/<name>.env`
+2. the environment's `instance:` binding in `environments.yaml`
+3. `<state>/.coolify.env` (the default; unchanged when neither of the above is
+   used)
+
+Two refusals, both fail-closed:
+
+- **An unknown `--instance` aborts**, naming the instances that do exist. It
+  does *not* fall back to the default — that fallback is how a `--full` diff
+  meant for a legacy box gets run against production.
+- **`COOLIFY_READ_ONLY=true` in an instance file makes it read-only**, and
+  `apply` / `smoke` / `server add` refuse it *before their first call*. The
+  guard is the **declaration**, not the token's scope: an instance configured
+  for inspection must not be writable even when the token it holds would permit
+  the writes. `diff`, `team` and `capture` still work against it — they read.
+
+Every command that reaches a live Coolify prints which one, next to the team
+assert.
+
+## Adoption (`capture`)
+
+`capture` is the only verb that writes *into* the state directory rather than
+into Coolify, and the only one that reads a hand-built instance as a **source**
+rather than as a target. It exists because cast is otherwise scoped to the
+steady state and has no bootstrap path for a box that predates its manifest.
+
+**The required set comes from the manifest, not from the box.** The names are
+the `${…}` refs in that environment's env templates, read by the same parser
+`apply` uses to demand them (`parseTemplate`, shared by `resolveTemplate` and
+`templateRefs` — deliberately one grammar, because a drift between the two
+would mean `capture` collects a different set than `apply` will later require,
+which is the "a name silently missed" failure it exists to remove). So the store
+it writes contains **exactly** the names the manifest requires: a live var
+nobody asked for is not the store's business, and a template literal
+(`NODE_ENV=production`) is not a secret.
+
+**The mapping is not mechanical, and must not be.** Some entries encode
+migration decisions rather than facts about the source box:
+
+- A `DATABASE_URL` / `REDIS_URL` read off the source points at the **source
+  box's** Postgres/Redis. Copying it is confidently wrong in a way that looks
+  entirely plausible, and the target's real URL does not exist until Coolify
+  creates the resource. These are declared `generated_secrets:` in the manifest
+  environment and written as the literal `pending-coolify-generated`.
+- staging's `ADMIN_EMAIL` must be the operator, not the source's value: staging
+  and prod share a Mailgun domain, so a staging box carrying the real address
+  can mail real users. That is `--override`.
+
+A "capture everything" verb would therefore be silently wrong in a handful of
+entries out of seventeen — worse than being wrong in all of them. So every
+required name is **forced into a disposition**, and two of the four stop the
+run:
+
+| disposition | source | outcome |
+| --- | --- | --- |
+| captured | found live | value taken |
+| generated | manifest `generated_secrets` (or `--generated`) | `pending-coolify-generated` |
+| overridden | `$CAST_CAPTURE_<NAME>` | operator's value |
+| **missing** | required by a template, absent live | **refuses** |
+| **conflict** | one name, different live values on two resources | **refuses** |
+
+`generated_secrets` is a **manifest** property, not a flag: the manifest is what
+knows `DATABASE_URL` comes from a database it declares. An entry naming
+something no template refs is a hard error — dead config here is not untidy but
+dangerous, because it reads like a guard standing over a name while standing
+over nothing, and the likeliest cause is a typo whose real name is then
+*captured* from the source box instead of placeheld.
+
+**Secret hygiene**, all enforced by tests against real values:
+
+- The plan prints **names and provenance, never values**. (The one value-shaped
+  thing it prints is the `pending-coolify-generated` literal, which carries no
+  information about the source.)
+- An `--override`'s value is read from `$CAST_CAPTURE_<NAME>`, **never from
+  argv** — a command-line value is visible in `ps` to every process on the box.
+- Plaintext is piped to `age` on **stdin**: never a temp file, never stdout,
+  never shell history. The hand-run recipe this replaces wrote
+  `/dev/shm/prod.env` and relied on remembering to `shred -u` it.
+- An existing store is **not overwritten** without `--force`: it may hold the
+  only copy of values the source box no longer has. Same disposition as apply's
+  never-delete.
+
+**`capture` takes `diff`'s position on an absent target** (see `LiveLookup`),
+and refuses one: against a project or environment that isn't there it would read
+back zero live values and report every required secret as *missing* — an
+alarming, meaningless report about the wrong box. It also inherits the team
+assert (a wrong-team token reads back `null` for everything, producing the same
+lie) and the `--path`-with-`--env prod` refusal (a feature-branch manifest must
+not decide which names land in the prod store).
+
+The final gate is a **typed confirmation** — the environment's own name, after
+the plan. There is no `--yes`: a store written without someone reading the
+provenance column is the outcome the verb exists to prevent. A closed stdin
+aborts rather than hanging.
+
+## Cloning a private manifest
+
+`resolveCheckout` resolves git credentials **inside cast**, in a fixed order —
+`gh` borrowed as a per-invocation credential helper, then
+`GITHUB_TOKEN`/`GH_TOKEN`, then the ambient helper — rather than leaving it to
+whatever the workstation's git config happens to do.
+
+It matters because `gh auth login` **does not** wire git's credential helper
+(that is `gh auth setup-git`, a separate act most people never run), so a
+perfectly logged-in operator still fell through to git's interactive
+username/password prompt — which GitHub no longer accepts — and got an error
+about *the repository* rather than about the missing credentials. There is no
+routing around it for prod: `--path` is refused there, so the clone is the only
+path and its auth is mandatory.
+
+`GIT_TERMINAL_PROMPT=0` is set on every path, so cast can never hang on or fall
+into that prompt. The token is never placed in the clone URL or in
+`http.extraheader` — both leak it into `ps`, and the latter persists it into the
+clone's `.git/config`; the helper reads it from the environment at run time, so
+what lands in argv is the literal text `$CAST_GIT_TOKEN`. Note that the empty
+`credential.helper=` reset clears **URL-scoped** helpers
+(`credential.https://github.com.helper`, which is what `gh auth setup-git`
+writes) as well as generic ones, so cast's chosen credential is genuinely the
+one used — verified against a live private clone.
+
 **Known limitations, not defects:**
 
 - **Backup schedules are create-time only.** A manifest database's `backup`

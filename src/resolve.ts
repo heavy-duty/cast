@@ -3,7 +3,11 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Desired } from "./diff.js";
-import { type ResolvedEnv, resolveTemplate } from "./envtemplate.js";
+import {
+  type ResolvedEnv,
+  resolveTemplate,
+  templateRefs,
+} from "./envtemplate.js";
 import { loadManifest } from "./manifest.js";
 
 // How cast authenticated (or failed to authenticate) a clone.
@@ -132,8 +136,11 @@ export function resolveCheckout(
   opts: { env: string; path?: string },
 ): string {
   if (opts.path && opts.env === "prod") {
+    // Holds for every verb that reads a manifest (apply, and now capture): a
+    // feature-branch checkout must not be able to decide what prod runs, nor
+    // which secret names land in prod's store.
     throw new Error(
-      "apply refuses --path with --env prod: prod always reads the default branch",
+      "refuses --path with --env prod: prod always reads the default branch",
     );
   }
   if (opts.path) return opts.path;
@@ -169,6 +176,73 @@ export function resolveCheckout(
     throw new Error(cloneFailureMessage(orgRepo, auth, stderr));
   }
   return dir;
+}
+
+// One secret the manifest requires: the ${REF} a template names (the key it
+// gets in the age store), the resource that needs it, and the env var it lands
+// on there. That last pair is what `capture` reads the live value from — the
+// store is keyed by REF, but the live box knows it as `resource.key`.
+export type RequiredSecret = { ref: string; resource: string; key: string };
+
+// Exactly the set of secret names an environment's manifest demands — the same
+// set `apply` will later insist on, read from the same templates by the same
+// parser. `capture` uses this to know what to go and fetch; nothing else has to
+// be told, and nothing can be silently missed.
+//
+// Deliberately does NOT take a secrets map: at capture time the store does not
+// exist yet. That is the whole point of the verb.
+export function requiredSecrets(
+  checkoutDir: string,
+  envName: string,
+): { required: RequiredSecret[]; generated: string[] } {
+  const manifest = loadManifest(join(checkoutDir, ".infra", "manifest.yaml"));
+  const envSpec = manifest.environments[envName];
+  if (!envSpec) {
+    throw new Error(
+      `environment ${envName} not in manifest (has: ${Object.keys(manifest.environments).join(", ") || "none"})`,
+    );
+  }
+  const required: RequiredSecret[] = [];
+  const collect = (resource: string, template?: string) => {
+    if (!template) return;
+    const file = join(checkoutDir, ".infra", "env", template);
+    if (!existsSync(file))
+      throw new Error(
+        `env template missing: ${file} (referenced by ${resource})`,
+      );
+    for (const { key, ref } of templateRefs(readFileSync(file, "utf8"))) {
+      required.push({ ref, resource, key });
+    }
+  };
+  for (const [name, app] of Object.entries(envSpec.applications)) {
+    collect(name, app.env_template);
+  }
+  for (const [name, svc] of Object.entries(envSpec.services ?? {})) {
+    collect(name, svc.env_template);
+  }
+  const generated = envSpec.generated_secrets ?? [];
+  // A generated_secrets entry naming something no template refs is dead
+  // config — and dead config in THIS list is not merely untidy, it is
+  // dangerous: it reads like a guard standing over a name while standing over
+  // nothing. The likeliest cause is a typo, and the consequence of the typo is
+  // that the real name gets CAPTURED from the source box instead of placeheld.
+  const refs = new Set(required.map((r) => r.ref));
+  const dead = generated.filter((g) => !refs.has(g));
+  if (dead.length > 0) {
+    throw new Error(
+      [
+        `manifest environment ${envName}: generated_secrets names ${dead.join(", ")}, which no env template refers to`,
+        "",
+        `  declared:   ${generated.join(", ")}`,
+        `  templates:  ${[...refs].sort().join(", ") || "(no ${...} refs at all)"}`,
+        "",
+        "A generated name that matches nothing guards nothing — and if this is a",
+        "typo, the name it was meant to guard is being captured from the source",
+        "box instead of placeheld. Fix the spelling, or drop the entry.",
+      ].join("\n"),
+    );
+  }
+  return { required, generated };
 }
 
 export function desiredFromManifest(

@@ -47,6 +47,12 @@ const BindingsSchema = z
           // An explicit --instance still wins, so a one-off read against a
           // legacy box needs no change to this file either.
           instance: z.string().optional(),
+          // The age recipient (public key) this environment's secret store is
+          // encrypted TO. Only `capture` needs it — decryption resolves an
+          // identity per keyFileFor, and the state repo deliberately holds
+          // ciphertext but never the identity that opens it. This is the
+          // public half, so it is safe to commit here next to the bindings.
+          age_recipient: z.string().optional(),
           s3_destination: z.string().optional(),
           // Var-name patterns this environment refuses outright (see
           // assertEnvVarPolicy). Operator-owned guard: prod typically bans

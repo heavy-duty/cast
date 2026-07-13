@@ -52,6 +52,7 @@ environments.yaml               # bindings: the team each env's token must belon
                                 #   GitHub App name, smoke target, guards
 secrets/<repo>.<env>.env.age    # age-encrypted values for the ${…} placeholders
 .coolify.env                    # COOLIFY_BASE_URL + COOLIFY_ACCESS_TOKEN (never commit)
+.coolify/<name>.env             # …the same, for a NAMED instance (see below)
 ```
 
 Pass it with `--state <dir>`, or set `CAST_STATE`. Defaults to the cwd.
@@ -59,8 +60,9 @@ Pass it with `--state <dir>`, or set `CAST_STATE`. Defaults to the cwd.
 ## Commands
 
 ```sh
-cast apply <org>/<repo> --env <env> [--path <dir>] [--hostname-overlay <file>]
-cast diff  <org>/<repo> --env <env> [--full]
+cast apply   <org>/<repo> --env <env> [--path <dir>] [--hostname-overlay <file>]
+cast diff    <org>/<repo> --env <env> [--full]
+cast capture <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
 cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
 cast smoke --env <env>
 cast team [--env <env>]
@@ -73,6 +75,9 @@ cast team [--env <env>]
   default branch).
 - **`diff`** — reports drift, manifest → Coolify. Structural by default; `--full`
   also compares env vars. Exits non-zero when dirty, so CI can gate on it.
+- **`capture`** — the adoption path: reads a hand-built instance's live env and
+  writes the environment's age store from it. See *Adopting a hand-built
+  instance* below.
 - **`server add`** — uploads a server's private key and registers it with Coolify.
 - **`smoke`** — contract test against `smoke_target`: proves Coolify's bulk env
   endpoint still *upserts* rather than replacing. Run it after every Coolify
@@ -88,6 +93,118 @@ them first asserts the token's team (below).
 
 `--hostname-overlay` swaps domains for a pre-flight run against temporary
 hostnames; re-applying **without** it is the cutover.
+
+## Cloning: cast authenticates, and never prompts
+
+`apply`, `diff` and `capture` clone the product repo (unless `--path` points at a
+local checkout — refused for prod, which always reads the default branch). For a
+private repo that needs credentials, and cast resolves them itself:
+
+1. **`gh`**, borrowed as a credential helper for that one invocation — it does
+   not touch your global git config.
+2. **`GITHUB_TOKEN` / `GH_TOKEN`** from the environment (the CI path).
+3. Whatever git's own credential helper does, if you have one.
+
+Being logged into `gh` is enough. You do **not** need `gh auth setup-git` —
+that separate act is what wires git's helper, and not running it is exactly how
+you end up at git's interactive username/password prompt, which GitHub no longer
+accepts. cast sets `GIT_TERMINAL_PROMPT=0` on every path, so it can never hang
+there or hide a credentials failure behind an error about *the repository*. With
+no credentials at all it says so, and names the fix.
+
+The token is never put in the clone URL or in `http.extraheader` — both leak it
+into `ps`, and the latter persists it into the clone's git config.
+
+## Many Coolifys
+
+`--instance <name>` reads `<state>/.coolify/<name>.env` instead of
+`<state>/.coolify.env`. Every verb that reaches Coolify takes it.
+
+```sh
+cast diff heavy-duty/incubator --env prod --full --instance legacy
+```
+
+An environment can bind one, so `--env` selects the right control plane with no
+flag at all:
+
+```yaml
+environments:
+  prod:
+    server: prod-box
+    team: { id: 1, name: heavy-duty }
+    instance: prod-cp        # → <state>/.coolify/prod-cp.env
+```
+
+An explicit `--instance` still wins, so a one-off read against a legacy box needs
+no edit to that file either. **With no flag and no binding, nothing changes** —
+`.coolify.env` is read exactly as before.
+
+Two properties, both deliberate:
+
+- **An unknown `--instance` refuses**, and names the instances that do exist.
+  Falling back to the default is how a diff meant for a legacy box gets run
+  against production.
+- **An instance may declare `COOLIFY_READ_ONLY=true`**, and then `apply`,
+  `smoke` and `server add` refuse it — *before their first call*, and even
+  though the token itself would permit the writes. That turns "I pointed the
+  wrong token at the wrong box" from a live incident into an exit code.
+
+Every command that reaches a Coolify now says which one, next to the team
+assert. It is the most consequential input to any run, and the least visible.
+
+## Adopting a hand-built instance
+
+cast is otherwise scoped to the steady state: manifest → Coolify, forever.
+`capture` is the one-way-in — it bootstraps an environment's age store from an
+instance that was built by hand, before any manifest existed.
+
+```sh
+CAST_CAPTURE_ADMIN_EMAIL=me@example.com \
+  cast capture heavy-duty/incubator --env prod --instance legacy \
+    --override ADMIN_EMAIL
+```
+
+It reads the required secret **names** from the manifest's own env templates (the
+`${…}` refs — the manifest already declares exactly this set), reads the live
+values off the instance, and classifies every name:
+
+| | |
+| --- | --- |
+| **captured** | found live, value taken |
+| **generated** | the manifest's `generated_secrets` declares it provider-made → written as the literal `pending-coolify-generated`, never the live value |
+| **overridden** | supplied by you, for a value that must *not* be carried over |
+| **missing** | required by a template, absent live → **refuses** |
+
+Then it prints a plan of **names and provenance — never values** — and waits for
+you to type the environment's name.
+
+The mapping is not mechanical, and that is the whole design. A `DATABASE_URL`
+copied off the source box points at the *source box's* Postgres: confidently
+wrong, entirely plausible, and the target's real URL does not exist until Coolify
+creates the resource. So the manifest declares those names, and cast placeholds
+them:
+
+```yaml
+environments:
+  prod:
+    generated_secrets: [DATABASE_URL_PROD, REDIS_URL_PROD, UMAMI_DATABASE_URL]
+```
+
+It is a manifest property rather than a flag you have to remember, because the
+manifest is what knows `DATABASE_URL` comes from a database it declares. (A
+`generated_secrets` entry no template refers to is a schema error — a guard
+standing over nothing is worse than no guard, because it reads like one.
+`--generated <NAME>` covers a manifest that hasn't declared them yet.)
+
+An **`--override`**'s value is read from `$CAST_CAPTURE_<NAME>`, never from the
+command line: argv is visible in `ps` to every process on the box. It exists for
+values that must not survive the copy — staging and prod sharing a Mailgun
+domain means a staging box carrying the real `ADMIN_EMAIL` can mail real users.
+
+The store is encrypted to the environment's `age_recipient` (add it to
+`environments.yaml` — it's the public half, safe to commit). Plaintext goes to
+`age` on stdin: it is never a temp file, never on stdout, never in your shell
+history. An existing store is not overwritten without `--force`.
 
 **[docs/semantics.md](docs/semantics.md)** is the contract behind those
 commands: what `apply` guarantees (never deletes, never recreates a database,

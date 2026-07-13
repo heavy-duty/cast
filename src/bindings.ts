@@ -52,6 +52,11 @@ const ProjectBindingSchema = z
     // app, and the day a second project deploys into this environment, an
     // environment-scoped (let alone the state-file-scoped one it replaces)
     // `smoke_target: core` is simply wrong.
+    //
+    // It is declared here AND resolved here (#29): `smoke` looks the name up in
+    // this project, in this environment, and refuses when it is not there. A
+    // bare app name is unique nowhere else — the instance-wide lookup it used to
+    // do could pick prod's `core` while smoking staging.
     smoke_target: z.string().optional(),
   })
   .strict();
@@ -146,22 +151,61 @@ const BindingsSchema = z
     // slug; a bare `<repo>` key still resolves (see githubAppNameFor) so
     // existing state files keep working.
     github_apps: z.record(z.string()),
-    // DEPRECATED — moved to environments.<env>.projects.<repo>.smoke_target.
-    // Still read (see smokeTargetFor) so state files written before the move
-    // keep working, on the same reasoning as the bare-`<repo>` github_apps key.
-    // It is wrong at TWO levels: it names one project's app (`core`) from a key
-    // scoped to the whole state file, so it cannot distinguish two projects and
-    // cannot distinguish prod's app from staging's either.
+    // GONE — nothing reads this any more (#29). It is still DECLARED here, and
+    // refused below with a message, precisely because it is gone: this schema is
+    // .strict(), so deleting the field outright would make an unmigrated state
+    // file fail with a raw zod "unrecognized key" — and loadBindings runs for
+    // EVERY verb, so `diff`, `apply`, `capture` and `inventory` would all die on
+    // a key none of them ever read, mid-migration, with a message about nothing.
+    // A key that has to be removed by hand gets a sentence saying how.
     smoke_target: z.string().optional(),
   })
   .strict()
-  // The registry only earns its keep if it is TRUE. Every check here defends the
-  // same failure: a project that a fleet run never visits, because a fleet run
-  // that skips a project prints exactly what a fleet run over a clean project
-  // prints — nothing. Silence is the one report that must never be ambiguous, so
-  // these are parse-time errors (every verb loads bindings, so every verb refuses
-  // a registry that lies) rather than warnings some command might print.
+  // Every check here defends one failure, from two ends: state that a command
+  // will silently fail to act on. A registry that lies makes a fleet run skip a
+  // project — and a skipped project prints exactly what a clean one prints,
+  // nothing. A removed key that is still present makes `smoke` look like it has
+  // a target when nothing reads it. Silence is the one report that must never be
+  // ambiguous, so these are parse-time errors (every verb loads bindings, so
+  // every verb refuses) rather than warnings some command might print.
   .superRefine((bindings, ctx) => {
+    // GONE, not merely deprecated (#29) — see the field's note above. Reported
+    // first, and without returning: a file may well carry both this and a
+    // registry that needs fixing, and the operator should learn about both in
+    // one run rather than one per run.
+    if (bindings.smoke_target !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["smoke_target"],
+        // The key could never be fixed, only carried: `smoke` now resolves its
+        // target inside the project and environment the target was declared
+        // under, and a key scoped to the whole state file has no project to
+        // scope to. Carrying it meant keeping the instance-wide name lookup
+        // alive for exactly the invocation that most needed it dead —
+        // `cast smoke --env prod`.
+        message: [
+          "the top-level `smoke_target` key is no longer read (#29)",
+          "",
+          `  found:  smoke_target: ${bindings.smoke_target}   (at the top level of this file)`,
+          "",
+          "It named ONE project's application from a key scoped to the whole state file,",
+          "so it could not tell two projects apart — or even prod's app from staging's.",
+          "`cast smoke` now resolves that name inside the project and environment it was",
+          "declared under, and this key names no project to resolve it in.",
+          "",
+          "Move it under the project it belongs to, and pass that repo to `cast smoke`:",
+          "",
+          "  environments:",
+          "    <env>:",
+          "      projects:",
+          "        <org>/<repo>:",
+          `          smoke_target: ${bindings.smoke_target}`,
+          "",
+          "  cast smoke <org>/<repo> --env <env>",
+        ].join("\n"),
+      });
+    }
+
     const registry = bindings.projects;
     if (!registry) return;
 
@@ -338,25 +382,21 @@ export function projectBindingFor(
   return projects[orgRepo] ?? projects[repoShort];
 }
 
-// The app `cast smoke` targets. Project-scoped first; the deprecated
-// state-file-scoped `smoke_target` is the fallback, so an unmigrated state file
-// still smokes.
+// The app `cast smoke` targets, in ONE project of ONE environment — the only
+// scope in which a bare application name is a coordinate at all. There is no
+// fallback and deliberately none: a name that cannot say which project and
+// which environment it belongs to does not identify an application, and `smoke`
+// writes to whatever it identifies (#29).
 //
-// `orgRepo` is optional because `cast smoke` did not take one until the target
-// became project-scoped — without it there is no project to look up and only
-// the old key can answer, which is exactly what the old invocation did.
+// `orgRepo` is required for the same reason: it is the project. Absence is not
+// an error here — an environment may simply declare no smoke target — but the
+// caller has to say so itself, and `smoke` does.
 export function smokeTargetFor(
   bindings: Bindings,
   envName: string,
-  orgRepo?: string,
-): { target: string; source: "project" | "deprecated" } | undefined {
-  const scoped = orgRepo
-    ? projectBindingFor(bindings, envName, orgRepo)?.smoke_target
-    : undefined;
-  if (scoped) return { target: scoped, source: "project" };
-  if (bindings.smoke_target)
-    return { target: bindings.smoke_target, source: "deprecated" };
-  return undefined;
+  orgRepo: string,
+): string | undefined {
+  return projectBindingFor(bindings, envName, orgRepo)?.smoke_target;
 }
 
 // The `<org>/<repo>` slugs registered for one environment — the list a fleet
@@ -389,7 +429,9 @@ export function loadBindings(
   if (!result.success) {
     // Zod's own `.message` is the entire issue array as JSON — which renders the
     // refusals above as one long line of `\n` escapes, i.e. throws away the part
-    // of them that was worth writing. Render the issues instead.
+    // of them that was worth writing. That matters most for the ones that are
+    // not typos at all but migrations (the removed `smoke_target`), where the
+    // message IS the instruction. Render the issues instead.
     const detail = result.error.issues
       .map((issue) => {
         // A multi-line message is one WE wrote: it already names the path, the

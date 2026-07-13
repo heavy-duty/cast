@@ -90,9 +90,11 @@ function stateWith(opts: {
       "    server: prod-box",
       "    team: { id: 0, name: Root Team }",
       ...(opts.boundInstance ? [`    instance: ${opts.boundInstance}`] : []),
+      "    projects:",
+      "      heavy-duty/incubator:",
+      "        smoke_target: core",
       "github_apps:",
       "  incubator: hdb-coolify",
-      "smoke_target: core",
       "",
     ].join("\n"),
   );
@@ -135,9 +137,19 @@ describe("infra cli", () => {
     expect(r.output).toMatch(/--env/);
   });
   it("refuses smoke without --env, exit non-zero", async () => {
-    const r = await runCli(["smoke"]);
+    const r = await runCli(["smoke", "heavy-duty/incubator"]);
     expect(r.code).not.toBe(0);
     expect(r.output).toMatch(/--env/);
+  });
+  // The repo is the PROJECT, and the project is half of the only scope in which
+  // `smoke_target: core` names anything (#29). `cast smoke --env prod` used to
+  // run — resolving the name against every application on the instance — which
+  // is precisely the invocation that could write prod's `core` while smoking
+  // staging. It is now a usage error, before any state is even read.
+  it("refuses smoke without the <org>/<repo> positional, exit non-zero", async () => {
+    const r = await runCli(["smoke", "--env", "prod"]);
+    expect(r.code).toBe(2);
+    expect(r.output).toMatch(/cast smoke\s+<org>\/<repo>/);
   });
 });
 
@@ -235,6 +247,7 @@ describe("--instance (multiple Coolify instances)", () => {
     });
     const r = await runCli([
       "smoke",
+      "heavy-duty/incubator",
       "--state",
       dir,
       "--env",

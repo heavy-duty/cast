@@ -76,12 +76,13 @@ cast team [--env <env>]
   default branch).
 - **`diff`** — reports drift, manifest → Coolify. Structural by default; `--full`
   also compares env vars. Exits non-zero when dirty, so CI can gate on it.
-- **`inventory`** — what is actually *on* a box, and how it lines up with the
-  manifest: resources and env var **keys** (never values), sorted into
-  on-both / manifest-only / box-only. Needs no store, no age key, and no
-  recipient — it runs *before* adoption, which is the point of it. A document,
-  read by a person; nothing here is consumed by `apply`. See *Adopting a
-  hand-built instance*.
+- **`inventory`** — what is actually *on* a box. **With no repo it sweeps the
+  instance** (every project, every environment, every resource — no manifest
+  involved); with a repo it reconciles, showing resources and env var **keys**
+  (never values) sorted into on-both / manifest-only / box-only. Needs no store,
+  no age key, and no recipient — it runs *before* adoption, which is the point of
+  it. A document, read by a person; nothing here is consumed by `apply`. See
+  *Adopting a hand-built instance*.
 - **`capture`** — the adoption path: reads a hand-built instance's live env and
   writes the environment's age store from it. See *Adopting a hand-built
   instance* below.
@@ -173,9 +174,40 @@ clicked *New Resource* that afternoon. `inventory` shows you both sides at once,
 so those differences arrive together, as a document — instead of one at a time,
 as refusals from a verb that is already halfway through a migration.
 
+**First, sweep it — you cannot aim at coordinates you do not have yet:**
+
+```sh
+cast inventory --env prod --instance legacy
+```
+
+```
+sweep — instance legacy (https://coolify.example.com)
+
+  Incubator
+    production     (empty)
+    staging        2 applications, 2 databases, 1 service
+      application  Incubator Stack v2
+      application  Incubator Landing
+      database     Incubator Database v2
+      …
+  La Familia Site
+    production     1 application
+      application  lafamilia-web
+```
+
+Note what that costs you to *not* have: Coolify auto-creates a `production`
+environment in every project, so the obvious guess is empty and the live system
+is somewhere else entirely — under a name someone typed, in a project you may
+not have known was there. An environment with **zero** resources is far more
+often the wrong coordinate than an empty one, and `inventory` says so rather than
+quietly reporting that the manifest has five things the box lacks.
+
+**Then reconcile**, against a target you now know exists:
+
 ```sh
 cast inventory heavy-duty/incubator --env prod --instance legacy \
-  --project Incubator --environment production
+  --project Incubator --environment staging \
+  --resource core="Incubator Stack v2"
 ```
 
 It never reads a value, needs no store and no key, and its output is **not**

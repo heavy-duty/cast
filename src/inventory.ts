@@ -54,6 +54,75 @@ export type Reconciliation = {
 
 const sorted = (xs: Iterable<string>) => [...xs].sort();
 
+// --- The sweep: what is on this box, before any manifest is involved ---
+//
+// The verb's premise is that you are looking at a box you did not build, so you
+// do NOT know its coordinates yet. Requiring a project and an environment to
+// look at it made it a discovery tool that needed you to have already
+// discovered — and the operator went back to hand-curling /projects to find out
+// where anything lived. This is that pass, and it needs no manifest at all.
+
+export type SweepEnvironment = {
+  name: string;
+  resources: Array<{ kind: string; name: string }>;
+};
+
+export type SweepProject = {
+  name: string;
+  environments: SweepEnvironment[];
+};
+
+export function renderSweep(
+  projects: SweepProject[],
+  ctx: { instance: string; baseUrl: string },
+): string {
+  const lines = [
+    `sweep — instance ${ctx.instance} (${ctx.baseUrl})`,
+    "",
+    "  Every project, every environment, every resource this token can see.",
+    "  No manifest involved: this is what is HERE, not how it compares to anything.",
+    "",
+  ];
+  if (projects.length === 0) {
+    lines.push(
+      "  (no projects at all)",
+      "",
+      "  An instance with no projects is more often a token that cannot see them",
+      "  than an empty instance — the team assert above is what rules that out.",
+    );
+    return lines.join("\n");
+  }
+  for (const p of projects) {
+    lines.push(`  ${p.name}`);
+    if (p.environments.length === 0) {
+      lines.push("    (no environments)");
+    }
+    for (const e of p.environments) {
+      const counts = Object.entries(
+        e.resources.reduce<Record<string, number>>((acc, r) => {
+          acc[r.kind] = (acc[r.kind] ?? 0) + 1;
+          return acc;
+        }, {}),
+      )
+        .map(([kind, n]) => `${n} ${kind}${n === 1 ? "" : "s"}`)
+        .join(", ");
+      // An empty environment is worth seeing, not hiding: Coolify auto-creates
+      // `production` in every project, and an operator who assumes that is where
+      // things live will aim every later command at nothing.
+      lines.push(`    ${e.name.padEnd(14)} ${counts || "(empty)"}`);
+      for (const r of e.resources) {
+        lines.push(`      ${r.kind.padEnd(12)} ${r.name}`);
+      }
+    }
+    lines.push("");
+  }
+  lines.push(
+    "Point a reconciliation at one of these with --project / --environment, and",
+    "map any resource whose name differs with --resource <manifest>=<live>.",
+  );
+  return lines.join("\n");
+}
+
 export function reconcile(
   manifest: ManifestResource[],
   live: LiveResource[],
@@ -98,6 +167,40 @@ export function renderInventory(
     environment: string;
   },
 ): string {
+  // The box has NOTHING in it. Not "nothing that matched" — nothing at all.
+  //
+  // This is the third face of the D-237 lie, and the quietest: an environment
+  // with zero resources reads back exactly like a box you have not built yet,
+  // and the report then consists entirely of the manifest talking to itself.
+  // The overall impression — "the box has nothing, the manifest has five things"
+  // — is how a full-create plan gets laundered into a pass. It happened: pointed
+  // at a project's auto-created `production` environment, this verb reported
+  // five differences against a box whose resources were alive and serving
+  // production the whole time, in an environment named `staging`.
+  if (rec.matched.length === 0 && rec.boxOnly.length === 0) {
+    return [
+      `inventory — ${ctx.orgRepo} ${ctx.env}`,
+      "",
+      `  looked in:    project "${ctx.project}", environment "${ctx.environment}"`,
+      `  found:        NOTHING. Not one resource.`,
+      "",
+      "This environment is EMPTY — so there is nothing here to reconcile, and the",
+      "manifest's list below would just be the manifest talking to itself.",
+      "",
+      "An environment with zero resources is far more often the WRONG COORDINATE",
+      "than an empty one. Coolify auto-creates a `production` environment in every",
+      "project, and a box built by hand keeps its real resources wherever someone",
+      "put them — which may well be an environment called something else entirely.",
+      "",
+      "Sweep the instance and see where things actually are:",
+      "",
+      `    cast inventory --env ${ctx.env} --instance ${ctx.instance}`,
+      "",
+      "(The manifest declares: " +
+        rec.manifestOnly.map((m) => m.name).join(", ") +
+        ".)",
+    ].join("\n");
+  }
   const lines = [
     `inventory — ${ctx.orgRepo} ${ctx.env}`,
     "",

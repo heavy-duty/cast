@@ -109,6 +109,44 @@ export class CoolifyClient {
     this.resolve("github app", "/github-apps", name);
   projectUuid = (name: string) => this.resolve("project", "/projects", name);
 
+  // Every project the TOKEN can see. Team-scoped by Coolify itself, which is
+  // why a sweep still asserts the team first: a wrong-team token sees nothing,
+  // and "nothing" would render as "this instance is empty".
+  async projects(): Promise<Array<{ uuid: string; name: string }>> {
+    return (await this.get("/projects")) as Array<{
+      uuid: string;
+      name: string;
+    }>;
+  }
+
+  // A project's environment NAMES.
+  //
+  // Two roads, because the vendored OpenAPI has been wrong before and this is a
+  // discovery path — the one place where failing to enumerate is worse than
+  // being slow. GET /projects/{uuid}/environments is documented; if a given
+  // instance does not serve it, GET /projects/{uuid} carries the same list as a
+  // relation on the project (ProjectController@show eager-loads it). Falling
+  // back beats reporting "no environments" for a project that has several.
+  async environments(projectUuid: string): Promise<string[]> {
+    const names = (items: unknown): string[] =>
+      Array.isArray(items)
+        ? items
+            .map((e) => (e as { name?: unknown })?.name)
+            .filter((n): n is string => typeof n === "string")
+        : [];
+    try {
+      const direct = await this.get(`/projects/${projectUuid}/environments`);
+      const found = names(direct);
+      if (found.length > 0) return found;
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 404) throw err;
+    }
+    const project = (await this.get(`/projects/${projectUuid}`)) as {
+      environments?: unknown;
+    } | null;
+    return names(project?.environments);
+  }
+
   async deploy(uuid: string): Promise<void> {
     await this.post(`/deploy?uuid=${encodeURIComponent(uuid)}`);
   }

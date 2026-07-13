@@ -28,7 +28,14 @@ import {
   renderDiff,
 } from "./diff.js";
 import { assertEnvVarPolicy } from "./envtemplate.js";
-import { type LiveResource, reconcile, renderInventory } from "./inventory.js";
+import {
+  type LiveResource,
+  type SweepEnvironment,
+  type SweepProject,
+  reconcile,
+  renderInventory,
+  renderSweep,
+} from "./inventory.js";
 import {
   desiredFromManifest,
   manifestResources,
@@ -48,7 +55,8 @@ import { assertTeam, formatTeam } from "./team.js";
 const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--hostname-overlay <file>]
        cast diff      <org>/<repo> --env <env> [--full] [--project <name>] [--environment <name>]
        cast capture   <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--generated <NAME>] [--override <NAME>] [--force]
-       cast inventory <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>]
+       cast inventory <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--resource <m>=<l>]
+       cast inventory --env <env> [--instance <name>]     # no repo: SWEEP the whole instance
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
        cast smoke --env <env>
        cast team [--env <env>]
@@ -863,11 +871,55 @@ async function main(): Promise<number> {
     });
     const orgRepo = positionals[0];
     const envName = values.env;
-    if (!orgRepo || !envName) {
+    if (!envName) {
       console.error(USAGE);
       return 2;
     }
     const stateDir = stateDirFrom(values.state);
+    const sweepBindings = loadBindings(join(stateDir, "environments.yaml"));
+    const sweepBinding = sweepBindings.environments[envName];
+    if (!sweepBinding) {
+      console.error(`environment ${envName} not in environments.yaml`);
+      return 2;
+    }
+    // NO REPO → SWEEP. There is nothing to reconcile against, so don't pretend
+    // to: just show what is on the box. This is the pass that has to come first
+    // when the box is one you did not build, and requiring coordinates for it
+    // made inventory a discovery verb that needed you to have already
+    // discovered.
+    if (!orgRepo) {
+      const { instance, client } = openCoolify(
+        stateDir,
+        values.instance,
+        sweepBinding,
+      );
+      // The team assert matters MORE here than anywhere: Coolify scopes what a
+      // token can see to its team, so a wrong-team token sweeps an instance and
+      // truthfully reports that it is empty.
+      const team = await assertTeam(client, sweepBinding.team, envName);
+      console.log(`team ${formatTeam(team)} ✓`);
+      const projects: SweepProject[] = [];
+      for (const p of await client.projects()) {
+        const environments: SweepEnvironment[] = [];
+        for (const name of await client.environments(p.uuid)) {
+          const found = await fetchLive(client, p.name, name);
+          environments.push({
+            name,
+            resources: found.found
+              ? found.live.map((l) => ({ kind: l.kind, name: l.name }))
+              : [],
+          });
+        }
+        projects.push({ name: p.name, environments });
+      }
+      console.log(
+        renderSweep(projects, {
+          instance: instance.name,
+          baseUrl: instance.baseUrl,
+        }),
+      );
+      return 0;
+    }
     const repoShort = orgRepo.split("/")[1];
     const projectName = values.project ?? repoShort;
     const coolifyEnv = values.environment ?? envName;

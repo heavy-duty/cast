@@ -257,6 +257,121 @@ describe("buildExecutor createResource (application, dockercompose)", () => {
   });
 });
 
+// Placement is create-time only, and every kind needs it: Coolify runs the same
+// destination logic in ApplicationsController, DatabasesController and
+// ServicesController, and 400s on a multi-destination server for whichever one
+// omits it. Missing it on the database create alone would be enough to leave a
+// project's Postgres on the shared default network.
+describe("buildExecutor createResource (destination placement)", () => {
+  function captureCreates() {
+    const bodies: Record<string, Record<string, unknown>> = {};
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/api/v1/projects" && (!init || init.method === "GET"))
+        return new Response(
+          JSON.stringify([{ uuid: "proj-1", name: "widget" }]),
+          { status: 200 },
+        );
+      if (
+        path === "/api/v1/applications/private-github-app" ||
+        path === "/api/v1/databases/postgresql" ||
+        path === "/api/v1/services"
+      ) {
+        bodies[path] = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ uuid: "new-1" }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    return { bodies, fetchImpl };
+  }
+
+  const creates = [
+    {
+      path: "/api/v1/applications/private-github-app",
+      change: {
+        kind: "application" as const,
+        name: "core",
+        op: "create" as const,
+        fieldDiffs: [
+          { field: "build_pack", desired: "nixpacks", updatable: false },
+          { field: "domains", desired: ["https://a"], updatable: true },
+        ],
+        envDiffs: [],
+      },
+    },
+    {
+      path: "/api/v1/databases/postgresql",
+      change: {
+        kind: "database" as const,
+        name: "postgres",
+        op: "create" as const,
+        fieldDiffs: [
+          { field: "type", desired: "postgresql", updatable: false },
+        ],
+        envDiffs: [],
+      },
+    },
+    {
+      path: "/api/v1/services",
+      change: {
+        kind: "service" as const,
+        name: "umami",
+        op: "create" as const,
+        fieldDiffs: [{ field: "type", desired: "umami", updatable: false }],
+        envDiffs: [],
+      },
+    },
+  ];
+
+  it.each(creates)(
+    "sends destination_uuid on the $path create",
+    async ({ path, change }) => {
+      const { bodies, fetchImpl } = captureCreates();
+      const client = new CoolifyClient(
+        "https://coolify.test",
+        "tok",
+        fetchImpl,
+      );
+      const exec = buildExecutor(client, {
+        projectName: "widget",
+        envName: "prod",
+        serverUuid: "srv-1",
+        githubAppUuid: "gh-1",
+        destinationUuid: "dest-abc",
+        backupSchedules: {},
+      });
+      await exec.createResource(change);
+      expect(bodies[path]?.destination_uuid).toBe("dest-abc");
+      // The server still has to be named — a destination belongs to one.
+      expect(bodies[path]?.server_uuid).toBe("srv-1");
+    },
+  );
+
+  // Undeclared must mean ABSENT, not empty-string: Coolify branches on
+  // `$request->has('destination_uuid')`, so sending "" would take the
+  // "you gave me one" path and then fail to match any destination.
+  it.each(creates)(
+    "omits destination_uuid entirely when none is declared ($path)",
+    async ({ path, change }) => {
+      const { bodies, fetchImpl } = captureCreates();
+      const client = new CoolifyClient(
+        "https://coolify.test",
+        "tok",
+        fetchImpl,
+      );
+      const exec = buildExecutor(client, {
+        projectName: "widget",
+        envName: "prod",
+        serverUuid: "srv-1",
+        githubAppUuid: "gh-1",
+        backupSchedules: {},
+      });
+      await exec.createResource(change);
+      expect(bodies[path]).not.toHaveProperty("destination_uuid");
+    },
+  );
+});
+
 describe("databaseVersionFromImage / defaultDatabaseImage", () => {
   it("round-trips through defaultDatabaseImage for postgres", () => {
     const image = defaultDatabaseImage("postgresql", "17");

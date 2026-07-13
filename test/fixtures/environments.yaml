@@ -4,6 +4,10 @@ environments:
     team: { id: 1, name: heavy-duty }
     s3_destination: s3-backups
     forbidden_var_patterns: ["^ALLOW_"]
+    projects:
+      heavy-duty/widget:
+        destination_uuid: dest-widget
+        smoke_target: core
   staging:
     server: staging-vm
     team: { id: 1, name: heavy-duty }

@@ -22,6 +22,42 @@ const TeamSchema = z
     message: "team must give at least one of `id` or `name`",
   });
 
+// State that belongs to ONE project inside ONE environment — not to the
+// environment as a whole.
+//
+// The environment block above it is the wrong scope for any of this, and was
+// always going to be: it says `server:`, and a server is exactly the thing two
+// projects can share. Everything here is keyed the way `github_apps` is (see
+// githubAppNameFor) — by the repo, full `<org>/<repo>` slug first — because the
+// repo is what identifies a project to US. The Coolify project NAME is theirs,
+// it is what someone typed into a UI, and `--project` exists precisely because
+// it does not have to match.
+const ProjectBindingSchema = z
+  .object({
+    // The Docker network this project's resources are created on — a raw UUID,
+    // read out of the Coolify UI, exactly like `s3_destination`.
+    //
+    // A UUID and not a name, deliberately, even though `server:` right above is
+    // a name: Coolify 4.1.2 has NO destinations API at all (zero routes in
+    // routes/api.php @ v4.1.2), so unlike a server name, cast cannot resolve a
+    // destination name to anything. A key called `destination` would invite one.
+    // See reference/README.md.
+    //
+    // Optional, and absent means "whatever the server's only destination is" —
+    // which is correct until the server has two, and is why this went unnoticed:
+    // Coolify picks `$destinations->first()` when a server has exactly one.
+    destination_uuid: z.string().optional(),
+    // The app `cast smoke` writes its canary env vars to. Project-scoped
+    // because it names one project's application: `core` is incubator's compose
+    // app, and the day a second project deploys into this environment, an
+    // environment-scoped (let alone the state-file-scoped one it replaces)
+    // `smoke_target: core` is simply wrong.
+    smoke_target: z.string().optional(),
+  })
+  .strict();
+
+export type ProjectBinding = z.infer<typeof ProjectBindingSchema>;
+
 const BindingsSchema = z
   .object({
     environments: z.record(
@@ -58,6 +94,9 @@ const BindingsSchema = z
           // assertEnvVarPolicy). Operator-owned guard: prod typically bans
           // whatever family of flags enables destructive tooling.
           forbidden_var_patterns: z.array(z.string()).optional(),
+          // Per-project state, keyed by repo. Optional: an environment whose
+          // server hosts one project needs none of it.
+          projects: z.record(ProjectBindingSchema).optional(),
         })
         .strict(),
     ),
@@ -65,6 +104,12 @@ const BindingsSchema = z
     // slug; a bare `<repo>` key still resolves (see githubAppNameFor) so
     // existing state files keep working.
     github_apps: z.record(z.string()),
+    // DEPRECATED — moved to environments.<env>.projects.<repo>.smoke_target.
+    // Still read (see smokeTargetFor) so state files written before the move
+    // keep working, on the same reasoning as the bare-`<repo>` github_apps key.
+    // It is wrong at TWO levels: it names one project's app (`core`) from a key
+    // scoped to the whole state file, so it cannot distinguish two projects and
+    // cannot distinguish prod's app from staging's either.
     smoke_target: z.string().optional(),
   })
   .strict();
@@ -102,6 +147,45 @@ export function githubAppNameFor(bindings: Bindings, orgRepo: string): string {
     );
   }
   return name;
+}
+
+// The project-scoped bindings for one repo in one environment, or undefined if
+// the environment declares none. Same full-slug-then-bare-repo lookup as
+// githubAppNameFor, for the same reason — see the note there.
+//
+// Absence is NOT an error: `projects:` is optional, and an environment with a
+// single project on a single-destination server has nothing to say here. The
+// callers that genuinely need a value (smoke) say so themselves.
+export function projectBindingFor(
+  bindings: Bindings,
+  envName: string,
+  orgRepo: string,
+): ProjectBinding | undefined {
+  const projects = bindings.environments[envName]?.projects;
+  if (!projects) return undefined;
+  const repoShort = orgRepo.split("/")[1] ?? orgRepo;
+  return projects[orgRepo] ?? projects[repoShort];
+}
+
+// The app `cast smoke` targets. Project-scoped first; the deprecated
+// state-file-scoped `smoke_target` is the fallback, so an unmigrated state file
+// still smokes.
+//
+// `orgRepo` is optional because `cast smoke` did not take one until the target
+// became project-scoped — without it there is no project to look up and only
+// the old key can answer, which is exactly what the old invocation did.
+export function smokeTargetFor(
+  bindings: Bindings,
+  envName: string,
+  orgRepo?: string,
+): { target: string; source: "project" | "deprecated" } | undefined {
+  const scoped = orgRepo
+    ? projectBindingFor(bindings, envName, orgRepo)?.smoke_target
+    : undefined;
+  if (scoped) return { target: scoped, source: "project" };
+  if (bindings.smoke_target)
+    return { target: bindings.smoke_target, source: "deprecated" };
+  return undefined;
 }
 
 export function loadBindings(

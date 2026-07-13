@@ -13,6 +13,15 @@ export type Live = {
   uuid: string;
   fields: Record<string, unknown>;
   env?: Record<string, string>;
+  // The destination (Docker network) Coolify reports this resource on.
+  //
+  // NOT in `fields`, because `fields` is the desired-vs-live comparison
+  // vocabulary and this can never take part in it: Coolify 4.1.2 accepts
+  // `destination_uuid` on write and returns `destination_id` (an integer
+  // primary key) on read, and exposes no endpoint that maps one to the other.
+  // Putting it in `fields` would diff a UUID against an int and report drift
+  // that can never be resolved. See Placement.
+  destinationId?: number;
 };
 export type FieldDiff = {
   field: string;
@@ -33,10 +42,32 @@ export type Change = {
   fieldDiffs: FieldDiff[];
   envDiffs: EnvDiff[];
 };
+// Where this project's resources actually sit, as far as Coolify will say.
+//
+// The destination cannot be diffed the way every other field is (see Live), so
+// the alternative was to leave it out of the report entirely — and a setting
+// that reads back as ABSENT rather than WRONG is the exact failure shape cast
+// keeps legislating against (#12, #14, #17, #18). So it is reported instead of
+// compared, and reported with the limit stated:
+//
+//   - `declared` is what the state file asks for. cast sends it on create and
+//     CANNOT check it afterwards. Never silently — renderDiff says so.
+//   - `groups` is what Coolify answers, by `destination_id`. It is an opaque
+//     int, but it is comparable to ITSELF, and that is enough to catch the
+//     thing actually worth catching: a project whose resources do not all share
+//     one network is a project whose isolation is broken, whatever the numbers
+//     happen to be.
+export type Placement = {
+  declared?: string;
+  groups: { destinationId: number; resources: string[] }[];
+  split: boolean;
+};
+
 export type DiffReport = {
   mode: "structural" | "full";
   changes: Change[];
   orphans: { kind: ResourceKind; name: string; uuid: string }[];
+  placement: Placement;
   clean: boolean;
 };
 
@@ -67,10 +98,33 @@ function diffEnv(
   return diffs;
 }
 
+function computePlacement(live: Live[], declared?: string): Placement {
+  const byDestination = new Map<number, string[]>();
+  for (const l of live) {
+    // Coolify returns destination_id on applications, databases and services
+    // alike (none of the three controllers' removeSensitiveData hides it,
+    // v4.1.2). A resource that reports none is not evidence of a split — it is
+    // no evidence at all, so it is left out rather than grouped under a
+    // fabricated id.
+    if (typeof l.destinationId !== "number") continue;
+    const at = byDestination.get(l.destinationId) ?? [];
+    at.push(`${l.kind} ${l.name}`);
+    byDestination.set(l.destinationId, at);
+  }
+  const groups = [...byDestination.entries()]
+    .map(([destinationId, resources]) => ({
+      destinationId,
+      resources: resources.sort(),
+    }))
+    .sort((a, b) => a.destinationId - b.destinationId);
+  return { declared, groups, split: groups.length > 1 };
+}
+
 export function computeDiff(
   desired: Desired[],
   live: Live[],
   mode: "structural" | "full",
+  opts: { declaredDestination?: string } = {},
 ): DiffReport {
   const changes: Change[] = [];
   for (const d of desired) {
@@ -120,11 +174,16 @@ export function computeDiff(
   const orphans = live
     .filter((l) => !desired.some((d) => d.kind === l.kind && d.name === l.name))
     .map((l) => ({ kind: l.kind, name: l.name, uuid: l.uuid }));
+  const placement = computePlacement(live, opts.declaredDestination);
   return {
     mode,
     changes,
     orphans,
-    clean: changes.length === 0 && orphans.length === 0,
+    placement,
+    // A split project is drift, and drift is not clean — the same disposition
+    // as an orphan: reported, counted, and NOT repaired (apply moves nothing
+    // between networks; see renderDiff).
+    clean: changes.length === 0 && orphans.length === 0 && !placement.split,
   };
 }
 
@@ -156,10 +215,39 @@ export function renderDiff(report: DiffReport): string {
       `orphan ${o.kind} ${o.name} (live, not in manifest — removal is a manual runbook act)`,
     );
   }
+  const { placement } = report;
+  if (placement.split) {
+    lines.push(
+      `split placement: these resources sit on ${placement.groups.length} different destinations`,
+    );
+    for (const g of placement.groups)
+      lines.push(`  destination ${g.destinationId}: ${g.resources.join(", ")}`);
+    lines.push(
+      "  a project's resources must share one destination — that is what the isolation IS.",
+      "  apply never moves a live resource between networks: resolve manually (runbook act).",
+    );
+  } else if (placement.declared && placement.groups.length === 1) {
+    lines.push(
+      `placement: all resources on destination ${placement.groups[0].destinationId}`,
+    );
+  }
+  if (placement.declared) {
+    // Said out loud on every run that declares one, rather than left to be
+    // inferred from its absence. cast enforces this UUID exactly once — at
+    // create — and can never check it again; an operator who thinks `diff`
+    // covers it is an operator who thinks the isolation is verified.
+    lines.push(
+      `destination ${placement.declared} declared, NOT compared — Coolify 4.1.2 takes`,
+      "  destination_uuid on write and returns destination_id on read, and has no endpoint",
+      "  mapping one to the other. cast sends it on create; nothing can verify it after.",
+    );
+  }
   lines.push(
     report.clean
       ? "clean"
-      : `${report.changes.length} change(s), ${report.orphans.length} orphan(s)`,
+      : `${report.changes.length} change(s), ${report.orphans.length} orphan(s)${
+          placement.split ? ", split placement" : ""
+        }`,
   );
   return lines.join("\n");
 }

@@ -49,7 +49,8 @@ infrastructure can be re-pointed at a new Coolify without touching a product.
 ```
 environments.yaml               # bindings: the team each env's token must belong to,
                                 #   which server it deploys onto, the S3 destination,
-                                #   GitHub App name, smoke target, guards
+                                #   GitHub App name, guards — and, per project,
+                                #   the destination it deploys onto + its smoke target
 secrets/<repo>.<env>.env.age    # age-encrypted values for the ${…} placeholders
 .coolify.env                    # COOLIFY_BASE_URL + COOLIFY_ACCESS_TOKEN (never commit)
 .coolify/<name>.env             # …the same, for a NAMED instance (see below)
@@ -65,7 +66,7 @@ cast diff      <org>/<repo> --env <env> [--full]
 cast capture   <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
 cast inventory <org>/<repo> --env <env>
 cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
-cast smoke --env <env>
+cast smoke [<org>/<repo>] --env <env>
 cast team [--env <env>]
 ```
 
@@ -86,10 +87,12 @@ cast team [--env <env>]
   writes the environment's age store from it. See *Adopting a hand-built
   instance* below.
 - **`server add`** — uploads a server's private key and registers it with Coolify.
-- **`smoke`** — contract test against `smoke_target`: proves Coolify's bulk env
-  endpoint still *upserts* rather than replacing. Run it after every Coolify
-  upgrade — `apply`'s never-delete guarantee rests on that behavior, and the
-  published OpenAPI does not describe it accurately.
+- **`smoke`** — contract test against the project's `smoke_target`: proves
+  Coolify's bulk env endpoint still *upserts* rather than replacing. Run it after
+  every Coolify upgrade — `apply`'s never-delete guarantee rests on that behavior,
+  and the published OpenAPI does not describe it accurately. Pass the repo whose
+  target you mean; without one, only the deprecated state-file-scoped
+  `smoke_target` can answer.
 - **`team`** — prints the team the configured token acts as. With `--env`, also
   checks it against that environment's `team:` binding and exits non-zero on a
   mismatch — the dry run for "would `apply` refuse?", answered without touching
@@ -321,6 +324,67 @@ Nothing below the team scopes a token. A Coolify environment has no team of its
 own (it hangs off a project) and no API path scopes by one: **Coolify
 environments are an organizational construct, not an auth boundary.** The team
 is the only boundary there is, so it is the one cast asserts.
+
+## Two projects, one box: destinations
+
+A **destination** is the Docker network a resource is created on. A server has a
+default one, and while a server hosts a single project that default is the right
+answer — which is why cast went so long without naming it.
+
+The moment a server hosts *two* projects, it stops being: they share one network,
+and "isolated" becomes a thing you believe rather than a thing that is true. So
+the destination is declared per **project**, inside the environment — an
+environment-scoped key could not express it, because `server:` is precisely the
+thing two projects share:
+
+```yaml
+environments:
+  prod:
+    server: shared-box
+    team: { id: 1, name: heavy-duty }
+    projects:
+      heavy-duty/incubator:
+        destination_uuid: <uuid>     # the network THIS project's resources go on
+        smoke_target: core           # the app `cast smoke` writes its canary to
+      acme/client-site:
+        destination_uuid: <other>
+```
+
+Keyed by repo, full `<org>/<repo>` slug first, exactly like `github_apps` — a
+bare `<repo>` key still resolves, so existing state files keep working. Both
+fields are optional, and an environment whose server hosts one project needs
+neither.
+
+A **UUID and not a name**, unlike `server:` right above it. Coolify 4.1.2 has no
+destinations API whatsoever — no list, no read, nothing — so there is no name for
+cast to resolve. You read the UUID out of the Coolify UI, the same way you do for
+`s3_destination`.
+
+**What cast can and cannot promise here.** It sends `destination_uuid` on create,
+for applications, databases and services alike. It can never check it afterwards:
+Coolify takes a UUID on write and hands back an integer `destination_id` on read,
+and nothing maps between them. So `diff` does the one honest thing left — it
+groups the live resources by the id Coolify *does* report, and a project whose
+resources do not all share one network is **drift**:
+
+```
+split placement: these resources sit on 2 different destinations
+  destination 1: application landing, database postgres
+  destination 4: application core
+  a project's resources must share one destination — that is what the isolation IS.
+  apply never moves a live resource between networks: resolve manually (runbook act).
+```
+
+…and when you declare a destination, every `diff` says, out loud, that it did not
+verify it. That is deliberate. A setting that reads back as *absent* rather than
+*wrong* is the failure this whole file keeps trying not to be.
+
+One sharp edge worth knowing: on a server with exactly **one** destination,
+Coolify ignores the `destination_uuid` you send and never validates it — a typo
+there is invisible until a second destination exists. On a server with more than
+one, a create that omits it is a hard `400`, which is why cast could not deploy
+onto a shared box at all until it could send this. Details, with citations:
+[reference/README.md](reference/README.md).
 
 ## Guarding an environment
 

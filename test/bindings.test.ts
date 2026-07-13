@@ -18,10 +18,7 @@ function bindings(github_apps: Record<string, string>): Bindings {
   } as Bindings;
 }
 
-function withProjects(
-  projects: Record<string, ProjectBinding>,
-  smoke_target?: string,
-): Bindings {
+function withProjects(projects: Record<string, ProjectBinding>): Bindings {
   return {
     environments: {
       prod: {
@@ -32,7 +29,6 @@ function withProjects(
       staging: { server: "staging-box", team: { id: 0, name: "Root Team" } },
     },
     github_apps: {},
-    ...(smoke_target ? { smoke_target } : {}),
   } as Bindings;
 }
 
@@ -140,49 +136,36 @@ describe("projectBindingFor", () => {
 });
 
 describe("smokeTargetFor", () => {
-  it("prefers the project-scoped target", () => {
-    const b = withProjects(
-      { "heavy-duty/incubator": { smoke_target: "core" } },
-      "old-target",
-    );
-    expect(smokeTargetFor(b, "prod", "heavy-duty/incubator")).toEqual({
-      target: "core",
-      source: "project",
+  it("resolves the project-scoped target", () => {
+    const b = withProjects({
+      "heavy-duty/incubator": { smoke_target: "core" },
     });
+    expect(smokeTargetFor(b, "prod", "heavy-duty/incubator")).toBe("core");
   });
 
-  // The state file mid-migration still has only the old key — it must keep
-  // smoking, exactly as the bare-`<repo>` github_apps key keeps resolving.
-  it("falls back to the deprecated state-file-scoped key, and says so", () => {
-    const b = withProjects({}, "old-target");
-    expect(smokeTargetFor(b, "prod", "heavy-duty/incubator")).toEqual({
-      target: "old-target",
-      source: "deprecated",
-    });
-    // ...and with no repo passed at all, which is the old invocation.
-    expect(smokeTargetFor(b, "prod")).toEqual({
-      target: "old-target",
-      source: "deprecated",
-    });
-  });
-
-  it("is undefined when neither key names a target", () => {
+  it("is undefined when the project declares no target", () => {
     expect(
       smokeTargetFor(withProjects({}), "prod", "heavy-duty/incubator"),
     ).toBe(undefined);
+    expect(
+      smokeTargetFor(
+        withProjects({ "heavy-duty/incubator": { smoke_target: "core" } }),
+        "staging",
+        "heavy-duty/incubator",
+      ),
+    ).toBe(undefined);
   });
 
-  // Two projects, each with its own smoke target: the case the old key could
-  // not express at all, since it named one app for the whole state file.
+  // Two projects, each with its own smoke target: the case the removed
+  // state-file-scoped key could not express at all, since it named one app for
+  // the whole file.
   it("keeps two projects' smoke targets apart", () => {
     const b = withProjects({
       "heavy-duty/incubator": { smoke_target: "core" },
       "acme/client-site": { smoke_target: "web" },
     });
-    expect(smokeTargetFor(b, "prod", "heavy-duty/incubator")?.target).toBe(
-      "core",
-    );
-    expect(smokeTargetFor(b, "prod", "acme/client-site")?.target).toBe("web");
+    expect(smokeTargetFor(b, "prod", "heavy-duty/incubator")).toBe("core");
+    expect(smokeTargetFor(b, "prod", "acme/client-site")).toBe("web");
   });
 });
 
@@ -205,6 +188,31 @@ github_apps: {}
       destination_uuid: "dest-abc",
       smoke_target: "core",
     });
+  });
+
+  // The key is gone (#29): it named one project's application from a scope that
+  // could not tell two projects — or prod from staging — apart, and `smoke` now
+  // resolves the name INSIDE the project it was declared under, which this key
+  // does not have. It is still declared in the schema purely so its removal
+  // reads as a migration instead of as a zod "unrecognized key" — loadBindings
+  // runs for every verb, so an unmigrated file would otherwise take `diff` and
+  // `apply` down with it, over a key neither of them reads.
+  it("refuses a state-file-scoped smoke_target, and says where to move it", () => {
+    const load = () =>
+      loadBindings("environments.yaml", {
+        overrideText: `
+environments:
+  prod:
+    server: shared-box
+    team: { id: 0, name: Root Team }
+github_apps: {}
+smoke_target: core
+`,
+      });
+    expect(load).toThrow(/top-level `smoke_target` key is no longer read/);
+    expect(load).toThrow(/projects:/);
+    expect(load).toThrow(/smoke_target: core/);
+    expect(load).toThrow(/cast smoke <org>\/<repo> --env <env>/);
   });
 
   it("rejects an unknown key under a project (a typo is not a placement)", () => {

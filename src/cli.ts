@@ -63,7 +63,7 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
        cast inventory <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--resource <m>=<l>]
        cast inventory --env <env> [--instance <name>]     # no repo: SWEEP the whole instance
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
-       cast smoke [<org>/<repo>] --env <env>
+       cast smoke     <org>/<repo> --env <env> [--project <name>] [--environment <name>]
        cast team [--env <env>]
 
   --state <dir>   the state checkout holding environments.yaml, secrets/ and
@@ -403,6 +403,65 @@ export function renderAbsentTarget(
         // must not decide any of them. --environment is the coordinate for reading
         // it, and it changes nothing on our side of the line.
         "Pass --environment <name> if this instance names it differently.",
+  ].join("\n");
+}
+
+// The same disposition as renderAbsentTarget, one level deeper, and for the one
+// verb that WRITES: the project and the environment are both there, and hold no
+// application of the name `smoke` was told to write to.
+//
+// Until #29, `smoke` never got here. It resolved its target against
+// GET /applications — every application the token can see, across every project
+// and every environment of the instance — and wrote to the first name match. So
+// `smoke_target: core` did not name an application; it named whichever `core`
+// Coolify happened to list first, and one instance carrying prod and staging is
+// enough for that to be prod's. The canary vars land on an app nobody named, and
+// on the failure path they stay there.
+//
+// This message therefore does NOT offer to look elsewhere, and the code behind it
+// does not either. An application in another project is not the same application
+// seen from a different angle — it is a different application, and this verb
+// writes. The only thing worth saying is: here is where I looked, here is what is
+// actually in there, and here is which coordinate to correct.
+export function renderAbsentSmokeTarget(
+  target: string,
+  live: Array<{ kind: ResourceKind; name: string }>,
+  ctx: { orgRepo: string; env: string; project: string; environment: string },
+): string {
+  const apps = live.filter((l) => l.kind === "application").map((l) => l.name);
+  // A service or a database of that name is not a near-miss to be accommodating
+  // about — smoke POSTs to /applications/<uuid>/envs, so being pointed at one
+  // would 404 on an endpoint that does not exist for that kind, and the operator
+  // would spend the afternoon on an HTTP status instead of on the name.
+  const sameName = live.find((l) => l.name === target);
+  const wrongKind =
+    sameName && sameName.kind !== "application"
+      ? [
+          "",
+          `  but note:    "${target}" DOES exist here — as a ${sameName.kind}, not an`,
+          "               application. `smoke` writes to an application's /envs endpoint;",
+          `               a ${sameName.kind} of the same name is a different resource behind a`,
+          "               different endpoint, not this one seen sideways.",
+        ]
+      : [];
+  return [
+    `refusing to smoke: project "${ctx.project}" / environment "${ctx.environment}" holds no application named "${target}"`,
+    "",
+    `  looked for:  application "${target}"`,
+    `               (environments.${ctx.env}.projects["${ctx.orgRepo}"].smoke_target)`,
+    `  in:          project "${ctx.project}", environment "${ctx.environment}"`,
+    `  exists here: ${apps.join(", ") || "(no applications at all)"}`,
+    ...wrongKind,
+    "",
+    "cast will not go looking for that name anywhere else on this instance. A bare",
+    "application name is unique only INSIDE a project and an environment, so the first",
+    `\`${target}\` the API lists may belong to another project — or to prod, while you are`,
+    "smoking staging (#29). `smoke` POSTs two canary env vars to the application it",
+    "resolves, and deletes them again; on the failure path it leaves them behind. An",
+    "app it was not pointed at is not a fallback.",
+    "",
+    "Name the application as it exists here, or pass --project / --environment if this",
+    "instance names the project or the environment differently.",
   ].join("\n");
 }
 
@@ -1064,27 +1123,37 @@ async function main(): Promise<number> {
       options: {
         state: { type: "string" },
         env: { type: "string" },
+        project: { type: "string" },
+        environment: { type: "string" },
         instance: { type: "string" },
       },
     });
-    // Optional, unlike every other verb's — and only because the target used to
-    // be state-file-scoped, so `cast smoke --env prod` with no repo at all is
-    // what the runbook says today. Without it, only the deprecated key can
-    // answer; with it, the project-scoped one can.
-    const smokeRepo = positionals[0];
-    // smoke writes: it POSTs two env vars onto the live smoke_target app and
-    // deletes them again. That is a mutation, so it takes the assert like any
-    // other. Without it, a wrong-team token that happened to own an app of
-    // the same name would have that app written to instead.
-    if (!values.env) {
+    // REQUIRED, like every other verb's — because the repo IS the project, and
+    // the project is half of the only scope in which the target's name means
+    // anything (#29). `cast smoke --env prod` with no repo used to work by
+    // reading the state-file-scoped `smoke_target`, which named an application
+    // from a key that could not say which project or which environment it was
+    // in; that key is gone (see BindingsSchema), and so is the invocation.
+    const orgRepo = positionals[0];
+    const envName = values.env;
+    if (!orgRepo || !envName) {
       console.error(USAGE);
       return 2;
     }
     const stateDir = stateDirFrom(values.state);
+    const repoShort = orgRepo.split("/")[1];
+    // The same two read-side coordinates diff/capture/inventory take, for the
+    // same two reasons: a project built by hand in the UI is called whatever
+    // someone typed, and an environment built by hand is called whatever Coolify
+    // defaulted to (`production`, not `prod`). --env still selects the manifest
+    // block, the environments.yaml binding and the team to assert; --project and
+    // --environment change ONLY the names cast looks the target up under.
+    const projectName = values.project ?? repoShort;
+    const coolifyEnv = values.environment ?? envName;
     const bindings = loadBindings(join(stateDir, "environments.yaml"));
-    const binding = bindings.environments[values.env];
+    const binding = bindings.environments[envName];
     if (!binding) {
-      console.error(`environment ${values.env} not in environments.yaml`);
+      console.error(`environment ${envName} not in environments.yaml`);
       return 2;
     }
     const { instance, client } = openCoolify(
@@ -1092,61 +1161,69 @@ async function main(): Promise<number> {
       values.instance,
       binding,
     );
+    // smoke writes: it POSTs two env vars onto the live smoke_target app and
+    // deletes them again. That is a mutation, so it takes both gates — the
+    // read-only instance refusal and the team assert — before the first call.
+    // Without the assert, a wrong-team token that happened to own an app of the
+    // same name would have that app written to instead.
     assertWritable(instance, "smoke");
-    const team = await assertTeam(client, binding.team, values.env);
+    const team = await assertTeam(client, binding.team, envName);
     console.log(`team ${formatTeam(team)} ✓`);
-    const resolved = smokeTargetFor(bindings, values.env, smokeRepo);
-    if (!resolved) {
-      const lookedFor = smokeRepo
-        ? [
-            `  looked for:  environments.${values.env}.projects["${smokeRepo}"].smoke_target`,
-            "               then the deprecated state-file-scoped smoke_target",
-          ]
-        : [
-            "  looked for:  the deprecated state-file-scoped smoke_target — and only",
-            "               that one, because no <org>/<repo> was given and so no",
-            "               project's binding could be consulted",
-          ];
+    const target = smokeTargetFor(bindings, envName, orgRepo);
+    if (!target) {
       console.error(
         [
-          `no smoke_target for ${values.env}`,
+          `no smoke_target for ${orgRepo} in ${envName}`,
           "",
-          ...lookedFor,
+          `  looked for:  environments.${envName}.projects["${orgRepo}"].smoke_target`,
+          `               (a bare "${repoShort}" key resolves too)`,
           "",
           "`smoke` writes two canary env vars to one application and deletes them",
-          "again — it has to be told which one. Name it under the project it belongs",
-          "to, and pass that repo:",
+          "again — it has to be told which one, under the project that owns it:",
           "",
           "  environments:",
-          `    ${values.env}:`,
+          `    ${envName}:`,
           "      projects:",
-          `        ${smokeRepo ?? "<org>/<repo>"}:`,
+          `        ${orgRepo}:`,
           "          smoke_target: <the application's name>",
         ].join("\n"),
       );
       return 2;
     }
-    if (resolved.source === "deprecated") {
-      console.warn(
-        `warning: smoke_target read from the deprecated state-file-scoped key. It names ONE project's application from a key that cannot tell two projects — or even prod from staging — apart. Move it to environments.${values.env}.projects.<org>/<repo>.smoke_target and pass the repo to \`cast smoke\`.`,
+    // The fix for #29, and the whole of it: the target is resolved in the project
+    // and the environment it was DECLARED under — the same lookup every read-side
+    // verb makes — instead of by name against GET /applications, which is every
+    // application on the instance and answers with whichever one it lists first.
+    const lookup = await fetchLive(client, projectName, coolifyEnv);
+    if (!lookup.found) {
+      console.error(
+        renderAbsentTarget(lookup, {
+          orgRepo,
+          overridden: values.project !== undefined,
+          envOverridden: values.environment !== undefined,
+          verb: "smoke",
+        }),
       );
-    }
-    // Resolved against the instance-wide application list, not the project's:
-    // that is what it did before this change and it is not this change's job to
-    // alter which app gets written to. It does mean the name is not actually a
-    // coordinate — one project's `core` and another's, or prod's and staging's
-    // on the same instance, are a coin flip. See #29; fixing it needs the
-    // read-side coordinates (--project/--environment) smoke does not yet have.
-    const apps = (await client.get("/applications")) as Array<{
-      uuid: string;
-      name: string;
-    }>;
-    const target = apps.find((a) => a.name === resolved.target);
-    if (!target) {
-      console.error(`smoke_target ${resolved.target} not found`);
       return 2;
     }
-    await smoke(client, target.uuid);
+    // Applications only. fetchLive returns every kind in the environment, and a
+    // service or database called `core` is not a smoke target — it is a 404 on an
+    // endpoint that does not exist for it (see renderAbsentSmokeTarget).
+    const app = lookup.live.find(
+      (l) => l.kind === "application" && l.name === target,
+    );
+    if (!app) {
+      console.error(
+        renderAbsentSmokeTarget(target, lookup.live, {
+          orgRepo,
+          env: envName,
+          project: projectName,
+          environment: coolifyEnv,
+        }),
+      );
+      return 2;
+    }
+    await smoke(client, app.uuid);
     return 0;
   }
   if (command === "team") {

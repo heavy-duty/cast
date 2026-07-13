@@ -68,7 +68,7 @@ cast diff      <org>/<repo> --env <env> [--full]
 cast capture   <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
 cast inventory <org>/<repo> --env <env>
 cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
-cast smoke [<org>/<repo>] --env <env>
+cast smoke     <org>/<repo> --env <env> [--project <name>] [--environment <name>]
 cast team [--env <env>]
 ```
 
@@ -93,9 +93,13 @@ cast team [--env <env>]
 - **`smoke`** — contract test against the project's `smoke_target`: proves
   Coolify's bulk env endpoint still *upserts* rather than replacing. Run it after
   every Coolify upgrade — `apply`'s never-delete guarantee rests on that behavior,
-  and the published OpenAPI does not describe it accurately. Pass the repo whose
-  target you mean; without one, only the deprecated state-file-scoped
-  `smoke_target` can answer.
+  and the published OpenAPI does not describe it accurately. It **writes** (two
+  canary env vars onto that one application, then deletes them), so the repo is
+  required: the target is resolved *inside the project and environment it was
+  declared under*, with `--project` / `--environment` if the box names either
+  differently, and it refuses rather than guessing when no application of that
+  name is there. A bare app name is unique nowhere else — one instance carrying
+  prod and staging is enough for the first `core` on it to be prod's.
 - **`team`** — prints the team the configured token acts as. With `--env`, also
   checks it against that environment's `team:` binding and exits non-zero on a
   mismatch — the dry run for "would `apply` refuse?", answered without touching
@@ -260,13 +264,18 @@ yours:
 | `--environment <name>` | the environment isn't named after `--env` (Coolify's default is `production`, not `prod`) |
 | `--resource <manifest>=<live>` | a resource isn't named after the manifest's (`core` is `Incubator Stack v2` over there). Repeatable |
 
-All three are **read-side only** — `diff`, `capture`, `inventory`. They are
-arguments to a one-off read, never manifest fields: a manifest that recorded a
-legacy box's names would carry a dead machine's vocabulary forever. And `apply`
-refuses `--resource` outright, because it creates resources under the manifest's
-own names — an alias there could only mean *adopt the existing one instead*,
-which is a different operation and would otherwise silently create a duplicate
-beside the resource you were pointing at.
+None of them is ever a manifest field: they are arguments to a single run, because
+a manifest that recorded a legacy box's names would carry a dead machine's
+vocabulary forever.
+
+`--project` and `--environment` are how a verb that must *find* a target says
+where to look — `diff`, `capture`, `inventory`, `apply`, and `smoke`, which
+resolves its `smoke_target` in exactly that project and that environment, and
+refuses when it is not there (#29). `--resource` is **read-side only** (`diff`,
+`capture`, `inventory`): `apply` refuses it outright, because it creates
+resources under the manifest's own names — an alias there could only mean *adopt
+the existing one instead*, which is a different operation and would otherwise
+silently create a duplicate beside the resource you were pointing at.
 
 `--env` stays **ours**: it selects the manifest block, the `environments.yaml`
 binding, the age key, the store path. `--environment` is *theirs*, on the wire,

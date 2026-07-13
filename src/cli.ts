@@ -5,7 +5,12 @@ import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { parse as parseYaml } from "yaml";
 import { type Executor, applyHostnameOverlay, applyPlan } from "./apply.js";
-import { githubAppNameFor, loadBindings } from "./bindings.js";
+import {
+  githubAppNameFor,
+  loadBindings,
+  projectBindingFor,
+  smokeTargetFor,
+} from "./bindings.js";
 import {
   type LiveEnvs,
   absentResources,
@@ -58,7 +63,7 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
        cast inventory <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--resource <m>=<l>]
        cast inventory --env <env> [--instance <name>]     # no repo: SWEEP the whole instance
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
-       cast smoke --env <env>
+       cast smoke [<org>/<repo>] --env <env>
        cast team [--env <env>]
 
   --state <dir>   the state checkout holding environments.yaml, secrets/ and
@@ -324,6 +329,14 @@ export async function fetchLive(
       uuid: String(i.uuid),
       fields: projectLiveFields(kind, i),
       env: undefined, // populated per-resource below only in full mode by caller
+      // The one thing Coolify will tell us about placement. `destination_id` is
+      // a plain column on all three resource tables and none of the three
+      // controllers' removeSensitiveData() hides it (v4.1.2), so it survives
+      // into this response — whereas the destination's UUID never appears in
+      // any response at all, because environment_details does not eager-load
+      // the `destination` relation and no endpoint exposes it. See Placement.
+      destinationId:
+        typeof i.destination_id === "number" ? i.destination_id : undefined,
     }));
   return {
     found: true,
@@ -611,6 +624,10 @@ async function main(): Promise<number> {
       return 2;
     }
     assertEnvVarPolicy(envName, resolvedEnvs, binding.forbidden_var_patterns);
+    // Keyed by the REPO, not by --project: --project is the name Coolify's own
+    // UI happens to use for this project, and cast's state is keyed by the name
+    // WE own (same split as the secrets file — see the --project note above).
+    const projectBinding = projectBindingFor(bindings, envName, orgRepo);
     if (values["hostname-overlay"]) {
       desired = applyHostnameOverlay(
         desired,
@@ -663,7 +680,9 @@ async function main(): Promise<number> {
         l.env = await fetchEnv(client, l);
       }
     }
-    const report = computeDiff(desired, live, mode);
+    const report = computeDiff(desired, live, mode, {
+      declaredDestination: projectBinding?.destination_uuid,
+    });
     console.log(renderDiff(report));
     if (command === "diff") return report.clean ? 0 : 1;
     const serverUuid = await client.serverUuid(binding.server);
@@ -678,6 +697,7 @@ async function main(): Promise<number> {
       envName: coolifyEnv,
       serverUuid,
       githubAppUuid,
+      destinationUuid: projectBinding?.destination_uuid,
       s3DestinationUuid: binding.s3_destination,
       backupSchedules,
     });
@@ -1038,7 +1058,7 @@ async function main(): Promise<number> {
     return 0;
   }
   if (command === "smoke") {
-    const { values } = parseArgs({
+    const { values, positionals } = parseArgs({
       args: rest,
       allowPositionals: true,
       options: {
@@ -1047,6 +1067,11 @@ async function main(): Promise<number> {
         instance: { type: "string" },
       },
     });
+    // Optional, unlike every other verb's — and only because the target used to
+    // be state-file-scoped, so `cast smoke --env prod` with no repo at all is
+    // what the runbook says today. Without it, only the deprecated key can
+    // answer; with it, the project-scoped one can.
+    const smokeRepo = positionals[0];
     // smoke writes: it POSTs two env vars onto the live smoke_target app and
     // deletes them again. That is a mutation, so it takes the assert like any
     // other. Without it, a wrong-team token that happened to own an app of
@@ -1070,20 +1095,55 @@ async function main(): Promise<number> {
     assertWritable(instance, "smoke");
     const team = await assertTeam(client, binding.team, values.env);
     console.log(`team ${formatTeam(team)} ✓`);
-    if (!bindings.smoke_target) {
+    const resolved = smokeTargetFor(bindings, values.env, smokeRepo);
+    if (!resolved) {
+      const lookedFor = smokeRepo
+        ? [
+            `  looked for:  environments.${values.env}.projects["${smokeRepo}"].smoke_target`,
+            "               then the deprecated state-file-scoped smoke_target",
+          ]
+        : [
+            "  looked for:  the deprecated state-file-scoped smoke_target — and only",
+            "               that one, because no <org>/<repo> was given and so no",
+            "               project's binding could be consulted",
+          ];
       console.error(
-        "environments.yaml: smoke_target (app name) required for smoke",
+        [
+          `no smoke_target for ${values.env}`,
+          "",
+          ...lookedFor,
+          "",
+          "`smoke` writes two canary env vars to one application and deletes them",
+          "again — it has to be told which one. Name it under the project it belongs",
+          "to, and pass that repo:",
+          "",
+          "  environments:",
+          `    ${values.env}:`,
+          "      projects:",
+          `        ${smokeRepo ?? "<org>/<repo>"}:`,
+          "          smoke_target: <the application's name>",
+        ].join("\n"),
       );
       return 2;
     }
-    // resolve app uuid by name across the project list
+    if (resolved.source === "deprecated") {
+      console.warn(
+        `warning: smoke_target read from the deprecated state-file-scoped key. It names ONE project's application from a key that cannot tell two projects — or even prod from staging — apart. Move it to environments.${values.env}.projects.<org>/<repo>.smoke_target and pass the repo to \`cast smoke\`.`,
+      );
+    }
+    // Resolved against the instance-wide application list, not the project's:
+    // that is what it did before this change and it is not this change's job to
+    // alter which app gets written to. It does mean the name is not actually a
+    // coordinate — one project's `core` and another's, or prod's and staging's
+    // on the same instance, are a coin flip. See #29; fixing it needs the
+    // read-side coordinates (--project/--environment) smoke does not yet have.
     const apps = (await client.get("/applications")) as Array<{
       uuid: string;
       name: string;
     }>;
-    const target = apps.find((a) => a.name === bindings.smoke_target);
+    const target = apps.find((a) => a.name === resolved.target);
     if (!target) {
-      console.error(`smoke_target ${bindings.smoke_target} not found`);
+      console.error(`smoke_target ${resolved.target} not found`);
       return 2;
     }
     await smoke(client, target.uuid);
@@ -1243,10 +1303,38 @@ export function buildExecutor(
     envName: string;
     serverUuid: string;
     githubAppUuid: string;
+    // The Docker network to create resources on. A raw UUID from
+    // environments.yaml for the same reason s3DestinationUuid is one: Coolify
+    // 4.1.2 has no destinations API, so there is no name for cast to resolve.
+    //
+    // Create-time ONLY, and every kind gets it (Coolify's three controllers run
+    // identical destination logic). Undefined means "the server's only
+    // destination", which is what Coolify picks anyway — and, until a server
+    // hosts two projects, is the right answer.
+    destinationUuid?: string;
     s3DestinationUuid?: string; // raw UUID from environments.yaml — no storage API exists to resolve names
     backupSchedules: Record<string, { frequency: string; retention: number }>;
   },
 ): Executor {
+  // Coolify resolves this identically for applications, databases and services
+  // (ApplicationsController ~1003, DatabasesController ~1700,
+  // ServicesController ~378 @ v4.1.2):
+  //
+  //   0 destinations              -> 400, whatever we send
+  //   >1 and no destination_uuid  -> 400 "Server has multiple destinations and
+  //                                  you do not set destination_uuid"
+  //   >1 and a foreign uuid       -> 422 "does not belong to the specified server"
+  //   exactly 1                   -> $destinations->first(), and anything we
+  //                                  send here is IGNORED, not validated
+  //
+  // So this field is what makes cast able to create resources on a server that
+  // has more than one destination AT ALL — without it, apply simply 400s there,
+  // which is the state of things before this change. On a single-destination
+  // server it is inert (and so, note, a WRONG uuid is silently accepted there —
+  // nothing on either side can catch that; see renderDiff's placement note).
+  const destination = ctx.destinationUuid
+    ? { destination_uuid: ctx.destinationUuid }
+    : {};
   return {
     async createResource(change) {
       // Field payloads assembled from change.fieldDiffs (desired values):
@@ -1259,6 +1347,7 @@ export function buildExecutor(
           project_uuid: projectUuid,
           environment_name: ctx.envName,
           server_uuid: ctx.serverUuid,
+          ...destination,
           github_app_uuid: ctx.githubAppUuid,
           name: change.name,
           instant_deploy: false,
@@ -1280,6 +1369,7 @@ export function buildExecutor(
             project_uuid: projectUuid,
             environment_name: ctx.envName,
             server_uuid: ctx.serverUuid,
+            ...destination,
             name: change.name,
             ...databaseApiFields(fields),
           },
@@ -1304,6 +1394,7 @@ export function buildExecutor(
         project_uuid: projectUuid,
         environment_name: ctx.envName,
         server_uuid: ctx.serverUuid,
+        ...destination,
         name: change.name,
         ...serviceApiFields(fields),
       })) as { uuid: string };

@@ -158,6 +158,46 @@ softened by an implementation detail):
   refuses `--path` combined with `--env prod`: prod always reads the default
   branch, so a feature-branch checkout can never reach it.
 
+## Placement (destinations)
+
+A **destination** is the Docker network a resource is created on. It is declared
+per project — `environments.<env>.projects.<repo>.destination_uuid` — because a
+destination is scoped project × environment, and the environment block above it
+says `server:`, which is exactly what two projects share.
+
+**Enforced once, at create.** `apply` sends `destination_uuid` on every create
+(applications, databases, services — Coolify runs identical destination logic in
+all three controllers). It is never sent on update, and `apply` never moves a
+live resource between networks.
+
+**Not comparable, and therefore reported rather than compared.** Coolify 4.1.2
+accepts a `destination_uuid` on write and returns a `destination_id` (an integer
+primary key) on read, exposes no endpoint mapping one to the other, and in fact
+has no destinations API at all (zero routes at `v4.1.2`). So the declared UUID
+**cannot be verified against the live resource it was sent for** — by cast or by
+anything else. Two consequences, both deliberate:
+
+- `diff` never diffs the destination as a field. Doing so would compare a UUID
+  against an int and report drift that could never be resolved — a phantom
+  "update" on every run.
+- `diff` instead groups live resources by the `destination_id` Coolify *does*
+  report. That int is opaque, but it is comparable **to itself**, which catches
+  the thing worth catching: a project whose resources do not all sit on one
+  network is a project whose isolation is broken. That is `split placement`, and
+  it is drift — non-clean, reported, and **not repaired** (same disposition as an
+  orphan).
+- Whenever a destination is declared, `diff` says explicitly that it was *not*
+  compared. Silence would make an unverified setting read as a verified one —
+  the failure shape this document exists to avoid.
+
+**Coolify's create-time behavior** (`ApplicationsController` ~L1003,
+`DatabasesController` ~L1700, `ServicesController` ~L378 @ v4.1.2): a server with
+**one** destination uses it and *ignores* any `destination_uuid` sent, never
+validating it — so a typo is invisible there. A server with **more than one**
+rejects a create that omits it (`400`), and rejects a UUID that belongs to
+another server (`422`). The second case is why cast could not apply to a shared
+box at all before this field existed. Citations: `reference/README.md`.
+
 ## Instance selection
 
 **The Coolify a command talks to is an explicit, named value** — not a property

@@ -90,6 +90,127 @@ describe("computeDiff", () => {
   });
 });
 
+// The destination can never be diffed the way a field is: Coolify 4.1.2 takes
+// destination_uuid on write and returns destination_id on read, with nothing
+// mapping between them. So it is REPORTED rather than compared — and the one
+// thing that IS comparable (a project's live resources against each other)
+// carries the check that matters.
+//
+// Placement is measured against the live side ALONE, so these fixtures pair each
+// live resource with a matching desired one: otherwise every resource is an
+// orphan, and `clean` would be false for reasons that have nothing to do with
+// the destination.
+const want = (name: string) => ({
+  kind: "application" as const,
+  name,
+  fields: {},
+});
+const got = (name: string, destinationId?: number) => ({
+  kind: "application" as const,
+  name,
+  uuid: `u-${name}`,
+  fields: {},
+  destinationId,
+});
+
+describe("computeDiff placement", () => {
+  it("is not split when every resource shares one destination", () => {
+    const r = computeDiff(
+      [want("a"), want("b")],
+      [got("a", 3), got("b", 3)],
+      "structural",
+    );
+    expect(r.placement.split).toBe(false);
+    expect(r.placement.groups).toEqual([
+      { destinationId: 3, resources: ["application a", "application b"] },
+    ]);
+    expect(r.clean).toBe(true);
+  });
+
+  // A project whose resources straddle two networks is a project whose
+  // isolation is broken — drift, not silence. Same disposition as an orphan:
+  // reported, counted, never repaired.
+  it("reports a split project as drift, and is not clean", () => {
+    const r = computeDiff(
+      [want("a"), want("b")],
+      [got("a", 3), got("b", 7)],
+      "structural",
+    );
+    expect(r.placement.split).toBe(true);
+    expect(r.placement.groups).toEqual([
+      { destinationId: 3, resources: ["application a"] },
+      { destinationId: 7, resources: ["application b"] },
+    ]);
+    expect(r.clean).toBe(false);
+    // ...and apply is not offered a way to "fix" it.
+    expect(r.changes).toHaveLength(0);
+  });
+
+  // A resource Coolify reports no destination for is no evidence of a split.
+  it("ignores resources with no destination rather than grouping them", () => {
+    const r = computeDiff(
+      [want("a"), want("b")],
+      [got("a", 3), got("b")],
+      "structural",
+    );
+    expect(r.placement.split).toBe(false);
+    expect(r.placement.groups).toEqual([
+      { destinationId: 3, resources: ["application a"] },
+    ]);
+    expect(r.clean).toBe(true);
+  });
+
+  it("carries the declared destination through without comparing it", () => {
+    const r = computeDiff([want("a")], [got("a", 3)], "structural", {
+      declaredDestination: "dest-abc",
+    });
+    expect(r.placement.declared).toBe("dest-abc");
+    // Declaring one does not make the project dirty — there is nothing to
+    // compare it against, and a phantom "update" would never clear.
+    expect(r.clean).toBe(true);
+    expect(r.changes).toHaveLength(0);
+  });
+});
+
+describe("renderDiff placement", () => {
+  it("says out loud that a declared destination was NOT compared", () => {
+    const out = renderDiff(
+      computeDiff([want("a")], [got("a", 3)], "structural", {
+        declaredDestination: "dest-abc",
+      }),
+    );
+    expect(out).toContain("dest-abc");
+    expect(out).toMatch(/NOT compared/);
+    expect(out).toMatch(/placement: all resources on destination 3/);
+  });
+
+  // The whole reason placement is in the report at all: a destination that read
+  // back as absent rather than wrong is the failure shape #12/#14/#17/#18 are
+  // about. Silence is the bug — but so is noise on the happy path.
+  it("stays silent about placement when nothing is declared and nothing is split", () => {
+    const out = renderDiff(
+      computeDiff([want("a")], [got("a", 3)], "structural"),
+    );
+    expect(out).not.toMatch(/placement/);
+    expect(out).toContain("clean");
+  });
+
+  it("names every resource on each side of a split", () => {
+    const out = renderDiff(
+      computeDiff(
+        [want("core"), want("landing")],
+        [got("core", 3), got("landing", 7)],
+        "structural",
+      ),
+    );
+    expect(out).toMatch(/split placement: these resources sit on 2 different/);
+    expect(out).toContain("destination 3: application core");
+    expect(out).toContain("destination 7: application landing");
+    expect(out).toMatch(/apply never moves a live resource between networks/);
+    expect(out).toMatch(/split placement$/m);
+  });
+});
+
 describe("renderDiff", () => {
   it("never prints secret values", () => {
     const live = [

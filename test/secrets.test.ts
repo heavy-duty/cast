@@ -1,26 +1,56 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { decryptSecrets, keyFileFor, secretsFileFor } from "../src/secrets.js";
 
+// A key file and a store encrypted to it, for the decrypt tests.
+function ageFixture(): { keyFile: string; enc: string } {
+  const dir = mkdtempSync(join(tmpdir(), "infra-age-"));
+  const keyFile = join(dir, "key.txt");
+  execFileSync("age-keygen", ["-o", keyFile]);
+  const recipient = execFileSync("age-keygen", ["-y", keyFile], {
+    encoding: "utf8",
+  }).trim();
+  const plain = join(dir, "s.env");
+  writeFileSync(plain, "MAILGUN_KEY=mk-123\nOPENROUTER_KEY=or-456\n");
+  const enc = join(dir, "s.env.age");
+  execFileSync("age", ["-r", recipient, "-o", enc, plain]);
+  return { keyFile, enc };
+}
+
 describe("decryptSecrets", () => {
   it("round-trips an env file through age", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-age-"));
-    const keyFile = join(dir, "key.txt");
-    execFileSync("age-keygen", ["-o", keyFile]);
-    const recipient = execFileSync("age-keygen", ["-y", keyFile], {
-      encoding: "utf8",
-    }).trim();
-    const plain = join(dir, "s.env");
-    writeFileSync(plain, "MAILGUN_KEY=mk-123\nOPENROUTER_KEY=or-456\n");
-    const enc = join(dir, "s.env.age");
-    execFileSync("age", ["-r", recipient, "-o", enc, plain]);
+    const { keyFile, enc } = ageFixture();
     expect(decryptSecrets(enc, keyFile)).toEqual({
       MAILGUN_KEY: "mk-123",
       OPENROUTER_KEY: "or-456",
     });
+  });
+
+  it("accepts a key path only this process can resolve — what <(pm read …) injects", () => {
+    // Process substitution hands cast a path like /proc/self/fd/11 that is
+    // meaningful only inside the process holding the fd. A spawned age does
+    // not hold it, so passing the path through as `-i <path>` can never work;
+    // the identity must travel to age on stdin. Opening the key here and
+    // pointing at our own fd reproduces exactly that shape.
+    const { keyFile, enc } = ageFixture();
+    const fd = openSync(keyFile, "r");
+    try {
+      expect(decryptSecrets(enc, `/proc/self/fd/${fd}`)).toEqual({
+        MAILGUN_KEY: "mk-123",
+        OPENROUTER_KEY: "or-456",
+      });
+    } finally {
+      closeSync(fd);
+    }
   });
 });
 

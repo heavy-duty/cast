@@ -1,13 +1,20 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+// The identity is read here and handed to age on stdin (`-i -`), never as a
+// path: keyFile may be a process substitution (`CAST_AGE_KEY_FILE_PROD=<(pm
+// read …)` → /proc/self/fd/N), and that path resolves only inside the process
+// holding the fd — this one. A freshly spawned age has no such fd and fails
+// with ENOENT. Not `-i /dev/stdin` either: node closes the pipe before age
+// re-opens it by path (ENXIO); `-` makes age read the inherited fd directly.
 export function decryptSecrets(
   file: string,
   keyFile: string,
 ): Record<string, string> {
-  const out = execFileSync("age", ["-d", "-i", keyFile, file], {
+  const out = execFileSync("age", ["-d", "-i", "-", file], {
+    input: readFileSync(keyFile),
     encoding: "utf8",
   });
   const secrets: Record<string, string> = {};

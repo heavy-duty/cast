@@ -38,6 +38,15 @@ const BindingsSchema = z
           // it per environment keeps each one's expectation explicit and
           // survives a future split into per-environment tokens.
           team: TeamSchema,
+          // The named Coolify instance this environment lives on
+          // (<state>/.coolify/<name>.env). Optional: with no binding and no
+          // --instance, cast reads <state>/.coolify.env exactly as it always
+          // has. Binding it here is what lets `--env prod` select the right
+          // control plane with no flag and no file edit — the connection
+          // target stops being implicit in a file's current contents.
+          // An explicit --instance still wins, so a one-off read against a
+          // legacy box needs no change to this file either.
+          instance: z.string().optional(),
           s3_destination: z.string().optional(),
           // Var-name patterns this environment refuses outright (see
           // assertEnvVarPolicy). Operator-owned guard: prod typically bans

@@ -5,7 +5,12 @@ import { parseArgs } from "node:util";
 import { parse as parseYaml } from "yaml";
 import { type Executor, applyHostnameOverlay, applyPlan } from "./apply.js";
 import { githubAppNameFor, loadBindings } from "./bindings.js";
-import { loadCoolifyEnv } from "./config.js";
+import {
+  type CoolifyInstance,
+  assertWritable,
+  formatInstance,
+  loadInstance,
+} from "./config.js";
 import { CoolifyClient, HttpError } from "./coolify.js";
 import {
   type Live,
@@ -33,6 +38,13 @@ const USAGE = `usage: cast apply <org>/<repo> --env <env> [--path <dir>] [--proj
                   the token belongs to that environment's declared team.
                   \`cast team\` alone (no --env) reports the token's team
                   without needing a binding — use it to fill environments.yaml.
+  --instance <name>
+                  the Coolify to talk to: <state>/.coolify/<name>.env, instead
+                  of <state>/.coolify.env. Bind one per environment in
+                  environments.yaml (\`instance: <name>\`) and --env selects it
+                  with no flag; an explicit --instance still wins. An instance
+                  may declare COOLIFY_READ_ONLY=true, and then no command that
+                  writes will run against it.
   --project <name>
                   the Coolify project to act on, when it is not named after the
                   repo (the default). A project built by hand in the UI is called
@@ -44,6 +56,28 @@ const USAGE = `usage: cast apply <org>/<repo> --env <env> [--path <dir>] [--proj
 // directory it is pointed at, never from a location the tool itself knows.
 function stateDirFrom(flag: string | undefined): string {
   return flag ?? process.env.CAST_STATE ?? ".";
+}
+
+// Resolve which Coolify to talk to, announce it, and open a client on it.
+//
+// Precedence: --instance > the environment's `instance:` binding > the
+// default .coolify.env. Every command that reaches a live Coolify goes through
+// here, so every one of them SAYS which Coolify it is about to touch, right
+// next to the team assert. The connection target used to be implicit in
+// .coolify.env's current contents — retargeting meant hand-editing a live
+// credential file and putting it back afterwards, and the failure mode of
+// getting it wrong is running `apply` against production.
+function openCoolify(
+  stateDir: string,
+  flag: string | undefined,
+  binding?: { instance?: string },
+): { instance: CoolifyInstance; client: CoolifyClient } {
+  const instance = loadInstance(stateDir, flag ?? binding?.instance);
+  console.log(formatInstance(instance));
+  return {
+    instance,
+    client: new CoolifyClient(instance.baseUrl, instance.token),
+  };
 }
 
 // Live Coolify objects use their own field vocabulary; computeDiff compares
@@ -306,6 +340,7 @@ async function main(): Promise<number> {
         path: { type: "string" },
         state: { type: "string" },
         project: { type: "string" },
+        instance: { type: "string" },
         "hostname-overlay": { type: "string" },
         full: { type: "boolean", default: false },
       },
@@ -350,8 +385,12 @@ async function main(): Promise<number> {
         parseYaml(readFileSync(values["hostname-overlay"], "utf8")),
       );
     }
-    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
-    const client = new CoolifyClient(baseUrl, token);
+    const { instance, client } = openCoolify(
+      stateDir,
+      values.instance,
+      binding,
+    );
+    if (command === "apply") assertWritable(instance, "apply");
     // Fail-closed, before the first live read — not merely before the first
     // write. A wrong-team token makes fetchLive come back empty (the API
     // resolves what it cannot see to null), so an unasserted `diff` would
@@ -438,6 +477,7 @@ async function main(): Promise<number> {
         user: { type: "string" },
         port: { type: "string" },
         state: { type: "string" },
+        instance: { type: "string" },
       },
     });
     // --env is required: a server is registered under the token's team and
@@ -457,8 +497,12 @@ async function main(): Promise<number> {
       console.error(`environment ${values.env} not in environments.yaml`);
       return 2;
     }
-    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
-    const client = new CoolifyClient(baseUrl, token);
+    const { instance, client } = openCoolify(
+      stateDir,
+      values.instance,
+      binding,
+    );
+    assertWritable(instance, "server add");
     const team = await assertTeam(client, binding.team, values.env);
     console.log(`team ${formatTeam(team)} ✓`);
     await serverAdd(client, {
@@ -474,7 +518,11 @@ async function main(): Promise<number> {
     const { values } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: { state: { type: "string" }, env: { type: "string" } },
+      options: {
+        state: { type: "string" },
+        env: { type: "string" },
+        instance: { type: "string" },
+      },
     });
     // smoke writes: it POSTs two env vars onto the live smoke_target app and
     // deletes them again. That is a mutation, so it takes the assert like any
@@ -485,14 +533,18 @@ async function main(): Promise<number> {
       return 2;
     }
     const stateDir = stateDirFrom(values.state);
-    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
-    const client = new CoolifyClient(baseUrl, token);
     const bindings = loadBindings(join(stateDir, "environments.yaml"));
     const binding = bindings.environments[values.env];
     if (!binding) {
       console.error(`environment ${values.env} not in environments.yaml`);
       return 2;
     }
+    const { instance, client } = openCoolify(
+      stateDir,
+      values.instance,
+      binding,
+    );
+    assertWritable(instance, "smoke");
     const team = await assertTeam(client, binding.team, values.env);
     console.log(`team ${formatTeam(team)} ✓`);
     if (!bindings.smoke_target) {
@@ -518,11 +570,27 @@ async function main(): Promise<number> {
     const { values } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: { state: { type: "string" }, env: { type: "string" } },
+      options: {
+        state: { type: "string" },
+        env: { type: "string" },
+        instance: { type: "string" },
+      },
     });
     const stateDir = stateDirFrom(values.state);
-    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
-    const client = new CoolifyClient(baseUrl, token);
+    // Bindings first, but only when --env was given: an environment's
+    // `instance:` binding is what selects the Coolify to ask. Without --env
+    // there is no binding to read (and deliberately so — see below), so the
+    // flag or the default file decides.
+    const binding = values.env
+      ? loadBindings(join(stateDir, "environments.yaml")).environments[
+          values.env
+        ]
+      : undefined;
+    if (values.env && !binding) {
+      console.error(`environment ${values.env} not in environments.yaml`);
+      return 2;
+    }
+    const { client } = openCoolify(stateDir, values.instance, binding);
     // Read-only, and the one command that deliberately does NOT require a
     // team binding: it is how you discover the values to write into
     // environments.yaml in the first place. Asserting here would be circular.
@@ -530,13 +598,7 @@ async function main(): Promise<number> {
     // "will apply refuse?" — ask the question without touching anything.
     const actual = await client.currentTeam();
     console.log(`token's team: ${formatTeam(actual)}`);
-    if (!values.env) return 0;
-    const binding = loadBindings(join(stateDir, "environments.yaml"))
-      .environments[values.env];
-    if (!binding) {
-      console.error(`environment ${values.env} not in environments.yaml`);
-      return 2;
-    }
+    if (!values.env || !binding) return 0;
     await assertTeam(client, binding.team, values.env);
     console.log(`matches the team ${values.env} expects ✓`);
     return 0;

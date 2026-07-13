@@ -1,11 +1,18 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { parse as parseYaml } from "yaml";
 import { type Executor, applyHostnameOverlay, applyPlan } from "./apply.js";
 import { githubAppNameFor, loadBindings } from "./bindings.js";
-import { loadCoolifyEnv } from "./config.js";
+import { type LiveEnvs, classify, renderCapturePlan } from "./capture.js";
+import {
+  type CoolifyInstance,
+  assertWritable,
+  formatInstance,
+  loadInstance,
+} from "./config.js";
 import { CoolifyClient, HttpError } from "./coolify.js";
 import {
   type Live,
@@ -14,14 +21,24 @@ import {
   renderDiff,
 } from "./diff.js";
 import { assertEnvVarPolicy } from "./envtemplate.js";
-import { desiredFromManifest, resolveCheckout } from "./resolve.js";
-import { decryptSecrets, keyFileFor, secretsFileFor } from "./secrets.js";
+import {
+  desiredFromManifest,
+  requiredSecrets,
+  resolveCheckout,
+} from "./resolve.js";
+import {
+  decryptSecrets,
+  encryptSecrets,
+  keyFileFor,
+  secretsFileFor,
+} from "./secrets.js";
 import { serverAdd } from "./server.js";
 import { smoke } from "./smoke.js";
 import { assertTeam, formatTeam } from "./team.js";
 
-const USAGE = `usage: cast apply <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--hostname-overlay <file>]
-       cast diff  <org>/<repo> --env <env> [--full] [--project <name>]
+const USAGE = `usage: cast apply   <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--hostname-overlay <file>]
+       cast diff    <org>/<repo> --env <env> [--full] [--project <name>]
+       cast capture <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--generated <NAME>] [--override <NAME>] [--force]
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
        cast smoke --env <env>
        cast team [--env <env>]
@@ -33,17 +50,55 @@ const USAGE = `usage: cast apply <org>/<repo> --env <env> [--path <dir>] [--proj
                   the token belongs to that environment's declared team.
                   \`cast team\` alone (no --env) reports the token's team
                   without needing a binding — use it to fill environments.yaml.
+  --instance <name>
+                  the Coolify to talk to: <state>/.coolify/<name>.env, instead
+                  of <state>/.coolify.env. Bind one per environment in
+                  environments.yaml (\`instance: <name>\`) and --env selects it
+                  with no flag; an explicit --instance still wins. An instance
+                  may declare COOLIFY_READ_ONLY=true, and then no command that
+                  writes will run against it.
   --project <name>
                   the Coolify project to act on, when it is not named after the
                   repo (the default). A project built by hand in the UI is called
                   whatever someone typed; \`diff\` refuses rather than reporting an
                   absent project as an empty one, and this is how you point it at
-                  the real name.`;
+                  the real name.
+
+capture (adopt a hand-built instance into the age secret store):
+  --generated <NAME>   force NAME to the \`pending-coolify-generated\` placeholder,
+                       for a manifest that has not declared generated_secrets yet.
+                       Repeatable.
+  --override <NAME>    supply NAME yourself instead of copying the source's value.
+                       The VALUE is read from \$CAST_CAPTURE_<NAME>, never from the
+                       command line — argv is visible in \`ps\`. Repeatable.
+  --force              overwrite an existing store (refused by default).`;
 
 // cast is stateless: every instance-scoped input is read from the state
 // directory it is pointed at, never from a location the tool itself knows.
 function stateDirFrom(flag: string | undefined): string {
   return flag ?? process.env.CAST_STATE ?? ".";
+}
+
+// Resolve which Coolify to talk to, announce it, and open a client on it.
+//
+// Precedence: --instance > the environment's `instance:` binding > the
+// default .coolify.env. Every command that reaches a live Coolify goes through
+// here, so every one of them SAYS which Coolify it is about to touch, right
+// next to the team assert. The connection target used to be implicit in
+// .coolify.env's current contents — retargeting meant hand-editing a live
+// credential file and putting it back afterwards, and the failure mode of
+// getting it wrong is running `apply` against production.
+function openCoolify(
+  stateDir: string,
+  flag: string | undefined,
+  binding?: { instance?: string },
+): { instance: CoolifyInstance; client: CoolifyClient } {
+  const instance = loadInstance(stateDir, flag ?? binding?.instance);
+  console.log(formatInstance(instance));
+  return {
+    instance,
+    client: new CoolifyClient(instance.baseUrl, instance.token),
+  };
 }
 
 // Live Coolify objects use their own field vocabulary; computeDiff compares
@@ -256,21 +311,26 @@ export async function fetchLive(
 // exists next to it.
 export function renderAbsentTarget(
   lookup: Extract<LiveLookup, { found: false }>,
-  ctx: { orgRepo: string; overridden: boolean },
+  ctx: { orgRepo: string; overridden: boolean; verb?: string },
 ): string {
+  // `capture` takes the same position as `diff`, and for the same reason: it
+  // is only ever a claim about something that already exists. Against an
+  // absent target it would read back zero live values and call every required
+  // secret "missing" — an alarming-but-meaningless report about the wrong box.
+  const verb = ctx.verb ?? "diff";
   const origin = ctx.overridden
     ? "--project"
     : `derived from the repo slug ${ctx.orgRepo}`;
   const head =
     lookup.missing === "project"
       ? [
-          `refusing to diff: no project named "${lookup.project}" exists in this team`,
+          `refusing to ${verb}: no project named "${lookup.project}" exists in this team`,
           "",
           `  looked for:  project "${lookup.project}"  (${origin})`,
           `  exists here: ${lookup.available.join(", ") || "(no projects at all)"}`,
         ]
       : [
-          `refusing to diff: project "${lookup.project}" has no environment "${lookup.environment}"`,
+          `refusing to ${verb}: project "${lookup.project}" has no environment "${lookup.environment}"`,
           "",
           `  looked for:  environment "${lookup.environment}" in project "${lookup.project}"`,
           "  note:        cast names environments after --env, so a project built by",
@@ -282,13 +342,86 @@ export function renderAbsentTarget(
     "",
     "An absent target reads back exactly like an empty one, so continuing would diff",
     'it as "nothing exists — create everything": a clean-looking report that verified',
-    "nothing. `apply` may create a target; `diff` may only ever describe one that is",
+    `nothing. \`apply\` may create a target; \`${verb}\` may only ever describe one that is`,
     "already there.",
     "",
     lookup.missing === "project"
       ? "Pass --project <name> if this instance names it differently."
       : "Re-run with --env naming the environment as it exists here.",
   ].join("\n");
+}
+
+// A live resource's env vars, by key. `real_value` is the decrypted one and
+// needs a token with read:sensitive; `value` is what a lesser token sees.
+//
+// A 404 (a resource we just listed no longer having an envs endpoint — not
+// expected in practice, but consistent with treating "gone" as "no env vars")
+// collapses to {}; anything else (401, 5xx, network) must surface. Swallowing
+// it would make a live resource's env look EMPTY, which turns every one of its
+// vars into a spurious create in a diff, and into a spurious "missing" in a
+// capture.
+async function fetchEnv(
+  client: CoolifyClient,
+  l: Live,
+): Promise<Record<string, string>> {
+  const base = l.kind === "database" ? "databases" : `${l.kind}s`;
+  const envs = (await client.get(`/${base}/${l.uuid}/envs`).catch((err) => {
+    if (err instanceof HttpError && err.status === 404) return [];
+    throw err;
+  })) as Array<{ key: string; real_value?: string; value: string }>;
+  return Object.fromEntries(envs.map((e) => [e.key, e.real_value ?? e.value]));
+}
+
+// The value for an --override, read from the ENVIRONMENT rather than argv.
+//
+// A secret passed as a command-line argument is visible in `ps` to every
+// process on the box, and lands in shell history — the same class of leak the
+// clone-auth fix (#13) exists to avoid. So --override names the secret and the
+// environment carries it.
+function readOverrides(names: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of names) {
+    const varName = `CAST_CAPTURE_${name}`;
+    const value = process.env[varName];
+    if (value === undefined) {
+      throw new Error(
+        [
+          `--override ${name}: no value supplied.`,
+          "",
+          `cast reads an override's value from ${varName}, never from the command`,
+          "line — an argv value is visible in `ps` to every process on this box.",
+          "",
+          `  ${varName}=… cast capture …`,
+        ].join("\n"),
+      );
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
+// Typed confirmation, and deliberately NOT a --yes flag.
+//
+// This verb writes an environment's secret store, once, off a box nobody is
+// going to rebuild. The entire reason it exists is that the hand-run version
+// was easy to get subtly wrong — so the last gate is a human who has read the
+// provenance column typing the environment's own name. Nothing shorter counts:
+// not "y", not a flag. Automating it means deliberately echoing the
+// environment name into cast, which is an explicit act rather than an absent
+// one.
+//
+// EOF (a closed or empty stdin) resolves to `null` and aborts. Without that
+// race, a `< /dev/null` run would hang forever on a question nobody can answer.
+async function confirmCapture(envName: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise<string | null>((resolve) => {
+    rl.question(
+      `\ntype the environment name to write this store (${envName}): `,
+    ).then(resolve, () => resolve(null));
+    rl.once("close", () => resolve(null));
+  });
+  rl.close();
+  return answer?.trim() === envName;
 }
 
 async function main(): Promise<number> {
@@ -306,6 +439,7 @@ async function main(): Promise<number> {
         path: { type: "string" },
         state: { type: "string" },
         project: { type: "string" },
+        instance: { type: "string" },
         "hostname-overlay": { type: "string" },
         full: { type: "boolean", default: false },
       },
@@ -350,8 +484,12 @@ async function main(): Promise<number> {
         parseYaml(readFileSync(values["hostname-overlay"], "utf8")),
       );
     }
-    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
-    const client = new CoolifyClient(baseUrl, token);
+    const { instance, client } = openCoolify(
+      stateDir,
+      values.instance,
+      binding,
+    );
+    if (command === "apply") assertWritable(instance, "apply");
     // Fail-closed, before the first live read — not merely before the first
     // write. A wrong-team token makes fetchLive come back empty (the API
     // resolves what it cannot see to null), so an unasserted `diff` would
@@ -380,28 +518,7 @@ async function main(): Promise<number> {
     const live = lookup.found ? lookup.live : [];
     if (mode === "full") {
       for (const l of live) {
-        const envs = (await client
-          .get(
-            `/${l.kind === "database" ? "databases" : `${l.kind}s`}/${l.uuid}/envs`,
-          )
-          .catch((err) => {
-            // Same policy as fetchLive's environment fetch: a 404 (a
-            // resource we just listed no longer having an envs endpoint —
-            // not expected in practice, but consistent with treating
-            // "gone" as "no env vars") collapses to []; anything else
-            // (401, 5xx, network) must surface. Swallowing it here would
-            // make a live resource's env look empty and turn every one of
-            // its vars into a spurious create in the diff.
-            if (err instanceof HttpError && err.status === 404) return [];
-            throw err;
-          })) as Array<{
-          key: string;
-          real_value?: string;
-          value: string;
-        }>;
-        l.env = Object.fromEntries(
-          envs.map((e) => [e.key, e.real_value ?? e.value]),
-        );
+        l.env = await fetchEnv(client, l);
       }
     }
     const report = computeDiff(desired, live, mode);
@@ -427,6 +544,139 @@ async function main(): Promise<number> {
     );
     return 0;
   }
+  if (command === "capture") {
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: {
+        env: { type: "string" },
+        state: { type: "string" },
+        path: { type: "string" },
+        project: { type: "string" },
+        instance: { type: "string" },
+        generated: { type: "string", multiple: true },
+        override: { type: "string", multiple: true },
+        force: { type: "boolean", default: false },
+      },
+    });
+    const orgRepo = positionals[0];
+    const envName = values.env;
+    if (!orgRepo || !envName) {
+      console.error(USAGE);
+      return 2;
+    }
+    const stateDir = stateDirFrom(values.state);
+    const repoShort = orgRepo.split("/")[1];
+    const projectName = values.project ?? repoShort;
+    const store = secretsFileFor(stateDir, repoShort, envName);
+    // Never overwrite a store by accident. `apply` never deletes; the verb
+    // that WRITES the store gets the same disposition, because the thing it
+    // would destroy is the only copy of values that may not exist anywhere
+    // else any more.
+    if (existsSync(store) && !values.force) {
+      console.error(
+        [
+          `refusing to capture: ${store} already exists`,
+          "",
+          "That store may hold the only copy of values the source box no longer has.",
+          "Pass --force to overwrite it deliberately, or move it aside first.",
+        ].join("\n"),
+      );
+      return 2;
+    }
+    const bindings = loadBindings(join(stateDir, "environments.yaml"));
+    const binding = bindings.environments[envName];
+    if (!binding) {
+      console.error(`environment ${envName} not in environments.yaml`);
+      return 2;
+    }
+    const recipient = binding.age_recipient;
+    if (!recipient) {
+      console.error(
+        [
+          `environment ${envName} has no age_recipient in environments.yaml`,
+          "",
+          "capture encrypts the store TO that recipient (the public half of the",
+          "environment's age key — safe to commit next to the bindings). Add it:",
+          "",
+          "  environments:",
+          `    ${envName}:`,
+          "      age_recipient: age1…",
+        ].join("\n"),
+      );
+      return 2;
+    }
+    // Same rule as apply (resolveCheckout enforces it): prod always reads the
+    // default branch. A feature-branch manifest must not be able to decide
+    // which names land in the prod store.
+    const checkout = resolveCheckout(orgRepo, {
+      env: envName,
+      path: values.path,
+    });
+    const { required, generated } = requiredSecrets(checkout, envName);
+    const overrides = readOverrides(values.override ?? []);
+    const { client } = openCoolify(stateDir, values.instance, binding);
+    // capture READS Coolify and writes only to the local store, so it is
+    // allowed against a read-only instance — inspecting a legacy box is
+    // precisely what such an instance is for. It still takes the team assert:
+    // a wrong-team token reads back nothing, and "nothing" here would render
+    // as "every secret is missing" against a box that is fine.
+    const team = await assertTeam(client, binding.team, envName);
+    console.log(`team ${formatTeam(team)} ✓`);
+    const lookup = await fetchLive(client, projectName, envName);
+    if (!lookup.found) {
+      console.error(
+        renderAbsentTarget(lookup, {
+          orgRepo,
+          overridden: values.project !== undefined,
+          verb: "capture",
+        }),
+      );
+      return 2;
+    }
+    const liveEnvs: LiveEnvs = {};
+    for (const l of lookup.live) {
+      // Databases hold no manifest-templated env of their own — their URL is
+      // what the APPS reference, and that name is generated, not captured.
+      if (l.kind === "database") continue;
+      liveEnvs[l.name] = await fetchEnv(client, l);
+    }
+    const classification = classify(
+      required,
+      [...generated, ...(values.generated ?? [])],
+      liveEnvs,
+      overrides,
+    );
+    console.log(
+      renderCapturePlan(classification, {
+        orgRepo,
+        env: envName,
+        instance: values.instance ?? binding.instance ?? "default",
+        store,
+        recipient,
+      }),
+    );
+    // Refuse, don't write a wrong store. Both of these are stop conditions,
+    // and the plan above has already named every offending entry.
+    if (
+      classification.missing.length > 0 ||
+      classification.conflicts.length > 0
+    )
+      return 2;
+    if (!(await confirmCapture(envName))) {
+      console.error("aborted — nothing written");
+      return 2;
+    }
+    encryptSecrets(
+      recipient,
+      store,
+      Object.fromEntries(classification.plan.map((d) => [d.ref, d.value])),
+    );
+    console.log(
+      `wrote ${store} — ${classification.plan.length} name(s), encrypted to ${recipient}`,
+    );
+    return 0;
+  }
   if (command === "server" && rest[0] === "add") {
     const { values, positionals } = parseArgs({
       args: rest.slice(1),
@@ -438,6 +688,7 @@ async function main(): Promise<number> {
         user: { type: "string" },
         port: { type: "string" },
         state: { type: "string" },
+        instance: { type: "string" },
       },
     });
     // --env is required: a server is registered under the token's team and
@@ -457,8 +708,12 @@ async function main(): Promise<number> {
       console.error(`environment ${values.env} not in environments.yaml`);
       return 2;
     }
-    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
-    const client = new CoolifyClient(baseUrl, token);
+    const { instance, client } = openCoolify(
+      stateDir,
+      values.instance,
+      binding,
+    );
+    assertWritable(instance, "server add");
     const team = await assertTeam(client, binding.team, values.env);
     console.log(`team ${formatTeam(team)} ✓`);
     await serverAdd(client, {
@@ -474,7 +729,11 @@ async function main(): Promise<number> {
     const { values } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: { state: { type: "string" }, env: { type: "string" } },
+      options: {
+        state: { type: "string" },
+        env: { type: "string" },
+        instance: { type: "string" },
+      },
     });
     // smoke writes: it POSTs two env vars onto the live smoke_target app and
     // deletes them again. That is a mutation, so it takes the assert like any
@@ -485,14 +744,18 @@ async function main(): Promise<number> {
       return 2;
     }
     const stateDir = stateDirFrom(values.state);
-    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
-    const client = new CoolifyClient(baseUrl, token);
     const bindings = loadBindings(join(stateDir, "environments.yaml"));
     const binding = bindings.environments[values.env];
     if (!binding) {
       console.error(`environment ${values.env} not in environments.yaml`);
       return 2;
     }
+    const { instance, client } = openCoolify(
+      stateDir,
+      values.instance,
+      binding,
+    );
+    assertWritable(instance, "smoke");
     const team = await assertTeam(client, binding.team, values.env);
     console.log(`team ${formatTeam(team)} ✓`);
     if (!bindings.smoke_target) {
@@ -518,11 +781,27 @@ async function main(): Promise<number> {
     const { values } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: { state: { type: "string" }, env: { type: "string" } },
+      options: {
+        state: { type: "string" },
+        env: { type: "string" },
+        instance: { type: "string" },
+      },
     });
     const stateDir = stateDirFrom(values.state);
-    const { baseUrl, token } = loadCoolifyEnv(join(stateDir, ".coolify.env"));
-    const client = new CoolifyClient(baseUrl, token);
+    // Bindings first, but only when --env was given: an environment's
+    // `instance:` binding is what selects the Coolify to ask. Without --env
+    // there is no binding to read (and deliberately so — see below), so the
+    // flag or the default file decides.
+    const binding = values.env
+      ? loadBindings(join(stateDir, "environments.yaml")).environments[
+          values.env
+        ]
+      : undefined;
+    if (values.env && !binding) {
+      console.error(`environment ${values.env} not in environments.yaml`);
+      return 2;
+    }
+    const { client } = openCoolify(stateDir, values.instance, binding);
     // Read-only, and the one command that deliberately does NOT require a
     // team binding: it is how you discover the values to write into
     // environments.yaml in the first place. Asserting here would be circular.
@@ -530,13 +809,7 @@ async function main(): Promise<number> {
     // "will apply refuse?" — ask the question without touching anything.
     const actual = await client.currentTeam();
     console.log(`token's team: ${formatTeam(actual)}`);
-    if (!values.env) return 0;
-    const binding = loadBindings(join(stateDir, "environments.yaml"))
-      .environments[values.env];
-    if (!binding) {
-      console.error(`environment ${values.env} not in environments.yaml`);
-      return 2;
-    }
+    if (!values.env || !binding) return 0;
     await assertTeam(client, binding.team, values.env);
     console.log(`matches the team ${values.env} expects ✓`);
     return 0;

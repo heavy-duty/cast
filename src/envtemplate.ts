@@ -2,11 +2,18 @@ export type ResolvedEnv = {
   vars: Record<string, { value: string; secret: boolean }>;
 };
 
-export function resolveTemplate(
-  text: string,
-  secrets: Record<string, string>,
-): ResolvedEnv {
-  const vars: ResolvedEnv["vars"] = {};
+// A template line, parsed but not resolved: `ref` is set when the whole RHS is
+// a single ${NAME} placeholder.
+export type TemplateVar = { key: string; rhs: string; ref?: string };
+
+// ONE grammar, shared by both readers of a template — resolveTemplate (which
+// needs the values) and templateRefs (which needs only the names). Keeping
+// them on separate parsers would let the two drift, and a drift here is not
+// cosmetic: `capture` would collect a different set of names than `apply` will
+// later demand, which is precisely the "a name silently missed" failure the
+// capture verb exists to remove.
+function parseTemplate(text: string): TemplateVar[] {
+  const vars: TemplateVar[] = [];
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -18,19 +25,40 @@ export function resolveTemplate(
       );
     const [, key, rhs] = m;
     const placeholder = rhs.match(/^\$\{([A-Z][A-Z0-9_]*)\}$/);
-    if (placeholder) {
-      const value = secrets[placeholder[1]];
-      if (value === undefined) {
-        throw new Error(
-          `secret ${placeholder[1]} (for ${key}) missing from the age store`,
-        );
-      }
-      vars[key] = { value, secret: true };
-    } else {
+    vars.push({ key, rhs, ...(placeholder ? { ref: placeholder[1] } : {}) });
+  }
+  return vars;
+}
+
+export function resolveTemplate(
+  text: string,
+  secrets: Record<string, string>,
+): ResolvedEnv {
+  const vars: ResolvedEnv["vars"] = {};
+  for (const { key, rhs, ref } of parseTemplate(text)) {
+    if (ref === undefined) {
       vars[key] = { value: rhs, secret: false };
+      continue;
     }
+    const value = secrets[ref];
+    if (value === undefined) {
+      throw new Error(`secret ${ref} (for ${key}) missing from the age store`);
+    }
+    vars[key] = { value, secret: true };
   }
   return { vars };
+}
+
+// The ${NAME} refs a template declares: the secret names the manifest requires,
+// paired with the env var each one lands on. `capture` reads these to learn
+// what to go and fetch — at capture time there is no store to resolve against
+// yet, which is the whole point of the verb.
+export function templateRefs(
+  text: string,
+): Array<{ key: string; ref: string }> {
+  return parseTemplate(text).flatMap(({ key, ref }) =>
+    ref === undefined ? [] : [{ key, ref }],
+  );
 }
 
 // An environment may forbid variables by name pattern, declared as

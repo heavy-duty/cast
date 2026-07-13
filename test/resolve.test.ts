@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { computeDiff } from "../src/diff.js";
-import { desiredFromManifest, resolveCheckout } from "../src/resolve.js";
+import {
+  cloneFailureMessage,
+  desiredFromManifest,
+  resolveCheckout,
+  resolveGitAuth,
+} from "../src/resolve.js";
 
 describe("resolveCheckout", () => {
   it("hard-refuses --path with prod", () => {
@@ -18,6 +23,94 @@ describe("resolveCheckout", () => {
         path: "/tmp/x",
       }),
     ).toBe("/tmp/x");
+  });
+});
+
+describe("resolveGitAuth", () => {
+  const noGh = () => false;
+  const yesGh = () => true;
+
+  it("prefers gh, borrowed as a per-invocation credential helper", () => {
+    const auth = resolveGitAuth({ GITHUB_TOKEN: "t" }, yesGh);
+    expect(auth.source).toBe("gh");
+    expect(auth.configArgs.join(" ")).toContain("!gh auth git-credential");
+    // No token is materialized when gh is driving.
+    expect(auth.env).toEqual({});
+  });
+
+  it("falls back to GITHUB_TOKEN when gh is absent", () => {
+    const auth = resolveGitAuth({ GITHUB_TOKEN: "ghp_secret" }, noGh);
+    expect(auth.source).toBe("token");
+    expect(auth.env).toEqual({ CAST_GIT_TOKEN: "ghp_secret" });
+  });
+
+  it("accepts GH_TOKEN as well as GITHUB_TOKEN", () => {
+    const auth = resolveGitAuth({ GH_TOKEN: "ghp_secret" }, noGh);
+    expect(auth.source).toBe("token");
+    expect(auth.env).toEqual({ CAST_GIT_TOKEN: "ghp_secret" });
+  });
+
+  // The acceptance criterion from #13: "the token never appears in process
+  // arguments or on disk". The helper string git receives must carry the
+  // NAME of the variable, never its value — sh expands it inside the helper.
+  it("never puts the token value in the git argv", () => {
+    const auth = resolveGitAuth({ GITHUB_TOKEN: "ghp_secret" }, noGh);
+    const argv = auth.configArgs.join(" ");
+    expect(argv).not.toContain("ghp_secret");
+    expect(argv).toContain("$CAST_GIT_TOKEN");
+  });
+
+  // A helper configured globally would otherwise be consulted first and
+  // silently decide the outcome, defeating the order cast just established.
+  it("resets the inherited helper list before installing its own", () => {
+    for (const auth of [
+      resolveGitAuth({}, yesGh),
+      resolveGitAuth({ GITHUB_TOKEN: "t" }, noGh),
+    ]) {
+      expect(auth.configArgs.slice(0, 2)).toEqual(["-c", "credential.helper="]);
+    }
+  });
+
+  it("falls through to the ambient helper when there is nothing else", () => {
+    expect(resolveGitAuth({}, noGh)).toEqual({
+      source: "ambient",
+      configArgs: [],
+      env: {},
+    });
+  });
+});
+
+describe("cloneFailureMessage", () => {
+  const ambient = { source: "ambient" as const, configArgs: [], env: {} };
+  const gh = { source: "gh" as const, configArgs: [], env: {} };
+
+  // The original bug: git's own error talked about THE REPOSITORY when the
+  // real fault was cast having no credentials at all.
+  it("blames the missing credentials, not the repo, when there were none", () => {
+    const msg = cloneFailureMessage("heavy-duty/incubator", ambient, "");
+    expect(msg).toMatch(/no GitHub credentials/);
+    expect(msg).toMatch(/gh auth login/);
+    expect(msg).toMatch(/GITHUB_TOKEN/);
+    expect(msg).not.toMatch(/does not exist/);
+  });
+
+  // ...and the converse: once cast DID authenticate, the repo really is a
+  // candidate explanation again, and 404-means-403 has to be spelled out.
+  it("names both roads when a credential was used and GitHub still refused", () => {
+    const msg = cloneFailureMessage("heavy-duty/incubator", gh, "");
+    expect(msg).toMatch(/gh/);
+    expect(msg).toMatch(/does not exist/);
+    expect(msg).toMatch(/private/);
+    expect(msg).not.toMatch(/no GitHub credentials/);
+  });
+
+  it("passes git's own stderr through rather than swallowing it", () => {
+    const msg = cloneFailureMessage(
+      "heavy-duty/incubator",
+      ambient,
+      "fatal: could not read Username for 'https://github.com'",
+    );
+    expect(msg).toMatch(/could not read Username/);
   });
 });
 

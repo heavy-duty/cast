@@ -82,6 +82,19 @@ const EnvironmentSpecSchema = z
     applications: z.record(AppSpecSchema),
     databases: z.record(DatabaseSpecSchema).optional(),
     services: z.record(ServiceSpecSchema).optional(),
+    // Secret names whose values the PROVIDER generates — a Coolify-created
+    // Postgres/Redis URL, a service's own generated credentials. `capture`
+    // writes these as the literal `pending-coolify-generated` and never copies
+    // the source box's live value: that value points at the SOURCE box's
+    // database, so carrying it over would be confidently wrong in a way that
+    // looks entirely plausible, and the target's real URL does not exist until
+    // Coolify creates the resource.
+    //
+    // It is a manifest property rather than a flag the operator has to
+    // remember, because the manifest is what knows DATABASE_URL comes from a
+    // database it declares. Optional: a manifest that names none simply has no
+    // generated secrets, and `capture` will say so in its plan.
+    generated_secrets: z.array(z.string()).optional(),
   })
   .strict();
 

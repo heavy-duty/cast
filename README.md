@@ -460,7 +460,16 @@ An environment's age identity is resolved in exactly two ways:
 That is the whole mechanism behind attended vs unattended applies: **an
 environment whose key you never leave on disk can only be applied by someone who
 injects it.** Keep a standing key for staging if you like; keep prod's in a
-password manager and pass it per apply.
+password manager and pass it per apply, straight from the manager with a
+process substitution:
+
+```sh
+CAST_AGE_KEY_FILE_PROD=<(pm read cast-prod-key) cast apply heavy-duty/incubator --env prod …
+```
+
+cast reads the identity itself and hands it to age on stdin, so this works even
+though `<(…)` yields a path only cast's own process can resolve — and the key
+never becomes a file, never appears in argv, and never enters the environment.
 
 The state directory holds ciphertext. It must never hold the identity that opens
 it.

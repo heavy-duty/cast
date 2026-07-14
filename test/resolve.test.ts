@@ -158,6 +158,64 @@ environments:
       value: "secret-v",
       secret: true,
     });
+    // None of the four build settings are emitted for an app that declares none:
+    // managing is_static is opt-in (declaring it would otherwise PATCH static
+    // serving OFF on an un-migrated app), and the commands default to "let the
+    // build pack decide".
+    expect(desired[0].fields).not.toHaveProperty("is_static");
+    expect(desired[0].fields).not.toHaveProperty("install_command");
+    expect(desired[0].fields).not.toHaveProperty("build_command");
+    expect(desired[0].fields).not.toHaveProperty("start_command");
+  });
+  it("emits is_static:false when static:false is explicitly declared (a guard against a UI flip)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    mkdirSync(join(dir, ".infra"), { recursive: true });
+    writeFileSync(
+      join(dir, ".infra", "manifest.yaml"),
+      `project: widget
+environments:
+  staging:
+    applications:
+      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: /, static: false }
+        domains: ["https://c.example.com"]
+`,
+    );
+    const { desired } = desiredFromManifest(dir, "staging", {});
+    expect(desired[0].fields.is_static).toBe(false);
+  });
+  // #63: the static-site build settings a workspace monorepo needs.
+  it("emits is_static:true and the three commands for a non-compose app that declares them", () => {
+    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    mkdirSync(join(dir, ".infra"), { recursive: true });
+    writeFileSync(
+      join(dir, ".infra", "manifest.yaml"),
+      `project: widget
+environments:
+  staging:
+    applications:
+      landing:
+        source: { repo: acme/widget, branch: main }
+        build:
+          pack: static
+          base_directory: /
+          publish_directory: /apps/landing-site/dist
+          install_command: npm ci
+          build_command: npm run build -w apps/landing-site
+          start_command: node server.js
+          static: true
+        domains: ["https://landing.example.com"]
+`,
+    );
+    const { desired } = desiredFromManifest(dir, "staging", {});
+    expect(desired[0].fields).toMatchObject({
+      is_static: true,
+      install_command: "npm ci",
+      build_command: "npm run build -w apps/landing-site",
+      start_command: "node server.js",
+      publish_directory: "/apps/landing-site/dist",
+    });
   });
   // The reverse of what this file used to assert. `backup` was deliberately
   // routed AROUND `fields` into a side channel, because live Coolify was
@@ -345,6 +403,12 @@ environments:
     expect(desired[0].fields).not.toHaveProperty("port");
     expect(desired[0].fields).not.toHaveProperty("healthcheck");
     expect(desired[0].fields).not.toHaveProperty("domains");
+    // A compose app builds from its compose file — none of the static/command
+    // fields belong on it, not even is_static (which every NON-compose app gets).
+    expect(desired[0].fields).not.toHaveProperty("is_static");
+    expect(desired[0].fields).not.toHaveProperty("install_command");
+    expect(desired[0].fields).not.toHaveProperty("build_command");
+    expect(desired[0].fields).not.toHaveProperty("start_command");
   });
   it('warns that apply cannot enable "Include Source Commit in Build" on a dockercompose app (unsettable via the Coolify 4.1.2 API)', () => {
     const dir = mkdtempSync(join(tmpdir(), "infra-co-"));

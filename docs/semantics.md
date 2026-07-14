@@ -221,6 +221,60 @@ softened by an implementation detail):
 - **Reserved names:** cast never writes `SOURCE_COMMIT` or a `COOLIFY_*` var,
   under any manifest, in any environment. See below.
 
+## Build settings (`install_command`, `build_command`, `start_command`, `static`)
+
+A manifest application's `build` block carries, beyond `pack` and the checkout
+paths, four optional settings Coolify accepts on both the create
+(`POST /applications/private-github-app`) and update (`PATCH /applications/{uuid}`)
+routes:
+
+```yaml
+landing:
+  source: { repo: acme/widget, branch: main }
+  build:
+    pack: nixpacks
+    base_directory: /
+    install_command: npm ci
+    build_command: npm run build -w apps/landing-site
+    publish_directory: /apps/landing-site/dist
+    static: true
+  domains: ["https://widget.example.com"]
+```
+
+- `install_command` / `build_command` / `start_command` are free-form strings,
+  passed through verbatim — cast does not parse the shell in them. They exist so
+  a **workspace monorepo** can scope the build to one app (`npm run build -w
+  apps/landing-site`) instead of letting nixpacks auto-detect from the repo-root
+  `package.json`, whose scripts may build and run a *different* workspace.
+- `static: true` maps to Coolify's `is_static`: Coolify then **serves
+  `publish_directory` and runs no start command**. Without it a static site in a
+  monorepo gets built and then *run* as its root `package.json` — for the
+  incubator's `landing` that meant Coolify ran `npm run start -w apps/core`, the
+  API server, which crash-looped on a missing `DATABASE_URL` (#63).
+
+**All four are rejected on a `dockercompose` app** — a compose app builds and
+runs from its compose file, so Coolify never consults them — and `static: true`
+is rejected without a `publish_directory` (nothing to serve). Both are parse-time
+refusals, like the checkout-path rules above.
+
+**Managing `is_static` is opt-in.** cast emits it only when the manifest declares
+`static:` — like the three commands, not on every app. Emitting `is_static:false`
+by default would make the first apply after this ships PATCH `is_static=false`
+onto any static/SPA app configured in the UI whose manifest has not yet been
+migrated — silently disabling static serving and re-creating the very crash, now
+caused by cast; a `pack: static` app that Coolify couples to `is_static=true`
+would drift-and-revert forever. So: declare `static: true` to serve, `static:
+false` to actively guard against a UI flip to `true`, or omit it to leave the
+field alone (Coolify keeps `pack` and `is_static` independent, which is why this
+is an explicit field, not inferred from `pack`). The three commands are likewise
+conditional (an unset command means "let the build pack decide"), diffed only
+when declared. `projectLiveFields` reads `is_static` back on every app so it is
+there to compare when a manifest does declare it. `draft` emits all four when the
+live box carries them (and `static` only alongside a `publish_directory`, so the
+draft always loads) — they used to sit in its `NO_HOME` list of settings a
+rebuild silently dropped, and `is_static` was not even there, which is exactly
+how a rebuilt static site came back wrong.
+
 ## Reserved env var names (`SOURCE_COMMIT`, `COOLIFY_*`)
 
 Coolify injects a set of values into an application's runtime environment

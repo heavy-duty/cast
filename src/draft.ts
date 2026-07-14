@@ -435,9 +435,6 @@ function applicationSpec(
   const NO_HOME: Array<[string, string]> = [
     ["custom_labels", "custom Traefik/Docker labels (Basic Auth lives here)"],
     ["ports_mappings", "host port mappings"],
-    ["install_command", "a custom install command"],
-    ["build_command", "a custom build command"],
-    ["start_command", "a custom start command"],
     ["pre_deployment_command", "a pre-deployment command"],
     ["post_deployment_command", "a post-deployment command"],
     ["dockerfile", "an inline Dockerfile"],
@@ -482,6 +479,33 @@ function applicationSpec(
         : {}),
       ...(!compose && r.raw.publish_directory
         ? { publish_directory: String(r.raw.publish_directory) }
+        : {}),
+      // The three build/run commands and the static flag now HAVE manifest
+      // fields (see manifest.ts), so a rebuild carries them instead of silently
+      // dropping them. `is_static` was previously not even in NO_HOME, so a
+      // rebuild lost it without a word — that is exactly the #63 crash: a static
+      // site whose is_static was true on the box came back as false, got built
+      // and RUN from the repo-root package.json, and crash-looped. draft now
+      // carries it. (Compose apps get none of these — see the else above.)
+      ...(!compose && r.raw.install_command
+        ? { install_command: String(r.raw.install_command) }
+        : {}),
+      ...(!compose && r.raw.build_command
+        ? { build_command: String(r.raw.build_command) }
+        : {}),
+      ...(!compose && r.raw.start_command
+        ? { start_command: String(r.raw.start_command) }
+        : {}),
+      // Gated on publish_directory as well: the schema refuses `static: true`
+      // with nothing to serve, and a draft must only ever emit a manifest that
+      // loads. Coolify's static apps carry a publish_directory (its default is
+      // `/`), so this drops `static` only for a box in a state the manifest could
+      // not express anyway — a loud, correct omission rather than an unloadable
+      // file.
+      ...(!compose &&
+      (r.raw.is_static === true || r.raw.is_static === 1) &&
+      r.raw.publish_directory
+        ? { static: true }
         : {}),
     },
     ...(compose

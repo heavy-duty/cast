@@ -43,6 +43,19 @@ const AppSpecSchema = z
         base_directory: repoDirectoryPath("base_directory"),
         publish_directory: repoDirectoryPath("publish_directory").optional(),
         compose_file: composeFilePath.optional(),
+        // The three build/run commands and the static flag Coolify accepts on
+        // both the create (POST /applications/private-github-app) and the
+        // update (PATCH /applications/{uuid}) routes. They are free-form
+        // strings passed through verbatim — cast does not parse or validate the
+        // shell in them, only whether they belong on this pack (superRefine
+        // below). `static` maps to Coolify's `is_static`: it makes Coolify
+        // SERVE `publish_directory` and run NO start command, which is exactly
+        // the fix for a static site in a workspace monorepo that otherwise gets
+        // built and RUN from the repo-root package.json (#63).
+        install_command: z.string().optional(),
+        build_command: z.string().optional(),
+        start_command: z.string().optional(),
+        static: z.boolean().optional(),
       })
       .strict(),
     port: z.number().int().optional(),
@@ -75,6 +88,26 @@ const AppSpecSchema = z
           code: "custom",
           message: "publish_directory not allowed on a dockercompose app",
         });
+      // A compose app builds and runs from its compose file — Coolify never
+      // consults these on it. Reject them at parse time rather than post them
+      // and have them silently ignored (the same reasoning as publish_directory
+      // and port above).
+      for (const k of [
+        "install_command",
+        "build_command",
+        "start_command",
+      ] as const)
+        if (app.build[k] !== undefined)
+          ctx.addIssue({
+            code: "custom",
+            message: `build.${k} not allowed on a dockercompose app (it builds from its compose file)`,
+          });
+      if (app.build.static !== undefined)
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "build.static not allowed on a dockercompose app (a compose file decides what is served)",
+        });
     } else {
       if (!app.domains)
         ctx.addIssue({
@@ -86,6 +119,16 @@ const AppSpecSchema = z
           code: "custom",
           message:
             "service_domains/compose_file only allowed with pack dockercompose",
+        });
+      // `static: true` tells Coolify to serve publish_directory and run no
+      // start command — so a static app with nothing to serve is almost
+      // certainly a mistake, and one that would deploy green while serving an
+      // empty site. Catch it in the file, once, not on a live box.
+      if (app.build.static === true && !app.build.publish_directory)
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "build.static: true serves publish_directory and runs no start command — but no publish_directory is set, so there is nothing to serve",
         });
     }
   });

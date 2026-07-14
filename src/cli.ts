@@ -326,6 +326,17 @@ export function projectLiveFields(
         ? { docker_compose_location: raw.docker_compose_location }
         : {}),
       ...(composeDomains ? { docker_compose_domains: composeDomains } : {}),
+      // is_static is read on every application so it is there to compare WHEN a
+      // manifest declares `static:`. computeDiff compares only fields the DESIRED
+      // side declares, so an app whose manifest omits `static` never diffs on it
+      // (which is what keeps this from PATCHing is_static off an un-migrated
+      // static app), and the three commands are the same — live carrying them
+      // here is safe and never reads as spurious drift. Coolify's Application
+      // model casts is_static to boolean; tolerate a 1/0 defensively.
+      is_static: raw.is_static === true || raw.is_static === 1,
+      ...(raw.install_command ? { install_command: raw.install_command } : {}),
+      ...(raw.build_command ? { build_command: raw.build_command } : {}),
+      ...(raw.start_command ? { start_command: raw.start_command } : {}),
     };
   }
   if (kind === "database") {
@@ -2445,6 +2456,10 @@ export function applicationApiFields(
   const { port, healthcheck, domains, docker_compose_domains, ...rest } =
     fields;
   return {
+    // is_static/install_command/build_command/start_command ride through `rest`
+    // unchanged: they are valid API params verbatim, accepted on both the create
+    // (POST /applications/private-github-app) and update (PATCH
+    // /applications/{uuid}) routes — verified against the vendored OpenAPI.
     ...rest,
     // ports_exposes wants a string; healthcheck -> health_check_path;
     // domains wants a comma-separated string, not an array.

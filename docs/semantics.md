@@ -82,11 +82,25 @@ manifest needs to change.
 ```yaml
 core:
   source: { repo: acme/widget, branch: main }
-  build: { pack: dockercompose, base_directory: /, compose_file: docker-compose.yaml }
+  build: { pack: dockercompose, base_directory: /, compose_file: /docker-compose.yaml }
   service_domains:
     api: ["https://api.widget.example.com"]
   env_template: core.prod.env.template
 ```
+
+**Checkout paths are absolute.** `build.compose_file`,
+`build.base_directory` and `build.publish_directory` are all paths *inside the
+repo checkout*, and all three must begin with `/` — the manifest schema refuses
+them otherwise. This is Coolify's own rule, not cast's taste: on create it
+validates `docker_compose_location` against
+`ValidationPatterns::FILE_PATH_PATTERN` and `base_directory`/`publish_directory`
+against `DIRECTORY_PATH_PATTERN` (both anchored on a leading slash; only the
+directory pattern also admits the bare `/` root), and a `docker-compose.yaml`
+with no slash comes back as a bare 422 — *after* `apply` has already created
+the project and the environment. cast refuses at parse time instead, on every
+verb, at zero API cost. It refuses rather than normalizes: the manifest is the
+artifact under review, so the value is fixed in the file, once, not repaired in
+memory on every run.
 
 Internally cast keeps the map vocabulary (`docker_compose_domains:
 {service: string[]}`) all the way through `resolve.ts`/`apply.ts`/diffing;

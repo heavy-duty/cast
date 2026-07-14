@@ -295,7 +295,7 @@ environments:
     applications:
       core:
         source: { repo: acme/widget, branch: main }
-        build: { pack: dockercompose, base_directory: /, compose_file: docker-compose.yaml }
+        build: { pack: dockercompose, base_directory: /, compose_file: /docker-compose.yaml }
         service_domains:
           api: ["https://api.widget.example.com"]
         env_template: core.prod.env.template
@@ -315,7 +315,7 @@ environments:
         git_branch: "main",
         build_pack: "dockercompose",
         base_directory: "/",
-        docker_compose_location: "docker-compose.yaml",
+        docker_compose_location: "/docker-compose.yaml",
         docker_compose_domains: {
           api: ["https://api.widget.example.com"],
         },

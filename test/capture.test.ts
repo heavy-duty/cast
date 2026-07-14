@@ -251,7 +251,7 @@ environments:
     applications:
       core:
         source: { repo: heavy-duty/incubator, branch: main }
-        build: { pack: dockercompose, base_directory: /, compose_file: docker-compose.yaml }
+        build: { pack: dockercompose, base_directory: /, compose_file: /docker-compose.yaml }
         service_domains:
           api: ["https://api.example.com"]
         env_template: core.prod.env.template

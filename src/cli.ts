@@ -29,6 +29,7 @@ import {
 } from "./config.js";
 import { CoolifyClient, HttpError } from "./coolify.js";
 import {
+  type Change,
   type Live,
   type ResourceKind,
   computeDiff,
@@ -811,6 +812,11 @@ async function runProject(
     envName: coolifyEnv,
     serverUuid,
     githubAppUuid,
+    // Not the wire names above (see buildExecutor): the names the operator wrote,
+    // and the state-file path a missing destination has to be declared at.
+    serverName: ctx.binding.server,
+    orgRepo,
+    bindingEnv: ctx.envName,
     destinationUuid: projectBinding?.destination_uuid,
     s3DestinationUuid: ctx.binding.s3_destination,
     backupSchedules,
@@ -1704,11 +1710,35 @@ async function resolveOrCreateProject(
 // duplicate name), reached when something else wins the race between our read
 // and our write.
 //
-// Coolify's own default environment is left exactly where it is: cast does not
-// remove things (see renderDiff — an orphan is reported and NOT repaired,
-// "removal is a manual runbook act"), and an empty `production` beside the
-// environment everything lives in is the mildest possible case of that. It is
-// reported for the same reason an orphan is: so the operator knows, and decides.
+// Coolify's default environment is then REMOVED — the one delete cast performs,
+// and the exception that has to argue for itself against *apply never deletes*
+// (#40).
+//
+// What that rule protects is things cast did not make: a resource, an env var, a
+// project someone built by hand. This is none of those. It is a byproduct of
+// cast's own `POST /projects` seconds earlier, in this run, holding nothing and
+// having never held anything — cast declining to leave litter behind itself. The
+// alternative is what #39 shipped and #40 was filed against: every project cast
+// creates from nothing carries a permanently-empty `production` beside the
+// environment everything actually lives in, which is *precisely* the shape that
+// makes a box unreadable later. We have the live example — on the box being
+// migrated away from, `production` is empty and everything runs in `staging`,
+// and "the obvious guess is the wrong one" is a note we had to write down for
+// ourselves. Shipping more of those is not neutrality; it is a bug with a
+// changelog entry.
+//
+// All three conditions are load-bearing, and removeDefaultEnvironment enforces
+// them jointly:
+//
+//   cast created the project, in THIS run — never touch a project someone built
+//     by hand, whatever it happens to carry.
+//   the environment is EMPTY — asked of Coolify, not assumed from the above.
+//   its name is NOT ours — a project whose --environment legitimately IS
+//     `production` keeps it (it is the one everything is about to live in).
+//
+// And it is best-effort: a delete that fails leaves the environment reported,
+// exactly as #39 left it, and never fails an apply that has otherwise worked.
+// Tidying is not worth a half-applied run.
 async function ensureEnvironment(
   client: CoolifyClient,
   projectUuid: string,
@@ -1717,7 +1747,7 @@ async function ensureEnvironment(
   projectWasCreated: boolean,
 ): Promise<void> {
   // The read that decides. On a project cast just created, it is also the list
-  // of environments Coolify gave it by itself — which is what `strays` reports.
+  // of environments Coolify gave it by itself — which is what `strays` holds.
   const existing = await client.environments(projectUuid);
   if (!existing.includes(envName)) {
     try {
@@ -1728,10 +1758,39 @@ async function ensureEnvironment(
       if (!(err instanceof HttpError) || err.status !== 409) throw err;
     }
   }
-  const strays = projectWasCreated ? existing.filter((e) => e !== envName) : [];
-  if (strays.length > 0) {
+  if (!projectWasCreated) return;
+  for (const stray of existing.filter((e) => e !== envName)) {
+    await removeDefaultEnvironment(client, projectUuid, projectName, stray);
+  }
+}
+
+// The delete itself, and the two ways it declines to happen. Nothing here throws:
+// every path ends in a line of output, because the operator's project is either
+// tidy or carrying an environment they now know about.
+async function removeDefaultEnvironment(
+  client: CoolifyClient,
+  projectUuid: string,
+  projectName: string,
+  envName: string,
+): Promise<void> {
+  try {
+    // Asked, not inferred. It is empty by construction — Coolify made it a
+    // moment ago and only cast has written to this project since — but "it must
+    // be empty" is a belief, and this is a delete. The check costs one GET and
+    // is what makes the guarantee a fact rather than an argument.
+    if (!(await client.environmentIsEmpty(projectUuid, envName))) {
+      console.log(
+        `note: left Coolify's default environment ${envName} on new project ${projectName} — it is NOT empty (cast deletes nothing that holds anything)`,
+      );
+      return;
+    }
+    await client.deleteEnvironment(projectUuid, envName);
     console.log(
-      `note: new project ${projectName} carries Coolify's default environment(s): ${strays.join(", ")} — empty, unused, and cast never removes (delete by hand if unwanted)`,
+      `removed Coolify's default environment ${envName} from new project ${projectName} (empty — created by Coolify's POST /projects, never by the manifest)`,
+    );
+  } catch (err) {
+    console.log(
+      `note: new project ${projectName} carries Coolify's default environment ${envName} — empty and unused, and cast could not remove it (${err instanceof Error ? err.message : String(err)}). Delete it by hand, or leave it.`,
     );
   }
 }
@@ -1841,6 +1900,55 @@ export function serviceApiFields(
   return rest;
 }
 
+// Coolify's answer when a server has more than one destination and the create did
+// not say which one to use (all three controllers, identically, v4.1.2):
+//
+//   POST /applications/private-github-app → 400:
+//   {"message":"Server has multiple destinations and you do not set destination_uuid."}
+//
+// It names neither the remedy nor the file the remedy goes in, and it arrives at
+// the FIRST create — after apply has already made the project and the environment.
+// So the operator is holding a half-applied run and a message about a field they
+// may never have heard of. (#41)
+//
+// cast cannot pre-flight this and that part is not fixable here: 4.1.2 serves no
+// destinations API at all — not list, not read, not create — and GET /servers/{uuid}
+// does not carry them either, so a server's destination COUNT is not knowable until
+// a create has already been attempted. What IS fixable is the diagnosis, and this is
+// the whole of it: catch the one message, and answer the question it raises.
+function isMultiDestination400(err: unknown): err is HttpError {
+  return (
+    err instanceof HttpError &&
+    err.status === 400 &&
+    err.message.includes("Server has multiple destinations")
+  );
+}
+
+export function multiDestinationRemedy(where: {
+  server: string;
+  env: string;
+  project: string;
+  resource: string;
+  coolify: string;
+}): string {
+  return [
+    `cannot create ${where.resource}: ${where.server} has multiple destinations, so a create must say which one to use.`,
+    "",
+    `  Coolify said: ${where.coolify}`,
+    "",
+    "Read the destination UUID from the Coolify UI (4.1.2 exposes no API for it) and",
+    "declare it as:",
+    "",
+    `    environments.${where.env}.projects.${where.project}.destination_uuid`,
+    "",
+    "Placement is create-time — a resource cannot be moved between networks later, so a",
+    "wrong or missing destination is repaired by delete + recreate, never by a later apply.",
+    "",
+    "Re-run this apply once the UUID is declared: anything it already created (the project,",
+    "its environment) is adopted, not made twice — apply reads before it writes.",
+  ].join("\n");
+}
+
 export function buildExecutor(
   client: CoolifyClient,
   ctx: {
@@ -1848,6 +1956,16 @@ export function buildExecutor(
     envName: string;
     serverUuid: string;
     githubAppUuid: string;
+    // The three names the multi-destination 400 has to be able to say back, and
+    // the only reason they are here: none of them is on the wire. A create sends
+    // `serverUuid`, but the operator wrote a server NAME — and the UUID they now
+    // have to go and read lands at `environments.<env>.projects.<org>/<repo>`, a
+    // path keyed by cast's OWN env name and the repo, never by the Coolify
+    // project/environment names above (which `--project`/`--environment` are free
+    // to make something else entirely).
+    serverName: string;
+    orgRepo: string;
+    bindingEnv: string;
     // The Docker network to create resources on. A raw UUID from
     // environments.yaml for the same reason s3DestinationUuid is one: Coolify
     // 4.1.2 has no destinations API, so there is no name for cast to resolve.
@@ -1888,70 +2006,96 @@ export function buildExecutor(
     ctx.projectName,
     ctx.envName,
   );
+  // Wrapped around all three creates rather than around each one: Coolify runs
+  // the same destination logic in ApplicationsController, DatabasesController and
+  // ServicesController, so whichever kind happens to be created first is the one
+  // that 400s, and which one that is depends only on the order of the manifest.
+  const withDestinationDiagnosis = async (
+    change: Change,
+    create: () => Promise<string>,
+  ): Promise<string> => {
+    try {
+      return await create();
+    } catch (err) {
+      if (!isMultiDestination400(err)) throw err;
+      throw new Error(
+        multiDestinationRemedy({
+          server: ctx.serverName,
+          env: ctx.bindingEnv,
+          project: ctx.orgRepo,
+          resource: `${change.kind} ${change.name}`,
+          coolify: err.message,
+        }),
+        { cause: err },
+      );
+    }
+  };
   return {
     async createResource(change) {
-      // Field payloads assembled from change.fieldDiffs (desired values):
-      const fields = Object.fromEntries(
-        change.fieldDiffs.map((f) => [f.field, f.desired]),
-      );
-      const projectUuid = await projectEnv();
-      if (change.kind === "application") {
-        const res = (await client.post("/applications/private-github-app", {
-          project_uuid: projectUuid,
-          environment_name: ctx.envName,
-          server_uuid: ctx.serverUuid,
-          ...destination,
-          github_app_uuid: ctx.githubAppUuid,
-          name: change.name,
-          instant_deploy: false,
-          ...applicationApiFields(fields),
-          // A compose stack must reach the managed Postgres/Redis resources
-          // (the box-B lesson, DEPLOY.md §0/§3) — Coolify only wires that up
-          // when this flag is set on create.
-          ...(fields.build_pack === "dockercompose"
-            ? { connect_to_docker_network: true }
-            : {}),
-        })) as { uuid: string };
-        return res.uuid;
-      }
-      if (change.kind === "database") {
-        const type = String(fields.type);
-        const res = (await client.post(
-          `/databases/${type === "postgresql" ? "postgresql" : "redis"}`,
-          {
+      return withDestinationDiagnosis(change, async () => {
+        // Field payloads assembled from change.fieldDiffs (desired values):
+        const fields = Object.fromEntries(
+          change.fieldDiffs.map((f) => [f.field, f.desired]),
+        );
+        const projectUuid = await projectEnv();
+        if (change.kind === "application") {
+          const res = (await client.post("/applications/private-github-app", {
             project_uuid: projectUuid,
             environment_name: ctx.envName,
             server_uuid: ctx.serverUuid,
             ...destination,
+            github_app_uuid: ctx.githubAppUuid,
             name: change.name,
-            ...databaseApiFields(fields),
-          },
-        )) as { uuid: string };
-        const schedule = ctx.backupSchedules[change.name];
-        if (schedule) {
-          if (!ctx.s3DestinationUuid) {
-            throw new Error(
-              `database ${change.name} declares a backup schedule but environments.yaml has no s3_destination UUID for this environment`,
-            );
-          }
-          await client.post(`/databases/${res.uuid}/backups`, {
-            frequency: schedule.frequency,
-            database_backup_retention_amount_locally: schedule.retention,
-            save_s3: true,
-            s3_storage_uuid: ctx.s3DestinationUuid,
-          });
+            instant_deploy: false,
+            ...applicationApiFields(fields),
+            // A compose stack must reach the managed Postgres/Redis resources
+            // (the box-B lesson, DEPLOY.md §0/§3) — Coolify only wires that up
+            // when this flag is set on create.
+            ...(fields.build_pack === "dockercompose"
+              ? { connect_to_docker_network: true }
+              : {}),
+          })) as { uuid: string };
+          return res.uuid;
         }
+        if (change.kind === "database") {
+          const type = String(fields.type);
+          const res = (await client.post(
+            `/databases/${type === "postgresql" ? "postgresql" : "redis"}`,
+            {
+              project_uuid: projectUuid,
+              environment_name: ctx.envName,
+              server_uuid: ctx.serverUuid,
+              ...destination,
+              name: change.name,
+              ...databaseApiFields(fields),
+            },
+          )) as { uuid: string };
+          const schedule = ctx.backupSchedules[change.name];
+          if (schedule) {
+            if (!ctx.s3DestinationUuid) {
+              throw new Error(
+                `database ${change.name} declares a backup schedule but environments.yaml has no s3_destination UUID for this environment`,
+              );
+            }
+            await client.post(`/databases/${res.uuid}/backups`, {
+              frequency: schedule.frequency,
+              database_backup_retention_amount_locally: schedule.retention,
+              save_s3: true,
+              s3_storage_uuid: ctx.s3DestinationUuid,
+            });
+          }
+          return res.uuid;
+        }
+        const res = (await client.post("/services", {
+          project_uuid: projectUuid,
+          environment_name: ctx.envName,
+          server_uuid: ctx.serverUuid,
+          ...destination,
+          name: change.name,
+          ...serviceApiFields(fields),
+        })) as { uuid: string };
         return res.uuid;
-      }
-      const res = (await client.post("/services", {
-        project_uuid: projectUuid,
-        environment_name: ctx.envName,
-        server_uuid: ctx.serverUuid,
-        ...destination,
-        name: change.name,
-        ...serviceApiFields(fields),
-      })) as { uuid: string };
-      return res.uuid;
+      });
     },
     async updateFields(uuid, kind, fields) {
       const base =

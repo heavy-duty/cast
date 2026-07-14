@@ -241,6 +241,29 @@ export function renderDiff(report: DiffReport): string {
       "  destination_uuid on write and returns destination_id on read, and has no endpoint",
       "  mapping one to the other. cast sends it on create; nothing can verify it after.",
     );
+  } else {
+    // The other half of the same principle, and #41: declaring NOTHING is also a
+    // decision about placement — cast sends no destination_uuid and lets Coolify
+    // pick — and it was the one placement decision made in silence. The inference
+    // lived in a source comment ("the server's only destination, which is what
+    // Coolify picks anyway"), which is exactly where an assumption is invisible
+    // until it is wrong.
+    //
+    // This reverses a judgment cast used to hold explicitly ("a line on every diff
+    // that says nothing is how a report stops being read" — the test this replaces).
+    // The line does not say nothing: it says which network the next create lands on,
+    // which is a fact about this run and a wrong one to have to infer from a blank
+    // space. It stays on a run that creates nothing, too, because the trap is set
+    // precisely for projects that are already built and clean — the day their server
+    // gains a second destination, every one of them that declared no destination
+    // stops being able to create at all, and nothing will have warned them.
+    //
+    // Two lines, not three: the old judgment was not wrong about noise, only about
+    // which side of it silence was on.
+    lines.push(
+      "placement: server's default destination (none declared) — cast sends no destination_uuid,",
+      "  so Coolify picks; a server with more than one destination refuses the create outright.",
+    );
   }
   lines.push(
     report.clean

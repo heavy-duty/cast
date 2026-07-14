@@ -152,9 +152,21 @@ softened by an implementation detail):
   and leaves the project behind, created and empty (#38). Read-before-write, so
   an environment that already exists is never written to: adoption keeps working
   exactly as it did, and this cannot regress an apply that works today.
-- That default environment is **left alone**, per *apply never deletes*. An
-  empty `production` beside the environment everything lives in is reported
-  (the same courtesy an orphan gets) and removed by hand, or not at all.
+- That default environment is then **removed** — the one delete cast performs,
+  and the only exception to *apply never deletes* (#40). What that rule protects
+  is things cast did not make; this is a byproduct of cast's own `POST /projects`
+  seconds earlier, holding nothing and having never held anything. Leaving it
+  meant every project cast created from nothing carried a permanently-empty
+  `production` beside the environment everything actually lives in — precisely
+  the shape that makes a box unreadable later (on the box being migrated away
+  from, `production` is empty and everything runs in `staging`, and *"the obvious
+  guess is the wrong one"* is a note we had to write for ourselves). All three
+  conditions hold jointly or nothing is touched: **cast created the project in
+  this run** (never a project someone built by hand, whatever it carries), the
+  environment is **empty** (asked of Coolify — the details route is the only one
+  that eager-loads resources — not assumed from the first condition), and its
+  name is **not ours** (an `--environment production` keeps its `production`).
+  Best-effort: a delete that fails is reported and never fails the apply.
 - On drift in a field the API cannot update in place (`build_pack`, a
   database's `type`/`version`, a service's `type`), apply **fails loudly
   naming the field** rather than recreating.
@@ -325,6 +337,30 @@ anything else. Two consequences, both deliberate:
 - Whenever a destination is declared, `diff` says explicitly that it was *not*
   compared. Silence would make an unverified setting read as a verified one —
   the failure shape this document exists to avoid.
+- Whenever one is **not** declared, `diff` says *that*, too:
+  `placement: server's default destination (none declared)`. Declaring nothing is
+  not the absence of a placement decision — it is one (cast sends no
+  `destination_uuid`, Coolify picks), and it was the only placement decision made
+  in silence until #41. It is reported even on a clean run that creates nothing,
+  because the trap is set precisely for projects that are already built: the day
+  their server gains a second destination, every project on it that declared no
+  destination stops being able to create at all.
+
+**The multi-destination 400 is translated, not passed through** (#41). A create
+against a server with more than one destination that names none is rejected with
+*"Server has multiple destinations and you do not set destination_uuid."* — a
+message that names neither the remedy nor the file the remedy goes in, and that
+arrives at the **first create**, after `apply` has already made the project and
+the environment. cast **cannot** pre-flight the condition: 4.1.2 serves no
+destinations API at all, and `GET /servers/{uuid}` does not carry them either, so
+a server's destination count is unknowable until a create has been attempted.
+What cast can do is answer the question the 400 raises, and it does: the failing
+resource, the server by the name the operator wrote (not its UUID), the exact
+state-file path the UUID goes in
+(`environments.<env>.projects.<org>/<repo>.destination_uuid`), the create-time
+warning, and Coolify's own words kept verbatim. A run interrupted this way is
+safe to re-run once the UUID is declared — the project and environment it already
+made are adopted, not remade.
 
 **Coolify's create-time behavior** (`ApplicationsController` ~L1003,
 `DatabasesController` ~L1700, `ServicesController` ~L378 @ v4.1.2): a server with

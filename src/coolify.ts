@@ -119,6 +119,32 @@ export class CoolifyClient {
     }>;
   }
 
+  // Every application the TOKEN can see, raw — the whole instance, not one
+  // project. The population a create's domains are checked against, and the
+  // only way cast can read it (see the domain pre-flight in cli.ts, #44).
+  //
+  // Two scopes have to be the same one for a pre-flight to mean anything, and
+  // they are: ApplicationsController@applications lists
+  // `Application::ownedByCurrentTeamAPI($teamId)`, and the create-time conflict
+  // check (bootstrap/helpers/domains.php@checkIfDomainIsAlreadyUsedViaAPI,
+  // v4.1.2) walks that same set. What it ALSO walks and this does not:
+  // ServiceApplication fqdns and the instance-level fqdn. So this list is a
+  // subset of what Coolify checks — which is why the 409 translation stays,
+  // and is not dead code once the pre-flight exists.
+  //
+  // Raw records rather than a narrow type, because the useful fields are not
+  // documented anywhere cast could import from: the vendored OpenAPI does not
+  // even list `fqdn` here. The list is serialized by the SAME
+  // removeSensitiveData() the per-application GET uses (ApplicationsController
+  // :38, called at :130 and :1980 @ v4.1.2), so it carries every non-sensitive
+  // column — `fqdn`, `docker_compose_domains`, `build_pack`, `uuid`, `name` —
+  // and a per-app GET would return byte-for-byte the same fields. Reading them
+  // is the caller's job (cli.ts@liveApplicationDomains).
+  async applications(): Promise<Array<Record<string, unknown>>> {
+    const raw = await this.get("/applications");
+    return Array.isArray(raw) ? (raw as Array<Record<string, unknown>>) : [];
+  }
+
   // A project's environment NAMES.
   //
   // Two roads, because the vendored OpenAPI has been wrong before and this is a

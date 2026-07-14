@@ -800,6 +800,28 @@ async function runProject(
   console.log(renderDiff(report));
   if (ctx.command === "diff")
     return report.clean ? { status: "clean" } : { status: "drift" };
+  // Before ANYTHING is written — the project and the environment are created lazily
+  // by the first create, so this is the last moment at which a refusal still costs
+  // nothing. A create whose domains are already claimed elsewhere on the instance
+  // will be refused by Coolify no matter what cast does (#44); the only question is
+  // whether the operator learns it now or half-way through an apply that has already
+  // built a project. One GET, and only on a plan that creates an application with a
+  // domain — a first apply, and nothing else.
+  const visibleUuids = new Set(live.map((l) => l.uuid));
+  const domainConflicts = await preflightDomainConflicts(
+    ctx.client,
+    report.changes,
+  );
+  if (domainConflicts.length > 0) {
+    throw new Error(
+      domainConflictRemedy(domainConflicts, {
+        project: projectName,
+        env: coolifyEnv,
+        visible: visibleUuids,
+        stage: "preflight",
+      }),
+    );
+  }
   const serverUuid = await ctx.client.serverUuid(ctx.binding.server);
   const githubAppUuid = await ctx.client.githubAppUuid(
     githubAppNameFor(ctx.bindings, orgRepo),
@@ -820,6 +842,7 @@ async function runProject(
     destinationUuid: projectBinding?.destination_uuid,
     s3DestinationUuid: ctx.binding.s3_destination,
     backupSchedules,
+    visibleUuids,
   });
   const { mutated } = await applyPlan(report, desired, exec);
   console.log(
@@ -1900,6 +1923,276 @@ export function serviceApiFields(
   return rest;
 }
 
+// --- Domain uniqueness: instance-wide, while cast plans project-scoped (#44) ---
+//
+// Coolify enforces domain uniqueness across the whole instance (every application
+// and every service application of the TEAM, plus the instance fqdn:
+// bootstrap/helpers/domains.php@checkIfDomainIsAlreadyUsedViaAPI, v4.1.2). cast
+// plans inside ONE project + ONE environment. So apply can produce a plan that is
+// internally consistent, correct against everything cast can observe, and still be
+// refused — by a resource cast cannot see, for a reason invisible from its scope:
+//
+//   POST /applications/private-github-app → 409:
+//   {"message":"Domain conflicts detected. Use force_domain_override=true to proceed.",
+//    "conflicts":[{"domain":"http://api.89.167.19.110.sslip.io","resource_name":"core",
+//                  "resource_uuid":"tqsmnzdde…","resource_type":"application",
+//                  "service_name":"api","message":"Domain … is already in use …"}],
+//    "warning":"Using the same domain for multiple resources can cause routing
+//               conflicts and unpredictable behavior."}
+//
+// Same family as the multi-destination 400 above (#41) — an instance-wide constraint
+// arriving mid-apply, after the project and the environment have been made. Unlike
+// that one, this one CAN be pre-flighted (GET /applications is the same population
+// Coolify checks against), so it is: see preflightDomainConflicts. The 409 handling
+// stays regardless, because the pre-flight is a subset — Coolify also compares
+// against service fqdns and the instance fqdn, which no list cast can read exposes.
+//
+// force_domain_override=true is the one thing cast will never do about any of this.
+// Coolify offers it in the error text; two resources sharing a domain is a routing
+// coin-flip, and Coolify says as much in the same response ("can cause routing
+// conflicts and unpredictable behavior"). If cast ever gains the flag it is an
+// explicit operator act, never a retry — nothing below may send it.
+
+export type DomainConflict = {
+  domain: string;
+  resource_name: string;
+  resource_uuid: string;
+  resource_type: string;
+  // The conflicting app's compose SERVICE, when it holds the domain per-service.
+  service_name?: string;
+  // Which resource in OUR plan wanted the domain. Not Coolify's field — cast's,
+  // so a refusal listing three conflicts says which create each one blocks.
+  wanted_by?: string;
+};
+
+// Coolify's comparison, exactly: strip ONE trailing slash, then compare the
+// strings LITERALLY — scheme and all (domains.php ~L153-177). So `http://x` and
+// `https://x` are different domains to Coolify, and cast must not be cleverer
+// here than the thing it is predicting: normalizing to a bare host would make the
+// pre-flight disagree with the server, in both directions (missed conflicts, and
+// refusals Coolify would have allowed).
+function nakedDomain(raw: string): string {
+  const d = raw.trim();
+  return d.endsWith("/") ? d.slice(0, -1) : d;
+}
+
+// The domains a planned CREATE would claim. Applications only, and that is not an
+// oversight: databases have no domains, and cast's service creates drop `domains`
+// on the wire entirely (serviceApiFields above), so an application create is the
+// only way an apply can claim one.
+export function desiredDomainsOfCreate(
+  change: Change,
+): Array<{ domain: string; service?: string }> {
+  if (change.kind !== "application" || change.op !== "create") return [];
+  const fields = Object.fromEntries(
+    change.fieldDiffs.map((f) => [f.field, f.desired]),
+  );
+  const out: Array<{ domain: string; service?: string }> = [];
+  const flat = fields.domains;
+  if (Array.isArray(flat)) {
+    for (const d of flat)
+      if (typeof d === "string" && d.length > 0)
+        out.push({ domain: nakedDomain(d) });
+  }
+  const compose = fields.docker_compose_domains as
+    | Record<string, string[]>
+    | undefined;
+  if (compose) {
+    for (const [service, urls] of Object.entries(compose))
+      for (const d of urls ?? [])
+        if (typeof d === "string" && d.length > 0)
+          out.push({ domain: nakedDomain(d), service });
+  }
+  return out;
+}
+
+// The domains a LIVE application holds, read off a raw GET /applications record.
+//
+// Both shapes, and they are mutually exclusive on Coolify's side: a non-compose app
+// carries `fqdn` (a comma-separated string), a dockercompose app carries per-service
+// domains in `docker_compose_domains` (JSON, service -> {domain: "a,b"}). The
+// build_pack gate on the second one is Coolify's, not a guess (domains.php L189:
+// `$app->build_pack === 'dockercompose' && ! empty($app->docker_compose_domains)`)
+// — and it is load-bearing in the strict direction: a nixpacks app carrying stale
+// compose-domain JSON does NOT conflict, so cast must not refuse for one either. A
+// pre-flight stricter than the server is a pre-flight that blocks correct applies.
+export function liveApplicationDomains(
+  raw: Record<string, unknown>,
+): Array<{ domain: string; service?: string }> {
+  const out: Array<{ domain: string; service?: string }> = [];
+  const fqdn = raw.fqdn;
+  if (typeof fqdn === "string")
+    for (const d of fqdn.split(",").filter(Boolean))
+      out.push({ domain: nakedDomain(d) });
+  if (raw.build_pack === "dockercompose") {
+    const compose = parseDockerComposeDomains(raw.docker_compose_domains);
+    if (compose)
+      for (const [service, urls] of Object.entries(compose))
+        for (const d of urls) out.push({ domain: nakedDomain(d), service });
+  }
+  return out;
+}
+
+// The pure half: what would Coolify refuse, given this plan and this instance?
+export function findDomainConflicts(
+  creates: Change[],
+  liveApps: Array<Record<string, unknown>>,
+): DomainConflict[] {
+  const conflicts: DomainConflict[] = [];
+  for (const change of creates) {
+    for (const want of desiredDomainsOfCreate(change)) {
+      for (const app of liveApps) {
+        for (const held of liveApplicationDomains(app)) {
+          if (held.domain !== want.domain) continue;
+          conflicts.push({
+            domain: want.domain,
+            resource_name: String(app.name ?? "(unnamed)"),
+            resource_uuid: String(app.uuid ?? "(unknown)"),
+            resource_type: "application",
+            ...(held.service ? { service_name: held.service } : {}),
+            wanted_by: `${change.kind} ${change.name}${want.service ? ` (service: ${want.service})` : ""}`,
+          });
+        }
+      }
+    }
+  }
+  return conflicts;
+}
+
+// N+1 was the obvious shape for this and it is not needed: GET /applications is
+// serialized by the same removeSensitiveData() as GET /applications/{uuid}, so the
+// list already carries `fqdn` and `docker_compose_domains` (see coolify.ts). One
+// call, and only on a plan that creates an application with a domain — which is a
+// first apply, and nothing else.
+export async function preflightDomainConflicts(
+  client: CoolifyClient,
+  changes: Change[],
+): Promise<DomainConflict[]> {
+  const creates = changes.filter(
+    (c) => c.op === "create" && desiredDomainsOfCreate(c).length > 0,
+  );
+  if (creates.length === 0) return [];
+  return findDomainConflicts(creates, await client.applications());
+}
+
+// The 409, when one still gets through — an update that moves a domain, a conflict
+// with a Coolify service or the instance fqdn (neither is in GET /applications), or
+// a resource created between the pre-flight and the create.
+function domainConflicts409(err: unknown): DomainConflict[] | undefined {
+  if (!(err instanceof HttpError) || err.status !== 409) return undefined;
+  // The HttpError message is "POST /path → 409: <body>"; the body is the only part
+  // that carries the conflicts, and it is JSON.
+  const start = err.message.indexOf("{");
+  if (start === -1) return undefined;
+  let body: unknown;
+  try {
+    body = JSON.parse(err.message.slice(start));
+  } catch {
+    return undefined;
+  }
+  const parsed = body as { message?: unknown; conflicts?: unknown };
+  // Narrow on the CONFLICTS, not on the status: 409 is also how Coolify answers a
+  // duplicate environment create (see ensureEnvironment), and this must not claim
+  // that one.
+  if (!Array.isArray(parsed.conflicts) || parsed.conflicts.length === 0)
+    return undefined;
+  return parsed.conflicts.map((c) => {
+    const e = c as Record<string, unknown>;
+    return {
+      domain: String(e.domain ?? "(unknown)"),
+      resource_name: String(e.resource_name ?? "(unknown)"),
+      resource_uuid: String(e.resource_uuid ?? "(unknown)"),
+      resource_type: String(e.resource_type ?? "resource"),
+      ...(typeof e.service_name === "string"
+        ? { service_name: e.service_name }
+        : {}),
+    };
+  });
+}
+
+// One renderer for both paths, because the operator's question is the same one
+// whether cast refused before touching anything or Coolify refused mid-apply: what
+// holds my domain, where is it, and why can't I see it?
+export function domainConflictRemedy(
+  conflicts: DomainConflict[],
+  where: {
+    project: string;
+    env: string;
+    // The UUIDs of the live resources cast CAN see — this project, this
+    // environment. The whole point of the message is the scope claim, so the scope
+    // claim is checked rather than assumed: a conflict with something in the plan's
+    // own project (a renamed resource, say) is a different fix, and saying "outside
+    // your project" about it would be a lie.
+    visible: ReadonlySet<string>;
+    // Before anything was mutated, or after. It decides what the operator is
+    // holding, which is the first thing they need to know.
+    stage: "preflight" | "apply";
+    // Coolify's own words, kept verbatim when we have them — a translation that
+    // hides the original makes the next person's search fail.
+    coolify?: string;
+  },
+): string {
+  const head =
+    where.stage === "preflight"
+      ? `refusing to apply: ${conflicts.length === 1 ? "a domain in this plan is" : `${conflicts.length} domains in this plan are`} already claimed on this Coolify.`
+      : `create rejected: Coolify refused ${conflicts.length === 1 ? "a domain" : "domains"} in this plan as already claimed.`;
+  const lines = [
+    head,
+    "",
+    "Domain uniqueness is enforced across the WHOLE Coolify instance. cast plans inside",
+    `one project + one environment (${where.project} / ${where.env}), so a plan can be`,
+    "correct against everything cast can see and still be refused by something it cannot.",
+    "",
+  ];
+  for (const c of conflicts) {
+    const held = c.service_name
+      ? `${c.resource_type} '${c.resource_name}' (service: ${c.service_name})`
+      : `${c.resource_type} '${c.resource_name}'`;
+    lines.push(`  ${c.domain}`);
+    if (c.wanted_by) lines.push(`    wanted by:  ${c.wanted_by}`);
+    lines.push(`    claimed by: ${held}, uuid ${c.resource_uuid}`);
+    if (where.visible.has(c.resource_uuid)) {
+      lines.push(
+        `    It IS in ${where.project} / ${where.env} — under another name, so the plan does not`,
+        "    match it to anything and wants to create beside it. Rename, or free the domain;",
+        "    cast never deletes what it did not plan.",
+      );
+    } else {
+      lines.push(
+        `    NOT in ${where.project} / ${where.env} — cast can neither see nor manage it.`,
+        "    Most likely residue from an earlier run cleaned up by deleting a Coolify",
+        "    project: deleting a project does NOT delete its resources. They survive it,",
+        "    invisible to cast (no project it queries holds them), still owning the domain",
+        "    instance-wide. Find it by uuid in the Coolify UI.",
+      );
+    }
+    lines.push("");
+  }
+  if (where.coolify) lines.push(`  Coolify said: ${where.coolify}`, "");
+  lines.push(
+    "Two fixes, and cast will take neither by itself: delete the resource that holds the",
+    "domain, or give this one a different domain (the manifest, or --hostname-overlay).",
+    "",
+    "cast will NOT retry with force_domain_override=true — the flag Coolify's own message",
+    "suggests. Two resources on one domain is a routing coin-flip, and the same response",
+    'says so: "can cause routing conflicts and unpredictable behavior". If that is ever',
+    "what you want it is an operator act, never something a tool does on your behalf.",
+  );
+  if (where.stage === "preflight") {
+    lines.push(
+      "",
+      "Nothing was created: this ran before the first write, so the refusal costs nothing.",
+    );
+  } else {
+    lines.push(
+      "",
+      "This arrived mid-apply — the project and its environment may already exist. Re-run",
+      "once the conflict is gone: apply reads before it writes, and adopts them.",
+    );
+  }
+  return lines.join("\n");
+}
+
 // Coolify's answer when a server has more than one destination and the create did
 // not say which one to use (all three controllers, identically, v4.1.2):
 //
@@ -1977,6 +2270,14 @@ export function buildExecutor(
     destinationUuid?: string;
     s3DestinationUuid?: string; // raw UUID from environments.yaml — no storage API exists to resolve names
     backupSchedules: Record<string, { frequency: string; retention: number }>;
+    // The live resources of THIS project + environment, by uuid — everything cast
+    // can see. Read by exactly one thing: the domain-conflict message, which has to
+    // say whether the resource holding the domain is inside the applied project or
+    // outside it, and must not guess (see domainConflictRemedy). Optional because an
+    // executor built without it is not wrong, only less able to place a conflict:
+    // an empty set says "cast sees nothing here", which is what a caller that did
+    // not read the project is in fact claiming.
+    visibleUuids?: ReadonlySet<string>;
   },
 ): Executor {
   // Coolify resolves this identically for applications, databases and services
@@ -2006,17 +2307,45 @@ export function buildExecutor(
     ctx.projectName,
     ctx.envName,
   );
-  // Wrapped around all three creates rather than around each one: Coolify runs
-  // the same destination logic in ApplicationsController, DatabasesController and
+  // The two instance-wide constraints a create can die on, both of them invisible
+  // from cast's project-scoped view, both of them arriving at the FIRST create —
+  // after apply has already made the project and the environment. One wrapper, and
+  // wrapped around all three creates rather than around each one: Coolify runs the
+  // same destination logic in ApplicationsController, DatabasesController and
   // ServicesController, so whichever kind happens to be created first is the one
   // that 400s, and which one that is depends only on the order of the manifest.
-  const withDestinationDiagnosis = async (
+  const withCreateDiagnosis = async (
     change: Change,
     create: () => Promise<string>,
   ): Promise<string> => {
     try {
       return await create();
     } catch (err) {
+      // The domain-conflict 409 the pre-flight could not have caught: a conflict
+      // with a Coolify SERVICE or with the instance fqdn (neither appears in
+      // GET /applications, so preflightDomainConflicts is a strict subset of
+      // Coolify's own check), or a resource created between the pre-flight and this
+      // create. Rare by construction — and precisely because it is rare, it must not
+      // be the one that arrives untranslated. (#44)
+      const conflicts = domainConflicts409(err);
+      if (conflicts) {
+        throw new Error(
+          domainConflictRemedy(
+            conflicts.map((c) => ({
+              ...c,
+              wanted_by: `${change.kind} ${change.name}`,
+            })),
+            {
+              project: ctx.projectName,
+              env: ctx.envName,
+              visible: ctx.visibleUuids ?? new Set(),
+              stage: "apply",
+              coolify: err instanceof Error ? err.message : String(err),
+            },
+          ),
+          { cause: err },
+        );
+      }
       if (!isMultiDestination400(err)) throw err;
       throw new Error(
         multiDestinationRemedy({
@@ -2032,7 +2361,7 @@ export function buildExecutor(
   };
   return {
     async createResource(change) {
-      return withDestinationDiagnosis(change, async () => {
+      return withCreateDiagnosis(change, async () => {
         // Field payloads assembled from change.fieldDiffs (desired values):
         const fields = Object.fromEntries(
           change.fieldDiffs.map((f) => [f.field, f.desired]),

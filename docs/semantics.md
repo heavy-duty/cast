@@ -408,6 +408,50 @@ rejects a create that omits it (`400`), and rejects a UUID that belongs to
 another server (`422`). The second case is why cast could not apply to a shared
 box at all before this field existed. Citations: `reference/README.md`.
 
+## Domains (uniqueness is instance-wide)
+
+**Coolify enforces domain uniqueness across the whole instance; cast plans inside one
+project and one environment.** That gap is structural, not a bug: a plan can be
+internally consistent, correct against everything cast can observe, and still be
+refused — by a resource in a project cast never queries. The check is
+`checkIfDomainIsAlreadyUsedViaAPI` (`bootstrap/helpers/domains.php` @ v4.1.2) and it
+walks every application of the *team* (its `fqdn`, and for `dockercompose` apps its
+per-service `docker_compose_domains`), every service application's `fqdn`, and the
+instance's own `fqdn`. Only applications can claim a domain through cast: databases
+have none, and cast's service creates send no domains at all.
+
+**The create plan is pre-flighted** (#44). Before `apply` writes anything — the
+project and the environment are created lazily, by the first create, so this is the
+last moment a refusal is free — cast reads `GET /applications` and checks the domains
+the plan is about to claim against every one already held. A conflict is a **refusal**
+(nothing created), not a failed apply. It costs one GET, and only on a plan that
+creates an application with a domain: a first apply, and nothing else. *N+1 is not
+needed:* the list is serialized by the same `removeSensitiveData()` as the per-app
+`GET` (`ApplicationsController.php` :38, called at :130 and :1980), so it already
+carries `fqdn`, `docker_compose_domains` and `build_pack` — none of which the vendored
+OpenAPI documents on that route.
+
+**The 409 is translated when one gets through anyway.** The pre-flight is a *subset*
+of Coolify's check — service `fqdn`s and the instance `fqdn` appear in no list cast
+can read — so a create can still be refused mid-apply, with a raw
+*"Domain conflicts detected. Use force_domain_override=true to proceed."* Both the
+refusal and the translation say the same three things, the last of which is the one
+the operator cannot get from Coolify: the domain, the resource holding it (name +
+uuid, and the compose service if it is held per-service), and **whether that resource
+is inside the applied project or outside it**. Outside is the usual case, and it has a
+usual cause worth naming: *residue from an earlier run cleaned up by deleting a
+Coolify project.* Deleting a project does **not** delete its resources — they survive,
+invisible to cast, still holding the domain instance-wide. (The scope claim is checked
+against the live resources cast read, never assumed: a conflict with something in the
+plan's own project — a renamed resource — is a different fix, and would be a lie
+otherwise.)
+
+**cast never sends `force_domain_override=true`.** Coolify offers it in the error text
+and it is the wrong answer: two resources on one domain is a routing coin-flip, and
+Coolify says so in the same response (*"can cause routing conflicts and unpredictable
+behavior"*). Nothing in cast can send that flag, and no retry may ever set it — if it
+is ever wanted, it is an explicit operator act in the UI, not a tool's decision.
+
 ## Instance selection
 
 **The Coolify a command talks to is an explicit, named value** — not a property

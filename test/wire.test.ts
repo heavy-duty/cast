@@ -119,6 +119,37 @@ describe("projectLiveFields", () => {
     });
     expect(out).not.toHaveProperty("docker_compose_domains");
   });
+
+  // #63: the static-site fields must read back off a live application so they
+  // diff against the manifest — otherwise a UI flip of is_static is invisible.
+  it("reads is_static and the build/run commands off a live application", () => {
+    const out = projectLiveFields("application", {
+      git_repository: "org/repo",
+      git_branch: "main",
+      build_pack: "static",
+      base_directory: "/",
+      is_static: true,
+      install_command: "npm ci",
+      build_command: "npm run build -w apps/landing-site",
+      start_command: "node server.js",
+    });
+    expect(out.is_static).toBe(true);
+    expect(out.install_command).toBe("npm ci");
+    expect(out.build_command).toBe("npm run build -w apps/landing-site");
+    expect(out.start_command).toBe("node server.js");
+  });
+
+  it("always reports is_static as a boolean, tolerating Coolify's 1/0", () => {
+    expect(projectLiveFields("application", { is_static: 1 }).is_static).toBe(
+      true,
+    );
+    expect(projectLiveFields("application", { is_static: 0 }).is_static).toBe(
+      false,
+    );
+    // Absent on the wire reads as false (its real default), never undefined —
+    // so it compares against the desired side, which always emits it.
+    expect(projectLiveFields("application", {}).is_static).toBe(false);
+  });
 });
 
 describe("compose app idempotency (review finding #2)", () => {

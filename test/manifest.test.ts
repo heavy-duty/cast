@@ -212,6 +212,77 @@ environments:
       }),
     ).toThrow(/service_domains/);
   });
+  // #63: the working (hand-built) config for a static site in a workspace
+  // monorepo — is_static plus workspace-scoped install/build commands that build
+  // only the target app and serve its dist, instead of the repo root's start
+  // script booting a different workspace.
+  it("accepts install/build/start commands and static on a non-compose app, round-tripping them", () => {
+    const m = loadManifest(`${FIX}manifest.yaml`, {
+      overrideText: `
+project: widget
+environments:
+  prod:
+    applications:
+      landing:
+        source: { repo: acme/widget, branch: main }
+        build:
+          pack: static
+          base_directory: /
+          publish_directory: /apps/landing-site/dist
+          install_command: npm ci
+          build_command: npm run build -w apps/landing-site
+          start_command: node server.js
+          static: true
+        domains: ["https://landing.example.com"]
+`,
+    });
+    const b = m.environments.prod.applications.landing.build;
+    expect(b.install_command).toBe("npm ci");
+    expect(b.build_command).toBe("npm run build -w apps/landing-site");
+    expect(b.start_command).toBe("node server.js");
+    expect(b.static).toBe(true);
+    expect(b.publish_directory).toBe("/apps/landing-site/dist");
+  });
+  it("rejects static: true with nothing to serve (no publish_directory)", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: `
+project: widget
+environments:
+  prod:
+    applications:
+      landing:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: static, base_directory: /, static: true }
+        domains: ["https://landing.example.com"]
+`,
+      }),
+    ).toThrow(/nothing to serve/);
+  });
+  it("rejects install/build/start commands and static on a dockercompose app", () => {
+    for (const field of [
+      "install_command: npm ci",
+      "build_command: npm run build",
+      "start_command: node server.js",
+      "static: true",
+    ]) {
+      expect(() =>
+        loadManifest(`${FIX}manifest.yaml`, {
+          overrideText: `
+project: widget
+environments:
+  prod:
+    applications:
+      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: dockercompose, base_directory: /, compose_file: /docker-compose.yaml, ${field} }
+        service_domains:
+          api: ["https://api.example.com"]
+`,
+        }),
+      ).toThrow(/not allowed on a dockercompose app/);
+    }
+  });
 });
 
 describe("loadBindings", () => {

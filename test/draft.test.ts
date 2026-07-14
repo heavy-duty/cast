@@ -171,6 +171,81 @@ describe("planDraft — the emitted shape", () => {
     expect(env.generated_secrets).toEqual(["DATABASE_URL"]);
   });
 
+  // #63: is_static was previously not even in NO_HOME, so a rebuild silently
+  // lost it — the exact crash. draft now carries it, plus the install/build/
+  // start commands that used to be flagged as NO_HOME.
+  it("carries static + install/build/start commands, and does NOT flag them as uncaptured", () => {
+    const p = project({
+      resources: [
+        {
+          kind: "application",
+          name: "Landing",
+          uuid: "a1",
+          raw: {
+            git_repository: "https://github.com/heavy-duty/incubator",
+            git_branch: "main",
+            build_pack: "static",
+            base_directory: "/",
+            publish_directory: "/apps/landing-site/dist",
+            fqdn: "https://landing.example.com",
+            is_static: true,
+            install_command: "npm ci",
+            build_command: "npm run build -w apps/landing-site",
+          },
+          env: {},
+        },
+      ],
+    });
+    const plan = planDraft([p], ctx);
+    const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
+    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const path = join(dir, "manifest.yaml");
+    writeFileSync(path, manifest?.content ?? "");
+    const build =
+      loadManifest(path).environments.prod.applications.Landing.build;
+    expect(build.static).toBe(true);
+    expect(build.install_command).toBe("npm ci");
+    expect(build.build_command).toBe("npm run build -w apps/landing-site");
+    // These now have a manifest home, so they must NOT be reported as settings
+    // cast could see but not express.
+    for (const setting of ["is_static", "install_command", "build_command"]) {
+      expect(plan.uncaptured.some((u) => u.setting === setting)).toBe(false);
+    }
+  });
+
+  // A draft must only ever emit a manifest that LOADS. is_static true with no
+  // publish_directory would be `static: true` with nothing to serve, which the
+  // schema refuses — so draft omits `static` for that (rare, malformed) box
+  // rather than writing a file that throws on load.
+  it("does not emit static:true when the box has is_static but no publish_directory", () => {
+    const p = project({
+      resources: [
+        {
+          kind: "application",
+          name: "Odd",
+          uuid: "a1",
+          raw: {
+            git_repository: "https://github.com/heavy-duty/incubator",
+            git_branch: "main",
+            build_pack: "nixpacks",
+            base_directory: "/",
+            fqdn: "https://odd.example.com",
+            is_static: true,
+          },
+          env: {},
+        },
+      ],
+    });
+    const plan = planDraft([p], ctx);
+    const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
+    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const path = join(dir, "manifest.yaml");
+    writeFileSync(path, manifest?.content ?? "");
+    // The whole point: it loads (does not throw), and simply carries no `static`.
+    const build = loadManifest(path).environments.prod.applications.Odd.build;
+    expect(build).not.toHaveProperty("static");
+  });
+
   it("emits an env template every cast reader can parse", () => {
     const plan = planDraft([project()], ctx);
     const tpl = plan.files.find((f) => f.path.endsWith(".env.template"));

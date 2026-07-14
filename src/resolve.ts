@@ -414,6 +414,31 @@ export function desiredFromManifest(
               ...(app.port !== undefined ? { port: app.port } : {}),
               ...(app.healthcheck ? { healthcheck: app.healthcheck } : {}),
               domains: app.domains,
+              // Emitted only when the manifest DECLARES `static:` — like the
+              // three commands, not unconditionally. Emitting `is_static:false`
+              // on every non-compose app would make the first apply after this
+              // ships PATCH `is_static=false` onto any static/SPA app configured
+              // in the UI whose manifest has not yet been migrated — silently
+              // disabling static serving and re-creating the #63 crash, now
+              // caused by cast. And a `pack: static` app that Coolify couples to
+              // is_static=true would drift-and-revert forever. So managing
+              // is_static is opt-in: declare `static: true` to serve, `static:
+              // false` to actively guard against a UI flip to true, or omit it to
+              // leave the field alone. (Coolify keeps pack and is_static
+              // independent, which is why this stays an explicit field, not a
+              // heuristic off `pack`.)
+              ...(app.build.static !== undefined
+                ? { is_static: app.build.static }
+                : {}),
+              ...(app.build.install_command !== undefined
+                ? { install_command: app.build.install_command }
+                : {}),
+              ...(app.build.build_command !== undefined
+                ? { build_command: app.build.build_command }
+                : {}),
+              ...(app.build.start_command !== undefined
+                ? { start_command: app.build.start_command }
+                : {}),
             }),
       },
       env: resolveEnvFile(name, app.env_template),

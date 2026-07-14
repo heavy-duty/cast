@@ -5,6 +5,7 @@ import {
   applyHostnameOverlay,
   applyPlan,
 } from "../src/apply.js";
+import { GENERATED_PLACEHOLDER } from "../src/capture.js";
 import { type Desired, type Live, computeDiff } from "../src/diff.js";
 
 const desired: Desired[] = [
@@ -70,6 +71,215 @@ describe("applyPlan", () => {
     ).rejects.toThrow(/build_pack.*core-api|core-api.*build_pack/s);
     expect(calls).toEqual([]);
   });
+  // #47 — the whole product of the guard. Every assertion here is about a
+  // routine `cast apply` against a box that has ALREADY been applied once: the
+  // store still holds `pending-coolify-generated` for the secrets Coolify was
+  // asked to generate, and Coolify has since generated them.
+  describe("generated-secret placeholder", () => {
+    const REAL_URL = "postgres://real:hunter2@db:5432/app";
+    const REAL_REDIS = "redis://real:hunter2@redis:6379";
+    const generated: Desired[] = [
+      {
+        kind: "application",
+        name: "core-api",
+        fields: { build_pack: "nixpacks" },
+        env: {
+          vars: {
+            DATABASE_URL: { value: GENERATED_PLACEHOLDER, secret: true },
+            REDIS_URL: { value: GENERATED_PLACEHOLDER, secret: true },
+            PORT: { value: "3000", secret: false },
+          },
+        },
+      },
+    ];
+    const liveApp = (env: Record<string, string>) => [
+      {
+        kind: "application" as const,
+        name: "core-api",
+        uuid: "u1",
+        fields: { build_pack: "nixpacks" },
+        env,
+      },
+    ];
+
+    it("REFUSES before any mutation — no syncEnv, no redeploy, nothing touched", async () => {
+      const { calls, exec } = recorder();
+      const report = computeDiff(
+        generated,
+        liveApp({
+          DATABASE_URL: REAL_URL,
+          REDIS_URL: REAL_REDIS,
+          PORT: "3000",
+        }),
+        "full",
+      );
+      await expect(applyPlan(report, generated, exec)).rejects.toThrow(
+        /refusing apply/,
+      );
+      expect(calls).toEqual([]);
+    });
+    it("names every conflicted key and its resource", async () => {
+      const { exec } = recorder();
+      const report = computeDiff(
+        generated,
+        liveApp({ DATABASE_URL: REAL_URL, REDIS_URL: REAL_REDIS }),
+        "full",
+      );
+      const err = await applyPlan(report, generated, exec).catch(
+        (e: Error) => e.message,
+      );
+      expect(err).toContain("DATABASE_URL on application core-api");
+      expect(err).toContain("REDIS_URL on application core-api");
+      expect(err).toContain(GENERATED_PLACEHOLDER);
+    });
+    it("never prints the live value it is protecting", async () => {
+      const { exec } = recorder();
+      const report = computeDiff(
+        generated,
+        liveApp({ DATABASE_URL: REAL_URL, REDIS_URL: REAL_REDIS }),
+        "full",
+      );
+      const err = await applyPlan(report, generated, exec).catch(
+        (e: Error) => e.message,
+      );
+      expect(err).not.toContain(REAL_URL);
+      expect(err).not.toContain(REAL_REDIS);
+      expect(err).not.toContain("hunter2");
+    });
+    it("tells the operator what to do about it (#48)", async () => {
+      const { exec } = recorder();
+      const report = computeDiff(
+        generated,
+        liveApp({ DATABASE_URL: REAL_URL, REDIS_URL: REAL_REDIS }),
+        "full",
+      );
+      const err = await applyPlan(report, generated, exec).catch(
+        (e: Error) => e.message,
+      );
+      expect(err).toContain("cast capture --generated-only");
+      expect(err).toContain("#48");
+      expect(err).toContain("generated_secrets:");
+    });
+    it("refuses even when the conflict rides along with legitimate drift", async () => {
+      const { calls, exec } = recorder();
+      const withDomain: Desired[] = [
+        {
+          ...generated[0],
+          fields: { build_pack: "nixpacks", domains: ["https://new.example"] },
+        },
+      ];
+      const report = computeDiff(
+        withDomain,
+        liveApp({
+          DATABASE_URL: REAL_URL,
+          REDIS_URL: REAL_REDIS,
+          PORT: "3000",
+        }),
+        "full",
+      );
+      await expect(applyPlan(report, withDomain, exec)).rejects.toThrow(
+        /refusing apply/,
+      );
+      // The updatable field drift is real and would otherwise have been applied.
+      // The refusal is not a filter: nothing at all goes out.
+      expect(calls).toEqual([]);
+    });
+    it("refuses on a conflict carried by a SECOND resource, after a clean first one", async () => {
+      const { calls, exec } = recorder();
+      const two: Desired[] = [
+        {
+          kind: "application",
+          name: "web",
+          fields: { build_pack: "nixpacks" },
+          env: { vars: { PORT: { value: "3000", secret: false } } },
+        },
+        ...generated,
+      ];
+      const live = [
+        {
+          kind: "application" as const,
+          name: "web",
+          uuid: "u0",
+          fields: { build_pack: "static" },
+          env: { PORT: "3000" },
+        },
+        ...liveApp({ DATABASE_URL: REAL_URL, REDIS_URL: REAL_REDIS }),
+      ];
+      // `web` also carries non-updatable drift, so if the refusals were ordered
+      // the other way this would throw for the wrong reason — the data-loss
+      // write is the one an operator must be told about first.
+      const report = computeDiff(two, live, "full");
+      await expect(applyPlan(report, two, exec)).rejects.toThrow(
+        /refusing apply.*DATABASE_URL/s,
+      );
+      expect(calls).toEqual([]);
+    });
+    // The FIRST apply, which must keep working: the placeholder is what cast is
+    // supposed to send, because Coolify replaces it when it creates the resource.
+    it("still sends the placeholder on a create", async () => {
+      const { calls, exec } = recorder();
+      const r = await applyPlan(
+        computeDiff(generated, [], "full"),
+        generated,
+        exec,
+      );
+      expect(calls).toEqual([
+        "create core-api",
+        "env new-uuid",
+        "redeploy new-uuid",
+      ]);
+      expect(r.mutated).toEqual(["core-api"]);
+    });
+    // Applied once, resources not yet generated (or generated as the placeholder
+    // — same thing to cast). Nothing differs, so there is nothing to refuse.
+    it("proceeds when the live value is the placeholder too", async () => {
+      const { calls, exec } = recorder();
+      const report = computeDiff(
+        generated,
+        liveApp({
+          DATABASE_URL: GENERATED_PLACEHOLDER,
+          REDIS_URL: GENERATED_PLACEHOLDER,
+          PORT: "3000",
+        }),
+        "full",
+      );
+      const r = await applyPlan(report, generated, exec);
+      expect(calls).toEqual([]);
+      expect(r.mutated).toEqual([]);
+    });
+    // A var the manifest declares and the live resource has never had: writing
+    // the placeholder is the only thing cast can do, and it is what the first
+    // apply's second pass needs.
+    it("proceeds when the generated var is absent live", async () => {
+      const { calls, exec } = recorder();
+      const report = computeDiff(generated, liveApp({ PORT: "3000" }), "full");
+      const r = await applyPlan(report, generated, exec);
+      expect(calls).toEqual(["env u1", "redeploy u1"]);
+      expect(r.mutated).toEqual(["core-api"]);
+    });
+    // The guard must not turn every secret rotation into a refusal — that is the
+    // failure that gets a guard disabled.
+    it("still applies an ordinary secret rotation", async () => {
+      const { calls, exec } = recorder();
+      const rotated: Desired[] = [
+        {
+          kind: "application",
+          name: "core-api",
+          fields: { build_pack: "nixpacks" },
+          env: { vars: { MAILGUN_KEY: { value: "mk-NEW", secret: true } } },
+        },
+      ];
+      const report = computeDiff(
+        rotated,
+        liveApp({ MAILGUN_KEY: "mk-OLD" }),
+        "full",
+      );
+      const r = await applyPlan(report, rotated, exec);
+      expect(calls).toEqual(["env u1", "redeploy u1"]);
+      expect(r.mutated).toEqual(["core-api"]);
+    });
+  });
+
   it("does nothing on a clean report", async () => {
     const { calls, exec } = recorder();
     const live = [

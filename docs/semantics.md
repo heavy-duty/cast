@@ -580,6 +580,50 @@ dangerous, because it reads like a guard standing over a name while standing
 over nothing, and the likeliest cause is a typo whose real name is then
 *captured* from the source box instead of placeheld.
 
+### The placeholder is a promise, and `apply` refuses to write it over a value
+
+The bootstrap is **two-pass**, and only the first pass is safe to repeat.
+`pending-coolify-generated` means *"no real value exists yet — Coolify will make
+one"*. The first `apply` sends it, Coolify creates the Postgres/Redis and
+replaces it with the real URL. **From that moment the store is known-wrong**, and
+a second `apply` would PATCH the placeholder back over the live, working value
+and redeploy every consumer onto it — Coolify's bulk env endpoint is a plain
+upsert (`create_bulk_envs`, v4.1.2: an existing key is found and its value
+overwritten), so nothing on the far side stops it either.
+
+So `diff` and `apply` both know the literal:
+
+- `diff` gives it its own state and its own words — `secret DATABASE_URL: store
+  holds the generated-secret PLACEHOLDER, live holds a real value — apply would
+  OVERWRITE it`, plus a count in the summary line. The old report said `secret
+  DATABASE_URL differs`, which is what a legitimate **rotation** of the same
+  secret prints: the one signal there was could not be told from routine.
+- `apply` **refuses** — it does not warn. Data-loss write, same fail-closed
+  family as the team assert and the absent-project gate. Refused before any
+  resource is touched, and the refusal names the key and the resource, **never
+  the live value**.
+
+The rule, exactly:
+
+| store value | live value | disposition |
+| --- | --- | --- |
+| placeholder | a real value | **refuse** (an already-generated secret) |
+| placeholder | placeholder | proceed (nothing differs) |
+| placeholder | absent | proceed (`add` — this is the first pass) |
+| placeholder | *resource does not exist* | proceed (`create` — Coolify replaces it) |
+| a real value | anything | proceed (an ordinary rotation) |
+
+It is keyed on the **store's value**, not on the manifest's `generated_secrets:`
+list — that list names store *refs* (`DATABASE_URL_PROD`) while an env diff is
+keyed by env var *key* (`DATABASE_URL`), and the template maps one to the other.
+The value is the same fact, carried to where it is needed. It is also the
+stricter reading: a name dropped from `generated_secrets:` while the store still
+holds the placeholder is still a write of a promise over a value.
+
+The other half of this hole is that nothing can yet **fill** the store after the
+first apply — `capture` placeholds a generated secret by design. Until it can,
+the refusal is the guard and filling the store is a manual act.
+
 **Secret hygiene**, all enforced by tests against real values:
 
 - The plan prints **names and provenance, never values**. (The one value-shaped

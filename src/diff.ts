@@ -1,3 +1,4 @@
+import { GENERATED_PLACEHOLDER } from "./capture.js";
 import type { ResolvedEnv } from "./envtemplate.js";
 import { isReservedEnvName, reservedConsequence } from "./reserved.js";
 
@@ -32,7 +33,12 @@ export type FieldDiff = {
 };
 export type EnvDiff = {
   key: string;
-  state: "add" | "change" | "remove-candidate";
+  // `placeholder-conflict` is NOT a kind of `change`, and the distinction is
+  // the whole point: a `change` is a value cast is entitled to write, and this
+  // is one it must never write. The store holds GENERATED_PLACEHOLDER — "no
+  // real value exists yet, Coolify will make one" — and the live resource says
+  // Coolify already did. See diffEnv, renderDiff and applyPlan's refusal.
+  state: "add" | "change" | "remove-candidate" | "placeholder-conflict";
   secret: boolean;
 };
 export type Change = {
@@ -108,8 +114,43 @@ function diffEnv(
   const diffs: EnvDiff[] = [];
   for (const [key, v] of Object.entries(desired.vars)) {
     if (!(key in live)) diffs.push({ key, state: "add", secret: v.secret });
-    else if (live[key] !== v.value)
-      diffs.push({ key, state: "change", secret: v.secret });
+    else if (live[key] !== v.value) {
+      // The second pass of the two-pass bootstrap, which for years only ever
+      // ran once. The store's value for a provider-generated secret is the
+      // literal `pending-coolify-generated` (capture.ts); the first apply sends
+      // it, Coolify creates the resource and replaces it with the real URL. From
+      // that moment the store is KNOWN-WRONG, and every diff since has printed
+      // `secret DATABASE_URL differs` — word for word what a legitimate rotation
+      // prints — while apply stood ready to PATCH the placeholder back over the
+      // live, working value and redeploy. So the placeholder gets its own state,
+      // and apply refuses on it (#47).
+      //
+      // Keyed on the STORE VALUE, not on the manifest's `generated_secrets:`
+      // list. Two reasons, and the first is fatal to the alternative:
+      //
+      //   - `generated_secrets:` names store REFS (`DATABASE_URL_PROD`) while an
+      //     env diff is keyed by env var KEY (`DATABASE_URL`) — the template maps
+      //     one to the other and they routinely differ, so matching the list
+      //     against these keys would sail straight past the real case. The value
+      //     carries the same fact to where it is needed: resolveTemplate copies
+      //     the store's value in verbatim, and `secret` is true exactly when the
+      //     RHS was a single `${REF}`.
+      //   - It is the stricter rule. A name dropped from `generated_secrets:`
+      //     while the store still holds the placeholder is still a data-loss
+      //     write; the placeholder is never a value anyone meant to ship.
+      //
+      // Only the UPDATE path can reach this: diffEnv runs solely against a live
+      // resource. On a create the placeholder is correct — Coolify replaces it —
+      // and that path emits `add`, untouched. A var absent live is likewise an
+      // `add`, and a live value that is ALSO the placeholder never gets here at
+      // all (the values are equal, so there is no diff to state).
+      const placeheld = v.secret && v.value === GENERATED_PLACEHOLDER;
+      diffs.push({
+        key,
+        state: placeheld ? "placeholder-conflict" : "change",
+        secret: v.secret,
+      });
+    }
   }
   for (const key of Object.keys(live)) {
     // A reserved name is deliberately NOT a remove-candidate: it is collected
@@ -240,6 +281,24 @@ export function computeDiff(
   };
 }
 
+// Every env var whose store value is still the generated-secret placeholder
+// while the live resource holds a real one. The single reading of the report
+// that both renderDiff and applyPlan use, so the warning and the refusal can
+// never disagree about what counts as one.
+//
+// Names the key and the resource — NEVER the live value. Same rule as capture's
+// disposition table: the point of the report is what to fix, not what the secret
+// is, and a secret printed to a terminal is a secret in a scrollback buffer.
+export function placeholderConflicts(
+  report: DiffReport,
+): Array<{ kind: ResourceKind; name: string; key: string }> {
+  return report.changes.flatMap((c) =>
+    c.envDiffs
+      .filter((e) => e.state === "placeholder-conflict")
+      .map((e) => ({ kind: c.kind, name: c.name, key: e.key })),
+  );
+}
+
 export function renderDiff(report: DiffReport): string {
   const lines: string[] = [];
   if (report.mode === "structural") {
@@ -258,6 +317,14 @@ export function renderDiff(report: DiffReport): string {
       if (e.state === "remove-candidate")
         lines.push(
           `  env ${e.key}: live-only (orphan var — apply never removes)`,
+        );
+      // Said in words no rotation prints. `secret X differs` was the ONLY signal
+      // this ever had, and it is exactly what a legitimate rotation of the same
+      // secret looks like — an operator reading it had no way to tell the two
+      // apart, which is how a plan to destroy a live database reads as routine.
+      else if (e.state === "placeholder-conflict")
+        lines.push(
+          `  secret ${e.key}: store holds the generated-secret PLACEHOLDER, live holds a real value — apply would OVERWRITE it`,
         );
       else if (e.secret) lines.push(`  secret ${e.key} differs`);
       else lines.push(`  env ${e.key}: ${e.state}`);
@@ -331,6 +398,11 @@ export function renderDiff(report: DiffReport): string {
       "  so Coolify picks; a server with more than one destination refuses the create outright.",
     );
   }
+  // In the tail too, not only against the var: the per-var line sits inside a
+  // change block that can be dozens of lines up, and the summary is the line an
+  // operator actually reads before typing `apply`. It says what apply will do,
+  // which is nothing at all.
+  const conflicts = placeholderConflicts(report);
   lines.push(
     report.clean
       ? "clean"
@@ -338,7 +410,11 @@ export function renderDiff(report: DiffReport): string {
           report.reserved.length > 0
             ? `, ${report.reserved.length} reserved-name FINDING(s)`
             : ""
-        }${placement.split ? ", split placement" : ""}`,
+        }${placement.split ? ", split placement" : ""}${
+          conflicts.length > 0
+            ? `, ${conflicts.length} generated-secret PLACEHOLDER conflict(s) — apply will REFUSE`
+            : ""
+        }`,
   );
   return lines.join("\n");
 }

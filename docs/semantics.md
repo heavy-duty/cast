@@ -731,6 +731,94 @@ application says which App cloned it, so cast binds every repo to the instance's
 only GitHub App when there is exactly one (there is no other it could be), and
 writes a `REVIEW-…` marker when there is not.
 
+## Teardown (`cast destroy`)
+
+`apply` never deletes. `destroy` is the one verb that does, and everything below
+is what stands between it and the hand deletion in the Coolify UI it replaces.
+
+### What a Coolify DELETE actually removes
+
+`DELETE /applications|databases|services/{uuid}` takes four query parameters, and
+**every one of them defaults to `true`**
+(`{Applications,Databases,Services}Controller@delete_by_uuid`, v4.1.2 — each reads
+`$request->boolean('delete_volumes', true)` and hands the four to
+`DeleteResourceJob`). cast sends all four **explicitly**: a default is a thing the
+vendor gets to change, and three of these decide whether an operator's data still
+exists afterwards.
+
+| parameter | cast sends | what it does (`app/Jobs/DeleteResourceJob.php`, v4.1.2) |
+|---|---|---|
+| `delete_volumes` | `true` | `Application::deleteVolumes` → `docker volume rm -f <storage>` per persistent storage (`docker compose down -v` for a compose app), then deletes the persistent-storage rows. **This is what makes a database delete unrecoverable** — its data volume goes with it. |
+| `delete_connected_networks` | `true` | `docker network disconnect <uuid> coolify-proxy` and `docker network rm <uuid>` (`Application::deleteConnectedNetworks`). The network is named for the **resource's own uuid** — it is *not* the shared destination network the rest of the box hangs off, so a multi-project server keeps its network and the other projects on it keep running. Left `false`, every delete would leak a dead network. |
+| `delete_configurations` | `true` | removes the resource's configuration directory on the server. |
+| `docker_cleanup` | **`false`** | It is not scoped to the resource at all: it dispatches `CleanupDocker` against the **server** — `docker container prune`, an image prune, `docker builder prune -af` (`app/Actions/Server/CleanupDocker.php`). The boxes in this fleet are multi-project by design and one of them hosts third-party production. A teardown of *our* project does not get to prune somebody else's build cache. Coolify runs its own scheduled cleanup. |
+
+Independently of all four, the job also deletes the resource's **env vars**, file
+storages, and — for a database — its SSL certificates and its **scheduled-backup
+configurations** (`scheduledBackups()->delete()`). Backups already written to S3
+are not touched by any of this; local backup files live under the storage the
+delete removes.
+
+**The delete is asynchronous.** The controller dispatches `DeleteResourceJob` onto
+the `high` queue and answers `200 {"message": "…deletion request queued."}`. A 2xx
+means *Coolify accepted the deletion*, not *the resource is gone* — which is why
+`--with-project` polls `GET /projects/{uuid}/{env}` until the environment actually
+reads back empty before it removes anything else, rather than racing the queue into
+a `400`.
+
+### Scope, order, and what is left standing
+
+destroy deletes **the resources the manifest declares**, in this project and this
+environment, in **reverse dependency order** (applications → services → databases —
+`DESTROY_ORDER` in `src/destroy.ts`; a database removed while an app still points at
+it does not fail quietly, it fails as a restart loop). Anything else it finds is
+**reported and left standing**: that report is how a resource created outside cast
+gets discovered, and deleting it would make this an environment wipe.
+
+It takes **no `--project`, no `--environment`, no `--resource`**. Those coordinates
+exist to point cast at names somebody else chose in a UI — which is exactly the box
+a delete must never be aimed at.
+
+### The gates
+
+- **`--all` is refused, always.** `apply --all` is safe to iterate because it is
+  idempotent and never deletes; `diff --all` because it only reads. A loop over a
+  delete is neither.
+- **A read-only instance is refused** (`assertWritable`), like `apply`/`smoke`/
+  `server add`.
+- **An absent project is refused** and names what *is* there — the D-237 family, and
+  doubly so here: an absent target reads back exactly like an empty one, and an empty
+  one gives this verb a plan that deletes nothing, which renders as a clean teardown
+  of an environment that is still standing. The same refusal fires when the manifest
+  declares nothing this environment actually holds.
+- **`environments.<env>.destroy_allowed: true` is required, and absent means refuse.**
+  A `--yes` flag is not a gate; it is a thing you type without reading. The gate lives
+  in the private state repo — a line a human edits, commits and merges — for the same
+  reason `forbidden_var_patterns` does: *a change on one side must not be able to lower
+  its own guard.* It is `true` on an environment that is empty and being battle-tested,
+  and the cutover checklist **deletes it** the moment that environment carries real data.
+- **The plan, then the environment's name, typed** — the ceremony `capture` uses. Names
+  and kinds, never values.
+- **`--with-project` is refused up front** when anything cast did not declare is still
+  in the environment, or when another environment of the project holds resources.
+  Coolify refuses those deletes too (`400 Project has resources, so it cannot be
+  deleted.` / `400 Environment has resources…` — `ProjectController@delete_project` /
+  `@delete_environment`, both guarded by `isEmpty()`), but it refuses them *after* the
+  declared resources are already gone.
+
+### What a database line says
+
+`GET /databases/{uuid}/backups` returns the backup configurations with their
+executions eager-loaded (`ScheduledDatabaseBackup::…->with('executions')->get()` —
+`DatabasesController@database_backup_details_uuid`), so one call answers both halves
+of the only question that matters at the prompt: *is this database backed up, and did
+a backup ever actually land?* The vendored OpenAPI documents that response as the
+literal string *"Content is very complex. Will be implemented later."*, so cast parses
+the source's shape and **refuses to guess**: an envelope it does not recognize, or a
+route that errors, prints `backup schedule: UNKNOWN` with the reason and is treated as
+unrecoverable. It never rounds down to `NONE` — a database that *is* backed up must
+never read as one that is not, and the reverse must never happen either.
+
 ## Cloning a private manifest
 
 `resolveCheckout` resolves git credentials **inside cast**, in a fixed order —

@@ -35,6 +35,20 @@ import {
 } from "./config.js";
 import { CoolifyClient, HttpError } from "./coolify.js";
 import {
+  type BackupState,
+  type DestroyExecutor,
+  executeDestroy,
+  planDestroy,
+  readBackupState,
+  renderAbsentDestroyTarget,
+  renderDestroyAllRefusal,
+  renderDestroyPlan,
+  renderDestroyResult,
+  renderNoInterlock,
+  renderNothingDeclaredHere,
+  renderProjectNotEmptiable,
+} from "./destroy.js";
+import {
   type Change,
   type Live,
   type ResourceKind,
@@ -98,6 +112,7 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
        cast inventory <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--resource <m>=<l>]
        cast inventory --env <env> [--instance <name>]     # no repo: SWEEP the whole instance
        cast inventory --env <env> --emit-draft <dir> [--recipient age1…] [--no-secrets]
+       cast destroy   <org>/<repo> --env <env> [--instance <name>] [--path <dir>] [--with-project]
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
        cast smoke     <org>/<repo> --env <env> [--project <name>] [--environment <name>]
        cast team [--env <env>]
@@ -176,6 +191,18 @@ capture --generated-only (PASS 2 — run it AFTER \`apply\` has created the reso
                        your store. Repeatable.
   --force              fill a generated name that already holds a REAL value
                        (refused by default — it is a silent credential rotation).
+
+destroy (the only verb that deletes what a manifest declared):
+  --with-project       after the resources, remove the environment and then the
+                       project — both only if they are EMPTY. Refused up front when
+                       anything cast did not declare is still in either of them.
+  MANIFEST-SCOPED, always: it deletes the resources this manifest declares in this
+  project and this environment, in reverse dependency order, and REPORTS anything
+  else it finds without touching it. It takes no --project/--environment/--resource
+  (the coordinates for a box somebody else named by hand), refuses --all outright,
+  refuses a read-only instance, and refuses any environment whose environments.yaml
+  binding does not carry \`destroy_allowed: true\`. The last gate is typing the
+  environment's name at the plan.
 
 inventory --emit-draft (write down what a box has, as a PROPOSAL):
   --emit-draft <dir>   emit what the sweep saw as a draft of cast's own inputs — a
@@ -774,16 +801,36 @@ function readOverrides(names: string[]): Record<string, string> {
 //
 // EOF (a closed or empty stdin) resolves to `null` and aborts. Without that
 // race, a `< /dev/null` run would hang forever on a question nobody can answer.
-async function confirmCapture(envName: string): Promise<boolean> {
+async function confirmTypedName(
+  expected: string,
+  question: string,
+): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const answer = await new Promise<string | null>((resolve) => {
-    rl.question(
-      `\ntype the environment name to write this store (${envName}): `,
-    ).then(resolve, () => resolve(null));
+    rl.question(question).then(resolve, () => resolve(null));
     rl.once("close", () => resolve(null));
   });
   rl.close();
-  return answer?.trim() === envName;
+  return answer?.trim() === expected;
+}
+
+async function confirmCapture(envName: string): Promise<boolean> {
+  return confirmTypedName(
+    envName,
+    `\ntype the environment name to write this store (${envName}): `,
+  );
+}
+
+// The same ceremony, for the verb it was really invented for. Everything said
+// above applies twice over here: `destroy` deletes resources and the volumes
+// under them, Coolify's delete is a queued job that nothing recalls, and the
+// operator has just been shown a plan whose database lines say whether each one
+// can ever come back. Typing the environment's name is the act of having read it.
+async function confirmDestroy(envName: string): Promise<boolean> {
+  return confirmTypedName(
+    envName,
+    `\ntype the environment name to DESTROY the resources above (${envName}): `,
+  );
 }
 
 // Everything ONE project run needs that is the same for every project in a
@@ -1923,6 +1970,210 @@ async function main(): Promise<number> {
     }
     await smoke(client, app.uuid);
     return 0;
+  }
+  // The only verb that deletes what a manifest declared — and, therefore, the
+  // verb whose REFUSALS are the product. Every gate below is placed as early as
+  // it can honestly be answered, so that the expensive, irreversible half of this
+  // command is reached only by a run that has already been told "yes" by the
+  // state repo, the instance, the team, the project, the manifest, and a human.
+  if (command === "destroy") {
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: {
+        env: { type: "string" },
+        state: { type: "string" },
+        path: { type: "string" },
+        instance: { type: "string" },
+        "with-project": { type: "boolean", default: false },
+        // Declared ONLY so that it can be refused with a sentence. Left out of
+        // this list, `--all` would die as parseArgs's "Unknown option" — which
+        // reads like a version skew, invites a retry, and says nothing about why
+        // a fleet-wide delete is a thing cast does not have. See
+        // renderDestroyAllRefusal.
+        all: { type: "boolean", default: false },
+      },
+    });
+    // FIRST, before the usage check even: `cast destroy --env prod --all` has no
+    // repo positional, and answering it with a usage block would tell an operator
+    // that the missing piece is the repo name.
+    if (values.all) {
+      console.error(renderDestroyAllRefusal());
+      return 2;
+    }
+    const orgRepo = positionals[0];
+    const envName = values.env;
+    if (!orgRepo || !envName) {
+      console.error(USAGE);
+      return 2;
+    }
+    // A checkout cannot decide what prod runs — and for THIS verb, what a
+    // checkout would be deciding is what gets deleted out of prod. Same rule,
+    // same string, same refusal as apply's.
+    if (refusesPathInProd({ env: envName, path: values.path })) {
+      console.error(PATH_IN_PROD_REFUSAL);
+      return 2;
+    }
+    const stateDir = stateDirFrom(values.state);
+    const bindingsPath = join(stateDir, "environments.yaml");
+    const bindings = loadBindings(bindingsPath);
+    const binding = bindings.environments[envName];
+    if (!binding) {
+      console.error(`environment ${envName} not in environments.yaml`);
+      return 2;
+    }
+    // THE INTERLOCK, and it is checked here — before the clone, before the
+    // instance is opened, before a single call — because it is a fact about the
+    // state repo and nothing on the wire can change the answer. An environment
+    // that has not been deliberately opened for destruction refuses at the
+    // cheapest possible moment, having touched nothing.
+    if (binding.destroy_allowed !== true) {
+      console.error(
+        renderNoInterlock(envName, bindingsPath, binding.destroy_allowed),
+      );
+      return 2;
+    }
+    // NO --project, NO --environment, NO --resource — see renderAbsentDestroyTarget.
+    // The project is the one named after the repo, the environment is the one named
+    // by --env, and the resources are the ones the manifest declares under their own
+    // names. Every one of those three flags exists to point cast at names SOMEBODY
+    // ELSE chose in a UI, and a delete does not get to be aimed by them.
+    const repoShort = orgRepo.split("/")[1];
+    const projectName = repoShort;
+    const coolifyEnv = envName;
+    const checkout = resolveCheckout(orgRepo, {
+      env: envName,
+      path: values.path,
+    });
+    // The manifest's names, and no secrets: destroy deletes resources, it does not
+    // resolve a single ${REF}, so it needs no store and no age key (which also means
+    // a store that was lost with the box being torn down cannot block the teardown).
+    const declared = manifestResources(checkout, envName).map((r) => ({
+      kind: r.kind,
+      name: r.name,
+    }));
+    const { instance, client } = openCoolify(
+      stateDir,
+      values.instance,
+      binding,
+    );
+    // Both asserts, both before the first read. The read-only refusal is the same
+    // one apply/smoke/server-add take; the team assert matters even more here than
+    // it does for them, because a wrong-team token reads back an EMPTY project —
+    // and an empty project is a plan that deletes nothing while the real one is
+    // untouched (or, with --with-project, a delete aimed at a project in a team
+    // nobody checked).
+    assertWritable(instance, "destroy");
+    const team = await assertTeam(client, binding.team, envName);
+    console.log(`team ${formatTeam(team)} ✓`);
+    const lookup = await fetchLive(client, projectName, coolifyEnv);
+    if (!lookup.found) {
+      console.error(
+        renderAbsentDestroyTarget(lookup, { orgRepo, env: envName }),
+      );
+      return 2;
+    }
+    const plan = planDestroy(declared, lookup.live);
+    // What deleting each database COSTS, asked of Coolify rather than assumed
+    // from the manifest's `backup:` block: the manifest says what was declared,
+    // and the only thing worth knowing at the prompt is what actually exists and
+    // whether it ever ran. A failure to read it is `unknown` (see readBackupState)
+    // — never "none", which is the one direction this must never round in.
+    for (const target of plan.targets) {
+      if (target.kind !== "database") continue;
+      target.backup = await client.databaseBackups(target.uuid).then(
+        readBackupState,
+        (err): BackupState => ({
+          state: "unknown",
+          reason: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+    // --with-project, pre-flighted: Coolify refuses to delete a project or an
+    // environment that still holds anything, and it refuses AFTER the resources are
+    // gone. Ask both questions now, while nothing has been deleted and the answer is
+    // still an operator's decision rather than a 400 they read afterwards.
+    let projectUuid: string | undefined;
+    if (values["with-project"]) {
+      projectUuid = await client.projectUuid(projectName);
+      const otherEnvironments: Array<{ name: string }> = [];
+      for (const name of await client.environments(projectUuid)) {
+        if (name === coolifyEnv) continue;
+        if (!(await client.environmentIsEmpty(projectUuid, name))) {
+          otherEnvironments.push({ name });
+        }
+      }
+      if (plan.undeclared.length > 0 || otherEnvironments.length > 0) {
+        console.error(
+          renderProjectNotEmptiable(
+            { project: projectName, environment: coolifyEnv },
+            { undeclared: plan.undeclared, otherEnvironments },
+          ),
+        );
+        return 2;
+      }
+    }
+    console.log(
+      renderDestroyPlan(plan, {
+        orgRepo,
+        env: envName,
+        project: projectName,
+        environment: coolifyEnv,
+        withProject: values["with-project"],
+      }),
+    );
+    // A destroy with nothing to destroy is a refusal, not a clean run (D-237).
+    // Under --with-project it is NOT: removing the empty project and environment a
+    // half-applied first run left behind is exactly the job, and there the emptiness
+    // is the point rather than the surprise.
+    if (plan.targets.length === 0 && !values["with-project"]) {
+      console.error(
+        renderNothingDeclaredHere(plan, {
+          orgRepo,
+          env: envName,
+          project: projectName,
+          environment: coolifyEnv,
+        }),
+      );
+      return 2;
+    }
+    if (!(await confirmDestroy(envName))) {
+      console.error("aborted — nothing deleted");
+      return 2;
+    }
+    const uuid = projectUuid;
+    const exec: DestroyExecutor = {
+      deleteResource: (t) => client.deleteResource(t.kind, t.uuid),
+      // Only ever reached under --with-project, which is the only path that
+      // resolves the project's uuid. The throw is not defensive noise: it is what
+      // keeps a future caller from wiring these three up with a uuid it never
+      // fetched, against a project it never looked at.
+      environmentIsEmpty: () => {
+        if (!uuid) throw new Error("no project uuid resolved");
+        return client.environmentIsEmpty(uuid, coolifyEnv);
+      },
+      deleteEnvironment: () => {
+        if (!uuid) throw new Error("no project uuid resolved");
+        return client.deleteEnvironment(uuid, coolifyEnv);
+      },
+      deleteProject: () => {
+        if (!uuid) throw new Error("no project uuid resolved");
+        return client.deleteProject(uuid);
+      },
+    };
+    const outcome = await executeDestroy(plan, exec, {
+      withProject: values["with-project"],
+    });
+    console.log(
+      renderDestroyResult(outcome, {
+        project: projectName,
+        environment: coolifyEnv,
+      }),
+    );
+    // A --with-project run that could not finish exits NON-ZERO even though every
+    // resource it was asked to delete is gone: what the operator asked for did not
+    // happen in full, and a 0 here would say it did.
+    return outcome.note ? 2 : 0;
   }
   if (command === "team") {
     const { values } = parseArgs({

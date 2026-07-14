@@ -71,6 +71,7 @@ cast capture   <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
 cast capture   <org>/<repo> --env <env> --generated-only [--from <NAME>=<db>]
 cast inventory <org>/<repo> --env <env>
 cast inventory --env <env> [--emit-draft <dir> [--recipient age1…] [--no-secrets]]
+cast destroy   <org>/<repo> --env <env> [--instance <name>] [--with-project]
 cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
 cast smoke     <org>/<repo> --env <env> [--project <name>] [--environment <name>]
 cast team [--env <env>]
@@ -109,6 +110,15 @@ cast team [--env <env>]
   bootstrap**: run *after* `apply`, it fills the store's provider-generated names
   (a Coolify-made `DATABASE_URL`) with the values Coolify generated. See *The
   bootstrap is two-pass* below.
+- **`destroy`** — the **only** verb that deletes what a manifest declared, and the
+  reason `apply` never has to. **Manifest-scoped**: it removes the resources this
+  manifest declares in this project and this environment, in reverse dependency
+  order (applications → services → databases), and **reports everything else it
+  finds without touching it**. It refuses `--all`, refuses a read-only instance,
+  refuses an absent project, and refuses any environment whose `environments.yaml`
+  binding does not carry `destroy_allowed: true`. The last gate is typing the
+  environment's name at a plan that says, for every database, whether it is backed
+  up and when the last backup landed. See *Tearing an environment down* below.
 - **`server add`** — uploads a server's private key and registers it with Coolify.
 - **`smoke`** — contract test against the project's `smoke_target`: proves
   Coolify's bulk env endpoint still *upserts* rather than replacing. Run it after
@@ -810,6 +820,94 @@ later in the Coolify UI without touching a manifest, so "off" has to mean absent
 
 This guard lives in your private state deliberately — not in the product's
 manifest. A product-side change must not be able to lower its own guard.
+
+## Tearing an environment down: `cast destroy`
+
+```sh
+cast destroy heavy-duty/incubator --env staging [--with-project]
+```
+
+`apply` fails closed on an immutable field (`build_pack`, `type`, `version`,
+placement) with *"resolve manually"* — which used to mean a hand deletion in the
+Coolify UI, against an instance whose token can see every project on it. That is
+how you delete the wrong project. `destroy` is that act, scoped and gated.
+
+**What it deletes:** the resources **the manifest declares**, in this project and
+this environment, in reverse dependency order — applications, then services, then
+databases. Nothing else. A resource it finds that the manifest does **not**
+declare is **reported and left standing**, and that report is also how you find
+out something was created outside cast. It is not an instance wipe and not an
+environment wipe: the boxes in this fleet are multi-project by design (one of them
+hosts two third-party client sites), and a delete you can point at a whole box is
+one wrong argument away from somebody else's production.
+
+**What it refuses:**
+
+| refusal | why |
+|---|---|
+| `--all` | the one verb that must never iterate a fleet. `apply --all` is safe to loop because it is idempotent and never deletes; a loop over a delete has no honest use. |
+| a read-only instance | the same `COOLIFY_READ_ONLY` assert `apply`/`smoke`/`server add` take. |
+| an absent project | an absent target reads back exactly like an empty one — and an empty one gives *this* verb a plan that deletes nothing, which renders as a perfectly clean teardown of an environment that is still standing. It names what *is* there instead. |
+| an environment without `destroy_allowed: true` | below. |
+| anything but the environment's name, typed | the same ceremony `capture` uses. |
+| `--with-project`, when anything cast did not declare is still in the project | Coolify refuses that delete too (`400 Project has resources`) — but it refuses it *after* your resources are gone. |
+
+There is no `--project`, no `--environment` and no `--resource`. Those coordinates
+exist to point cast at names **somebody else** chose in a UI, and that is exactly
+the box a delete must never be aimed at.
+
+**The interlock lives in state, not in argv:**
+
+```yaml
+environments:
+  staging:
+    server: staging-box
+    team: { id: 0, name: Root Team }
+    destroy_allowed: true    # absent = destroy refuses. Removed at cutover, forever.
+```
+
+A `--yes` flag is not a gate; it is a thing you type without reading, and by the
+second week it is in the shell history above the command it guards. This is a line
+a human edits, commits and merges — in the **private state repo**, for the same
+reason `forbidden_var_patterns` lives there: *a change on one side must not be able
+to lower its own guard.* It is `true` while an environment is empty and being
+battle-tested. **The cutover checklist deletes it the moment that environment
+carries real data**, and from then on destroying it costs a PR.
+
+**The plan says what the delete costs.** Coolify's delete takes the resource's
+volumes with it, so a database line carries its backup schedule and when the last
+backup actually landed — the difference between *recreate this* and *this is
+gone*. A backup configuration cast cannot read prints `backup schedule: UNKNOWN`
+and is treated as unrecoverable; it never rounds down to "none".
+
+```
+destroy plan — heavy-duty/incubator staging
+
+  project:      incubator   (on Coolify)
+  environment:  staging
+  scope:        3 resource(s) the manifest declares for staging, and nothing else
+
+DELETE, in reverse dependency order (applications → services → databases):
+
+  application  core       a1
+  database     cache      d2
+      backup schedule: NONE — nothing has ever been scheduled for this database.
+      its volume goes with it, and cast cannot bring it back. UNRECOVERABLE.
+  database     postgres   d1
+      backup schedule: 0 2 * * *
+      last backup:     2026-07-13T02:00:11Z (success)
+
+LEFT STANDING — on this box, and NOT declared by the manifest:
+
+  service      metabase
+
+type the environment name to DESTROY the resources above (staging):
+```
+
+`--with-project` additionally removes the **environment** and then the **project** —
+both only if they are empty, and only after Coolify's delete queue has actually
+drained (its DELETE returns *"deletion request queued"*, not *"deleted"*). It is
+the way back to zero from a half-applied first run.
 
 ## Scripts
 

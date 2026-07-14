@@ -5,9 +5,11 @@ import { join } from "node:path";
 import type { Desired } from "./diff.js";
 import {
   type ResolvedEnv,
+  fillDerivedEnv,
   resolveTemplate,
   templateKeys,
   templateRefs,
+  templateResourceRefs,
 } from "./envtemplate.js";
 import { loadManifest } from "./manifest.js";
 import {
@@ -205,6 +207,51 @@ export function resolveCheckout(
 // store is keyed by REF, but the live box knows it as `resource.key`.
 export type RequiredSecret = { ref: string; resource: string; key: string };
 
+// The dead-reference check, pointed at derived edges instead of generated
+// secrets (#60). The same failure the generated_secrets check below catches — a
+// name that resolves against nothing, dressed up as config that guards or
+// derives something — and refused in the same voice, wherever a template is
+// opened: `apply`, `diff`, and `capture` all validate before they act, because a
+// `${resource:X.url}` naming a database the manifest does not declare is broken
+// for all three, not just the verb about to write.
+//
+//   - an attr other than `.url`: nothing else is derivable, so it can only be a
+//     mistake — named here rather than resolved to `undefined` and written blank.
+//   - a resource the manifest does not declare: the URL would resolve against
+//     nothing on every box, forever. The likeliest cause is a typo.
+function assertResourceRefs(
+  envName: string,
+  databases: Set<string>,
+  refs: Array<{ key: string; resource: string; attr: string }>,
+): void {
+  for (const r of refs) {
+    if (r.attr !== "url") {
+      throw new Error(
+        [
+          `manifest environment ${envName}: ${r.key} refers to \${resource:${r.resource}.${r.attr}}, an unknown resource attribute`,
+          "",
+          "Only `.url` is derivable — the internal URL of a database the manifest",
+          "declares. Fix the attribute, or make it a plain ${SECRET} the store holds.",
+        ].join("\n"),
+      );
+    }
+    if (!databases.has(r.resource)) {
+      throw new Error(
+        [
+          `manifest environment ${envName}: ${r.key} refers to \${resource:${r.resource}.url}, but the manifest declares no database named ${r.resource}`,
+          "",
+          `  declares:   ${[...databases].sort().join(", ") || "(no databases)"}`,
+          "",
+          "A ${resource:…} ref derives the URL of a database this manifest creates. One",
+          "that names a database the manifest does not declare derives nothing, on every",
+          "box, forever — the likeliest cause is a typo. Fix the name, or declare the",
+          "database.",
+        ].join("\n"),
+      );
+    }
+  }
+}
+
 // Exactly the set of secret names an environment's manifest demands — the same
 // set `apply` will later insist on, read from the same templates by the same
 // parser. `capture` uses this to know what to go and fetch; nothing else has to
@@ -224,6 +271,8 @@ export function requiredSecrets(
     );
   }
   const required: RequiredSecret[] = [];
+  const resourceRefs: Array<{ key: string; resource: string; attr: string }> =
+    [];
   // Reserved names are checked HERE, and in manifestResources, and in
   // desiredFromManifest — every function in this file that opens an env
   // template, rather than once in the verb that writes. The rule is a property
@@ -244,6 +293,7 @@ export function requiredSecrets(
       );
     const text = readFileSync(file, "utf8");
     reserved.push(...reservedHits(resource, templateKeys(text)));
+    resourceRefs.push(...templateResourceRefs(text));
     for (const { key, ref } of templateRefs(text)) {
       required.push({ ref, resource, key });
     }
@@ -255,6 +305,11 @@ export function requiredSecrets(
     collect(name, svc.env_template);
   }
   assertNoReservedEnvNames(reserved);
+  assertResourceRefs(
+    envName,
+    new Set(Object.keys(envSpec.databases ?? {})),
+    resourceRefs,
+  );
   const generated = envSpec.generated_secrets ?? [];
   // A generated_secrets entry naming something no template refs is dead
   // config — and dead config in THIS list is not merely untidy, it is
@@ -352,6 +407,8 @@ export function desiredFromManifest(
   const desired: Desired[] = [];
   const resolvedEnvs: Record<string, ResolvedEnv> = {};
   const reserved: ReservedHit[] = [];
+  const resourceRefs: Array<{ key: string; resource: string; attr: string }> =
+    [];
   const resolveEnvFile = (
     name: string,
     template?: string,
@@ -360,8 +417,10 @@ export function desiredFromManifest(
     const file = join(checkoutDir, ".infra", "env", template);
     if (!existsSync(file))
       throw new Error(`env template missing: ${file} (referenced by ${name})`);
-    const env = resolveTemplate(readFileSync(file, "utf8"), secrets);
+    const text = readFileSync(file, "utf8");
+    const env = resolveTemplate(text, secrets);
     reserved.push(...reservedHits(name, Object.keys(env.vars)));
+    resourceRefs.push(...templateResourceRefs(text));
     resolvedEnvs[name] = env;
     return env;
   };
@@ -486,5 +545,28 @@ export function desiredFromManifest(
   // resolved env that carries a reserved name is not desired state, it is a
   // suppression of the platform's own value dressed up as one. See reserved.ts.
   assertNoReservedEnvNames(reserved);
+  assertResourceRefs(
+    envName,
+    new Set(Object.keys(envSpec.databases ?? {})),
+    resourceRefs,
+  );
   return { desired, resolvedEnvs };
+}
+
+// Fill the derived vars in a desired set against a URL map keyed by MANIFEST
+// resource name. Used twice, with two different maps, and that is the whole
+// point of it being one function: diff/apply fills first against the resources
+// that already exist on the box (so an app whose DATABASE_URL already equals the
+// live database's URL shows no drift — the "differs on every plan" noise #60
+// deletes), and the executor fills again against a database it has just created
+// (the from-nothing case, where nothing existed to resolve against at plan
+// time). A ref whose resource is in neither map stays unresolved; the executor
+// is the one place that refuses to WRITE one that never resolved.
+export function fillDesiredDerived(
+  desired: Desired[],
+  urls: Record<string, string>,
+): Desired[] {
+  return desired.map((d) =>
+    d.env ? { ...d, env: fillDerivedEnv(d.env, urls) } : d,
+  );
 }

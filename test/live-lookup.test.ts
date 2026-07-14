@@ -85,6 +85,35 @@ describe("fetchLive", () => {
     const r = await fetchLive(client, "incubator", "prod");
     expect(r).toEqual({ found: true, live: [] });
   });
+
+  // #60: a database carries its internal_db_url onto Live (what an app's
+  // ${resource:<name>.url} derives from); an application does not. This is the
+  // plumbing runProject reads to build its URL map, so it is worth pinning.
+  it("plumbs a database's internal_db_url onto Live, and only for databases", async () => {
+    const client = coolify([{ uuid: "p1", name: "incubator" }], {
+      "p1/prod": {
+        applications: [
+          { name: "core", uuid: "a1", internal_db_url: "nonsense" },
+        ],
+        postgresqls: [
+          {
+            name: "db",
+            uuid: "d1",
+            internal_db_url: "postgres://u:p@d1:5432/app",
+          },
+        ],
+        redis: [{ name: "cache", uuid: "r1" }],
+      },
+    });
+    const r = await fetchLive(client, "incubator", "prod");
+    if (!r.found) throw new Error("unreachable");
+    const byName = Object.fromEntries(r.live.map((l) => [l.name, l]));
+    expect(byName.db.internalDbUrl).toBe("postgres://u:p@d1:5432/app");
+    // An application never carries it — even if the raw record has the key.
+    expect(byName.core.internalDbUrl).toBeUndefined();
+    // A database whose read carried no URL simply has none (not "").
+    expect(byName.cache.internalDbUrl).toBeUndefined();
+  });
 });
 
 describe("renderAbsentTarget", () => {

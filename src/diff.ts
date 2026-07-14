@@ -36,6 +36,12 @@ export type Live = {
   // drift nor a clean bill; it produces a line on the report. computeDiff is
   // where that is enforced.
   backupNotCompared?: string;
+  // The internal URL Coolify minted for this database (`internal_db_url`), when
+  // it is a database and the read carried one. NOT in `fields`: it is never
+  // written or compared as a database field — it is what an APPLICATION's
+  // ${resource:<this>.url} derives from (#60). Absent on applications/services,
+  // and on a database whose URL the read could not see.
+  internalDbUrl?: string;
 };
 export type FieldDiff = {
   field: string;
@@ -52,6 +58,13 @@ export type EnvDiff = {
   // Coolify already did. See diffEnv, renderDiff and applyPlan's refusal.
   state: "add" | "change" | "remove-candidate" | "placeholder-conflict";
   secret: boolean;
+  // Set to the RESOURCE NAME this var's value is derived from — its
+  // ${resource:<name>.url} — when it is a derived value rather than an authored
+  // one. Rendered as "derived from database <name>" rather than "secret differs",
+  // so a routine URL change (a rotation the derivation is meant to follow) never
+  // reads as an unexplained secret drift. Still `secret`, so the value itself is
+  // never printed either way (#60).
+  derived?: string;
 };
 export type Change = {
   kind: ResourceKind;
@@ -130,7 +143,10 @@ function diffEnv(
 ): EnvDiff[] {
   const diffs: EnvDiff[] = [];
   for (const [key, v] of Object.entries(desired.vars)) {
-    if (!(key in live)) diffs.push({ key, state: "add", secret: v.secret });
+    const derived =
+      v.derived !== undefined ? { derived: v.derived.resource } : {};
+    if (!(key in live))
+      diffs.push({ key, state: "add", secret: v.secret, ...derived });
     else if (live[key] !== v.value) {
       // The second pass of the two-pass bootstrap, which for years only ever
       // ran once. The store's value for a provider-generated secret is the
@@ -166,6 +182,7 @@ function diffEnv(
         key,
         state: placeheld ? "placeholder-conflict" : "change",
         secret: v.secret,
+        ...derived,
       });
     }
   }
@@ -246,6 +263,9 @@ export function computeDiff(
                 key,
                 state: "add" as const,
                 secret: v.secret,
+                ...(v.derived !== undefined
+                  ? { derived: v.derived.resource }
+                  : {}),
               }))
             : [],
       });
@@ -360,6 +380,18 @@ export function renderDiff(report: DiffReport): string {
       else if (e.state === "placeholder-conflict")
         lines.push(
           `  secret ${e.key}: store holds the generated-secret PLACEHOLDER, live holds a real value — apply would OVERWRITE it`,
+        );
+      // A derived value, said in words that are not a rotation's: it is not a
+      // secret that "differs", it is a URL cast reads back from the database it
+      // created and keeps the app pointed at. `add` = the app does not carry it
+      // yet (a first apply, or a database made this run); `change` = the live
+      // value has drifted from the database's current URL and apply will follow
+      // it. Never the value — same rule as any secret.
+      else if (e.derived)
+        lines.push(
+          e.state === "add"
+            ? `  ${e.key}: derived from database ${e.derived} — apply will set it`
+            : `  ${e.key}: derived from database ${e.derived} — live differs, apply will follow it`,
         );
       else if (e.secret) lines.push(`  secret ${e.key} differs`);
       else lines.push(`  env ${e.key}: ${e.state}`);

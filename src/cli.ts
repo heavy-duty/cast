@@ -66,7 +66,12 @@ import {
   renderNoRecipient,
   renderRepoWithDraft,
 } from "./draft.js";
-import { assertEnvVarPolicy } from "./envtemplate.js";
+import {
+  type ResolvedEnv,
+  assertEnvVarPolicy,
+  fillDerivedEnv,
+  unresolvedDerived,
+} from "./envtemplate.js";
 import {
   type ProjectOutcome,
   fleetConflict,
@@ -89,6 +94,7 @@ import { assertNoReservedEnvNames, reservedHits } from "./reserved.js";
 import {
   PATH_IN_PROD_REFUSAL,
   desiredFromManifest,
+  fillDesiredDerived,
   manifestResources,
   refusesPathInProd,
   requiredSecrets,
@@ -506,6 +512,16 @@ export async function fetchLive(
       // the `destination` relation and no endpoint exposes it. See Placement.
       destinationId:
         typeof i.destination_id === "number" ? i.destination_id : undefined,
+      // The URL an application's ${resource:<name>.url} derives from (#60). Only
+      // databases carry `internal_db_url` (an appended model attribute on
+      // StandalonePostgresql/StandaloneRedis — see fetchGeneratedSources for the
+      // provenance); it rides on Live rather than in `fields` because it is never
+      // a database field cast writes or diffs. aliasLive preserves it while
+      // renaming to the manifest's vocabulary, so the URL map built downstream is
+      // keyed by the name a ref actually uses.
+      ...(kind === "database" && typeof i.internal_db_url === "string"
+        ? { internalDbUrl: i.internal_db_url }
+        : {}),
     }));
   const live = [
     ...map("application", env.applications),
@@ -1024,6 +1040,21 @@ async function runProject(
       l.env = await fetchEnv(ctx.client, l);
     }
   }
+  // Resolve ${resource:<name>.url} against the databases that ALREADY exist on
+  // the box (#60). On a re-apply this is the whole story — the app's live
+  // DATABASE_URL already equals its database's URL, so the derived var shows no
+  // drift, which is what stops the "secret DATABASE_URL differs" noise that ran
+  // on every plan. On a from-nothing apply the databases are not here yet, so
+  // their refs stay unresolved through the diff (rendered "apply will set it")
+  // and the executor fills them after it creates the databases. Keyed by manifest
+  // name: aliasLive has already renamed live resources, and internalDbUrl rode
+  // along (see fetchLive).
+  const resourceUrls = Object.fromEntries(
+    live
+      .filter((l) => l.kind === "database" && l.internalDbUrl)
+      .map((l) => [l.name, l.internalDbUrl as string]),
+  );
+  desired = fillDesiredDerived(desired, resourceUrls);
   const report = computeDiff(desired, live, ctx.mode, {
     declaredDestination: projectBinding?.destination_uuid,
   });
@@ -2977,6 +3008,48 @@ export function buildExecutor(
     }
     await client.post(`/databases/${dbUuid}/backups`, body);
   };
+  // Resolve any ${resource:<name>.url} still unresolved when apply is about to
+  // write an env (#60). It can only still be unresolved on a from-nothing run:
+  // runProject filled every ref whose database already existed at plan time, so
+  // what is left is a database THIS apply created moments ago (apply acts
+  // databases-before-applications, #45, so it exists by now). Read its URL back
+  // from the same environment_details route `capture --generated-only` uses, and
+  // key by name — a from-nothing box has no aliases, so the live name IS the
+  // manifest name the ref carries.
+  //
+  // Refuses to write a ref that resolved to nothing: an empty DATABASE_URL boots
+  // the app pointed at nothing, the exact fill fetchGeneratedSources forbids.
+  // Coolify mints a database's credentials at CREATE time and internal_db_url is
+  // a model accessor built from them (not from a running container), so the URL
+  // is expected the moment the create returns. If a given Coolify build only
+  // populates it once the container is up, this refuses with a re-run instruction
+  // rather than writing a blank — and the re-run resolves it as an ordinary
+  // update, because by then the database is live and the diff fills it.
+  const resolveDerivedEnv = async (env: ResolvedEnv): Promise<ResolvedEnv> => {
+    if (unresolvedDerived(env).length === 0) return env;
+    const { sources } = await fetchGeneratedSources(
+      client,
+      ctx.projectName,
+      ctx.envName,
+    );
+    const urls = Object.fromEntries(sources.map((s) => [s.resource, s.url]));
+    const filled = fillDerivedEnv(env, urls);
+    const missing = unresolvedDerived(filled);
+    if (missing.length > 0) {
+      throw new Error(
+        [
+          "cannot resolve derived env var(s) after creating the database:",
+          ...missing.map((m) => `  ${m.key} — from database ${m.resource}`),
+          "",
+          "cast created the database this run, but Coolify has not published its",
+          "internal URL yet (the resource may still be starting). Nothing was written",
+          "— an empty URL would boot the app pointed at nothing. Re-run `cast apply`",
+          "once the database is up; the second run resolves it as an ordinary update.",
+        ].join("\n"),
+      );
+    }
+    return filled;
+  };
   // The two instance-wide constraints a create can die on, both of them invisible
   // from cast's project-scoped view, both of them arriving at the FIRST create —
   // after apply has already made the project and the environment. One wrapper, and
@@ -3121,6 +3194,12 @@ export function buildExecutor(
       }
     },
     async syncEnv(uuid, kind, env) {
+      // Fill any ${resource:<name>.url} still carrying the unresolved sentinel
+      // before anything is written — the from-nothing case, where the database
+      // was created earlier in this same apply (#60). A no-op read-wise for an
+      // env with no derived vars (the common case), and for one already resolved
+      // at plan time.
+      const resolved = await resolveDerivedEnv(env);
       // The reserved-name rule at the wire (reserved.ts). Nothing can reach here
       // carrying one — resolve.ts refuses the manifest long before a diff, let
       // alone an apply — and the check is here anyway, because this is the single
@@ -3129,7 +3208,7 @@ export function buildExecutor(
       // caller of buildExecutor will not have read resolve.ts; the guard it needs
       // is the one standing where the write happens.
       assertNoReservedEnvNames(
-        reservedHits(`${kind} ${uuid}`, Object.keys(env.vars)),
+        reservedHits(`${kind} ${uuid}`, Object.keys(resolved.vars)),
       );
       // Bulk env update is an UPSERT of listed keys, not a full replace —
       // verified against app/Http/Controllers/Api/{Applications,Databases,
@@ -3145,7 +3224,7 @@ export function buildExecutor(
             ? "databases"
             : "services";
       await client.patch(`/${base}/${uuid}/envs/bulk`, {
-        data: Object.entries(env.vars).map(([key, v]) => ({
+        data: Object.entries(resolved.vars).map(([key, v]) => ({
           key,
           value: v.value,
           is_buildtime: false,

@@ -77,9 +77,13 @@ cast team [--env <env>]
 
 - **`apply`** — idempotent create-or-update of every manifest resource, then
   redeploy what changed. One-way: it never deletes a resource that Coolify has
-  and the manifest doesn't. Clones the repo's default branch unless `--path`
-  points at a local checkout (refused with `--env prod` — prod always reads the
-  default branch).
+  and the manifest doesn't. It creates the **project** and its **environment**
+  when they are absent — the two things a resource create has to name — and then
+  removes the empty `production` that Coolify hands every new project, which is
+  the single delete cast performs and never touches a project built by hand
+  ([docs/semantics.md](docs/semantics.md)). Clones the repo's default branch
+  unless `--path` points at a local checkout (refused with `--env prod` — prod
+  always reads the default branch).
 - **`diff`** — reports drift, manifest → Coolify. Structural by default; `--full`
   also compares env vars. Exits non-zero when dirty, so CI can gate on it.
 - **`--all`** — on `apply`/`diff`, act on **every project the registry lists for
@@ -677,12 +681,49 @@ split placement: these resources sit on 2 different destinations
 verify it. That is deliberate. A setting that reads back as *absent* rather than
 *wrong* is the failure this whole file keeps trying not to be.
 
+When you declare **nothing**, every `diff` says that too:
+
+```
+placement: server's default destination (none declared) — cast sends no destination_uuid,
+  so Coolify picks; a server with more than one destination refuses the create outright.
+```
+
+Declaring nothing is not the absence of a placement decision. It is one, and it
+used to be the only one cast made silently — the inference sat in a source comment
+("the server's only destination, which is what Coolify picks anyway"), which is
+exactly where an assumption is invisible until it is wrong.
+
 One sharp edge worth knowing: on a server with exactly **one** destination,
 Coolify ignores the `destination_uuid` you send and never validates it — a typo
 there is invisible until a second destination exists. On a server with more than
 one, a create that omits it is a hard `400`, which is why cast could not deploy
-onto a shared box at all until it could send this. Details, with citations:
-[reference/README.md](reference/README.md).
+onto a shared box at all until it could send this. The asymmetry hides itself:
+the day a server gains its second destination, every project on it that declared
+no destination stops being able to create.
+
+cast cannot warn you before that create — Coolify 4.1.2 serves no destinations
+API, so a server's destination *count* is not knowable until a create has already
+been attempted, and the 400 therefore lands **after** apply has made the project
+and the environment. What cast does instead is answer it:
+
+```
+cannot create application core: prod-box has multiple destinations, so a create must say which one to use.
+
+  Coolify said: POST /applications/private-github-app → 400: {"message":"Server has multiple destinations and you do not set destination_uuid."}
+
+Read the destination UUID from the Coolify UI (4.1.2 exposes no API for it) and
+declare it as:
+
+    environments.prod.projects.heavy-duty/incubator.destination_uuid
+
+Placement is create-time — a resource cannot be moved between networks later, so a
+wrong or missing destination is repaired by delete + recreate, never by a later apply.
+
+Re-run this apply once the UUID is declared: anything it already created (the project,
+its environment) is adopted, not made twice — apply reads before it writes.
+```
+
+Details, with citations: [reference/README.md](reference/README.md).
 
 ## Guarding an environment
 

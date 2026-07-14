@@ -147,6 +147,37 @@ export class CoolifyClient {
     return names(project?.environments);
   }
 
+  // Does this environment hold anything at all?
+  //
+  // The LIST route above cannot answer it: an `Environment` carries id, name,
+  // project_id, description, timestamps — no relations, so an environment with
+  // five applications in it looks exactly like an empty one. This route is the
+  // one that eager-loads them (ProjectController@environment_details, v4.1.2:
+  // applications, postgresqls, redis, mongodbs, mysqls, mariadbs, services).
+  //
+  // The question is asked of the SHAPE rather than of those seven names: any
+  // non-empty array in the response is a resource list, because everything else
+  // there is a scalar. Naming the seven instead would mean a Coolify that grows
+  // an eighth database type could answer "empty" about an environment holding
+  // one — and this answer is the guard on a delete.
+  async environmentIsEmpty(
+    projectUuid: string,
+    envName: string,
+  ): Promise<boolean> {
+    const env = (await this.get(
+      `/projects/${projectUuid}/${encodeURIComponent(envName)}`,
+    )) as Record<string, unknown> | null;
+    // Not "empty" — unreadable. The caller must not delete on this answer.
+    if (!env) return false;
+    return !Object.values(env).some((v) => Array.isArray(v) && v.length > 0);
+  }
+
+  async deleteEnvironment(projectUuid: string, envName: string): Promise<void> {
+    await this.delete_(
+      `/projects/${projectUuid}/environments/${encodeURIComponent(envName)}`,
+    );
+  }
+
   async deploy(uuid: string): Promise<void> {
     await this.post(`/deploy?uuid=${encodeURIComponent(uuid)}`);
   }

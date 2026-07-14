@@ -195,6 +195,9 @@ describe("buildExecutor createResource (application, dockercompose)", () => {
       envName: "prod",
       serverUuid: "srv-1",
       githubAppUuid: "gh-1",
+      serverName: "prod-box",
+      orgRepo: "acme/widget",
+      bindingEnv: "prod",
       backupSchedules: {},
     });
     const uuid = await exec.createResource({
@@ -249,6 +252,9 @@ describe("buildExecutor createResource (application, dockercompose)", () => {
       envName: "prod",
       serverUuid: "srv-1",
       githubAppUuid: "gh-1",
+      serverName: "prod-box",
+      orgRepo: "acme/widget",
+      bindingEnv: "prod",
       backupSchedules: {},
     });
     await exec.createResource({
@@ -351,6 +357,9 @@ describe("buildExecutor createResource (destination placement)", () => {
         envName: "prod",
         serverUuid: "srv-1",
         githubAppUuid: "gh-1",
+        serverName: "prod-box",
+        orgRepo: "acme/widget",
+        bindingEnv: "prod",
         destinationUuid: "dest-abc",
         backupSchedules: {},
       });
@@ -378,6 +387,9 @@ describe("buildExecutor createResource (destination placement)", () => {
         envName: "prod",
         serverUuid: "srv-1",
         githubAppUuid: "gh-1",
+        serverName: "prod-box",
+        orgRepo: "acme/widget",
+        bindingEnv: "prod",
         backupSchedules: {},
       });
       await exec.createResource(change);
@@ -401,9 +413,16 @@ describe("buildExecutor createResource (environment reconcile)", () => {
     projects?: Array<{ uuid: string; name: string }>;
     environments?: string[];
     envCreateStatus?: number;
+    // What an environment HOLDS, by name — the guard on #40's delete. A project
+    // cast just created cannot really hold anything, which is exactly why the
+    // mock has to be able to say otherwise: the guard is worth only as much as
+    // the case it refuses.
+    holds?: Record<string, unknown[]>;
+    envDeleteStatus?: number;
   }) {
     const projects = opts.projects ?? [];
     let environments = opts.environments ?? [];
+    const holds = opts.holds ?? {};
     const calls: string[] = [];
     const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
       const path = new URL(String(url)).pathname;
@@ -458,6 +477,46 @@ describe("buildExecutor createResource (environment reconcile)", () => {
         environments.push(name);
         return new Response(JSON.stringify({ uuid: "env-1" }), { status: 201 });
       }
+      // DELETE /projects/{uuid}/environments/{name} — #40. Three segments, so the
+      // two-segment details route below cannot swallow it.
+      const envDelete =
+        /^\/api\/v1\/projects\/([^/]+)\/environments\/([^/]+)$/.exec(path);
+      if (envDelete && method === "DELETE") {
+        const status = opts.envDeleteStatus ?? 200;
+        if (status !== 200)
+          return new Response(JSON.stringify({ message: "boom" }), { status });
+        environments = environments.filter((e) => e !== envDelete[2]);
+        return new Response(
+          JSON.stringify({ message: "Environment deleted." }),
+          { status: 200 },
+        );
+      }
+      // GET /projects/{uuid}/{environment} — the details route, the ONLY one that
+      // eager-loads an environment's resources, and so the only one that can
+      // answer "is it empty?". The list route's Environment objects carry no
+      // relations at all. Checked after the /environments routes above, which
+      // this pattern would otherwise match.
+      const envDetail = /^\/api\/v1\/projects\/([^/]+)\/([^/]+)$/.exec(path);
+      if (envDetail && method === "GET") {
+        const name = envDetail[2];
+        if (!environments.includes(name))
+          return new Response(JSON.stringify({ message: "Not found." }), {
+            status: 404,
+          });
+        return new Response(
+          JSON.stringify({
+            id: 1,
+            name,
+            project_id: 1,
+            description: "",
+            applications: holds[name] ?? [],
+            postgresqls: [],
+            redis: [],
+            services: [],
+          }),
+          { status: 200 },
+        );
+      }
       if (path === "/api/v1/applications/private-github-app") {
         // Coolify's actual rule, and the whole of #38: a create names an
         // environment, and an environment that is not there is a 404. Without
@@ -488,14 +547,21 @@ describe("buildExecutor createResource (environment reconcile)", () => {
     envDiffs: [],
   };
 
-  function exec(fetchImpl: typeof fetch) {
+  // envName is a parameter because #40's third guard is about it: an environment
+  // named `production` is Coolify's leftover default in every run EXCEPT the one
+  // that asked for `--environment production`, where it is the environment
+  // everything is about to live in.
+  function exec(fetchImpl: typeof fetch, envName = "prod") {
     return buildExecutor(
       new CoolifyClient("https://coolify.test", "tok", fetchImpl),
       {
         projectName: "widget",
-        envName: "prod",
+        envName,
         serverUuid: "srv-1",
         githubAppUuid: "gh-1",
+        serverName: "prod-box",
+        orgRepo: "acme/widget",
+        bindingEnv: "prod",
         backupSchedules: {},
       },
     );
@@ -574,6 +640,250 @@ describe("buildExecutor createResource (environment reconcile)", () => {
     expect(
       coolify.calls.filter((c) => c === "POST /api/v1/projects").length,
     ).toBe(1);
+  });
+
+  // #40: what #39 left behind. POST /projects hands the new project Coolify's own
+  // default environment, and #39 then created OURS beside it — so every project cast
+  // creates from nothing carried a permanently-empty `production` next to the
+  // environment everything actually lives in. That is the shape that makes a box
+  // unreadable later; the box being migrated away from has an empty `production` and
+  // runs everything in `staging`, and "the obvious guess is the wrong one" is a note
+  // we had to write for ourselves.
+  //
+  // This is also the ONE delete cast performs, so the guards are the test: it happens
+  // only to a project cast made in this run, only to an environment that is empty, and
+  // only when the name is not the one we asked for.
+  describe("buildExecutor createResource (default environment removal, #40)", () => {
+    const DELETE_DEFAULT =
+      "DELETE /api/v1/projects/proj-new/environments/production";
+
+    it("removes the empty default environment from a project it just created", async () => {
+      const coolify = fakeCoolify({ projects: [] });
+      const notes = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const uuid = await exec(coolify.fetchImpl).createResource(app);
+
+      expect(uuid).toBe("app-1");
+      expect(coolify.calls).toContain(DELETE_DEFAULT);
+      // The point of the whole issue: what is left is ours, and only ours.
+      expect(coolify.environments()).toEqual(["prod"]);
+      expect(notes.mock.calls.flat().join("\n")).toMatch(
+        /removed Coolify's default environment production/,
+      );
+      notes.mockRestore();
+    });
+
+    // Guard 1. The rule cast does not get to break: a project someone built by hand
+    // is not cast's to tidy, whatever it happens to carry. `production` sitting empty
+    // next to `staging` on an ADOPTED project is exactly the live box we migrate from
+    // — and it stays untouched.
+    it("never removes an environment from a project it adopted", async () => {
+      const coolify = fakeCoolify({
+        projects: [{ uuid: "proj-1", name: "widget" }],
+        environments: ["production", "prod"],
+      });
+
+      await exec(coolify.fetchImpl).createResource(app);
+
+      expect(coolify.calls.some((c) => c.startsWith("DELETE"))).toBe(false);
+      expect(coolify.environments()).toContain("production");
+    });
+
+    // Guard 2. Asked of Coolify, not inferred from "we just made this project". The
+    // mock is lying here — a fresh project cannot hold an application — and it must
+    // be able to, because a guard that is only ever handed the safe case is not a
+    // guard. cast declines, and says why.
+    it("leaves the default environment alone when it holds anything", async () => {
+      const coolify = fakeCoolify({
+        projects: [],
+        holds: { production: [{ uuid: "app-x", name: "legacy" }] },
+      });
+      const notes = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await exec(coolify.fetchImpl).createResource(app);
+
+      expect(coolify.calls.some((c) => c.startsWith("DELETE"))).toBe(false);
+      expect(coolify.environments()).toContain("production");
+      expect(notes.mock.calls.flat().join("\n")).toMatch(
+        /left Coolify's default environment production .* NOT empty/,
+      );
+      notes.mockRestore();
+    });
+
+    // Guard 3. `production` is a leftover in every run except the one that asked for
+    // it, where it is the environment everything is about to live in. Deleting it
+    // there would delete the target of the very apply doing the deleting.
+    it("keeps the default environment when it is the one we asked for", async () => {
+      const coolify = fakeCoolify({ projects: [] });
+
+      await exec(coolify.fetchImpl, "production").createResource(app);
+
+      expect(coolify.calls.some((c) => c.startsWith("DELETE"))).toBe(false);
+      expect(coolify.environments()).toEqual(["production"]);
+      // ...and it was never re-created either: it was already there.
+      expect(coolify.calls).not.toContain(
+        "POST /api/v1/projects/proj-new/environments",
+      );
+    });
+
+    // Tidying is a courtesy, and a courtesy that can fail an apply is not one. The
+    // resource still gets created; the operator is told what was left behind.
+    it("does not fail the apply when the delete fails", async () => {
+      const coolify = fakeCoolify({ projects: [], envDeleteStatus: 500 });
+      const notes = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const uuid = await exec(coolify.fetchImpl).createResource(app);
+
+      expect(uuid).toBe("app-1");
+      expect(coolify.environments()).toContain("production");
+      expect(notes.mock.calls.flat().join("\n")).toMatch(
+        /could not remove it .*500/s,
+      );
+      notes.mockRestore();
+    });
+  });
+});
+
+// #41: a first apply against a server with more than one destination 400s on the
+// first create — with the project and the environment already made. Coolify's own
+// message names neither the remedy nor the file it goes in, and cast cannot
+// pre-flight the condition (4.1.2 serves no destinations API at all, so a server's
+// destination count is unknowable until a create has been attempted). The diagnosis
+// is the whole of what is fixable, so the diagnosis is what is tested.
+describe("buildExecutor createResource (multi-destination 400, #41)", () => {
+  const app = {
+    kind: "application" as const,
+    name: "core",
+    op: "create" as const,
+    fieldDiffs: [
+      { field: "build_pack", desired: "nixpacks", updatable: false },
+    ],
+    envDiffs: [],
+  };
+
+  // Coolify's real answer, verbatim, from all three create controllers.
+  function multiDestinationCoolify() {
+    return vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      const method = init?.method ?? "GET";
+      if (path === "/api/v1/projects" && method === "GET")
+        return new Response(
+          JSON.stringify([{ uuid: "proj-1", name: "widget" }]),
+          { status: 200 },
+        );
+      if (path === "/api/v1/projects/proj-1/environments" && method === "GET")
+        return new Response(JSON.stringify([{ name: "prod" }]), {
+          status: 200,
+        });
+      return new Response(
+        JSON.stringify({
+          message:
+            "Server has multiple destinations and you do not set destination_uuid.",
+        }),
+        { status: 400 },
+      );
+    }) as unknown as typeof fetch;
+  }
+
+  const exec = (fetchImpl: typeof fetch) =>
+    buildExecutor(new CoolifyClient("https://coolify.test", "tok", fetchImpl), {
+      projectName: "widget",
+      envName: "prod",
+      serverUuid: "srv-1",
+      githubAppUuid: "gh-1",
+      // The names the message has to be able to say back. None is on the wire:
+      // Coolify knows srv-1, the operator wrote prod-box.
+      serverName: "prod-box",
+      orgRepo: "heavy-duty/incubator",
+      bindingEnv: "prod",
+      backupSchedules: {},
+    });
+
+  const kinds = [
+    { label: "application", change: app },
+    {
+      label: "database",
+      change: {
+        kind: "database" as const,
+        name: "postgres",
+        op: "create" as const,
+        fieldDiffs: [
+          { field: "type", desired: "postgresql", updatable: false },
+        ],
+        envDiffs: [],
+      },
+    },
+    {
+      label: "service",
+      change: {
+        kind: "service" as const,
+        name: "umami",
+        op: "create" as const,
+        fieldDiffs: [{ field: "type", desired: "umami", updatable: false }],
+        envDiffs: [],
+      },
+    },
+  ];
+
+  // Every kind, because which one 400s first depends only on the order of the
+  // manifest — Coolify runs the same destination logic in all three controllers.
+  it.each(kinds)(
+    "answers the $label 400 with the state-file path the UUID goes in",
+    async ({ change }) => {
+      const err = await exec(multiDestinationCoolify())
+        .createResource(change)
+        .catch((e: Error) => e);
+
+      expect(err).toBeInstanceOf(Error);
+      const message = (err as Error).message;
+      // The remedy: the exact key, in the exact place, with the repo and the env
+      // the operator actually named.
+      expect(message).toContain(
+        "environments.prod.projects.heavy-duty/incubator.destination_uuid",
+      );
+      // The server, by the name the operator wrote — not srv-1.
+      expect(message).toContain("prod-box has multiple destinations");
+      // Which resource it died on, so a half-applied run can be read.
+      expect(message).toContain(`cannot create ${change.kind} ${change.name}`);
+      // Create-time: the part that decides whether they can fix this with an
+      // apply (they cannot) or a delete + recreate (they must).
+      expect(message).toMatch(/cannot be moved between networks later/);
+      // Coolify's own words survive — a translation that hides the original
+      // makes the next person's search fail.
+      expect(message).toContain(
+        "Server has multiple destinations and you do not set destination_uuid.",
+      );
+    },
+  );
+
+  // The translation must be about THIS 400, not about 400s. A create rejected for
+  // any other reason has to arrive unmolested, or the next bug gets a confident
+  // answer about a destination it has nothing to do with.
+  it("leaves every other failure exactly as Coolify sent it", async () => {
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      const method = init?.method ?? "GET";
+      if (path === "/api/v1/projects" && method === "GET")
+        return new Response(
+          JSON.stringify([{ uuid: "proj-1", name: "widget" }]),
+          { status: 200 },
+        );
+      if (path === "/api/v1/projects/proj-1/environments" && method === "GET")
+        return new Response(JSON.stringify([{ name: "prod" }]), {
+          status: 200,
+        });
+      return new Response(
+        JSON.stringify({ message: "The name field is required." }),
+        { status: 422 },
+      );
+    }) as unknown as typeof fetch;
+
+    const err = await exec(fetchImpl)
+      .createResource(app)
+      .catch((e: Error) => e);
+
+    expect((err as Error).message).toContain("The name field is required.");
+    expect((err as Error).message).not.toMatch(/destination/);
   });
 });
 

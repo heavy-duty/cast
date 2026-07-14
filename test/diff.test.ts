@@ -186,13 +186,42 @@ describe("renderDiff placement", () => {
 
   // The whole reason placement is in the report at all: a destination that read
   // back as absent rather than wrong is the failure shape #12/#14/#17/#18 are
-  // about. Silence is the bug — but so is noise on the happy path.
-  it("stays silent about placement when nothing is declared and nothing is split", () => {
+  // about.
+  //
+  // This test used to assert the opposite — that an undeclared, unsplit box says
+  // NOTHING about placement, on the grounds that a line on every diff is how a
+  // report stops being read. #41 reversed it. Declaring nothing is not the absence
+  // of a placement decision, it is a placement decision: cast sends no
+  // destination_uuid and Coolify picks. Leaving that inference in a source comment
+  // is what made it invisible until the day it was wrong — a first apply against a
+  // multi-destination server, 400ing after the run had already created the project
+  // and the environment. It is a fact about what the next create will do, so it is
+  // on screen while it is still true.
+  it("says out loud that an undeclared placement is the server's default", () => {
     const out = renderDiff(
       computeDiff([want("a")], [got("a", 3)], "structural"),
     );
-    expect(out).not.toMatch(/placement/);
+    expect(out).toMatch(
+      /placement: server's default destination \(none declared\)/,
+    );
+    // ...and the consequence, which is the only part that can hurt: on a server
+    // with more than one destination this is not a default, it is a 400.
+    expect(out).toMatch(/refuses the create/);
+    // Still clean: an undeclared destination is an assumption, not drift.
     expect(out).toContain("clean");
+  });
+
+  // The claim above is about the UNDECLARED case only. A declared destination
+  // makes the opposite statement (it was sent, and cannot be verified) and must
+  // never make both.
+  it("does not call a declared destination the server's default", () => {
+    const out = renderDiff(
+      computeDiff([want("a")], [got("a", 3)], "structural", {
+        declaredDestination: "dest-abc",
+      }),
+    );
+    expect(out).toMatch(/NOT compared/);
+    expect(out).not.toMatch(/none declared/);
   });
 
   it("names every resource on each side of a split", () => {

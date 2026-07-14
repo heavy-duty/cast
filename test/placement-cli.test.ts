@@ -219,14 +219,21 @@ describe("cast diff — placement (#21)", () => {
     expect(r.output).not.toMatch(/NOT compared/);
   });
 
-  // The state of every box today: one project, one server, one network, nothing
-  // declared. Placement must be silent — a line on every diff that says nothing
-  // is how a report stops being read.
-  it("says nothing at all about placement on an undeclared, unsplit box", async () => {
+  // The state of most boxes today: one project, one server, one network, nothing
+  // declared. This used to assert silence. #41 made it speak: an undeclared
+  // destination is cast choosing to let Coolify pick, and a run says which network
+  // its creates land on rather than leaving it to be inferred from a blank space.
+  // The clean exit is the part that must not move — an assumption is not drift.
+  it("names the assumption on an undeclared, unsplit box, and stays clean", async () => {
     const f = fixture((await stubCoolify({ core: 5, landing: 5 })).url);
     const r = await run(base(f));
     expect(r.code).toBe(0);
-    expect(r.output).not.toMatch(/placement/);
+    expect(r.output).toMatch(
+      /placement: server's default destination \(none declared\)/,
+    );
     expect(r.output).toContain("clean");
+    // The declared-destination warning is the other branch, and belongs to a run
+    // that declared one. Saying both would be saying nothing.
+    expect(r.output).not.toMatch(/NOT compared/);
   });
 });

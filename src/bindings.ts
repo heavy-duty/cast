@@ -125,6 +125,27 @@ const BindingsSchema = z
           // assertEnvVarPolicy). Operator-owned guard: prod typically bans
           // whatever family of flags enables destructive tooling.
           forbidden_var_patterns: z.array(z.string()).optional(),
+          // THE DESTROY INTERLOCK (#43). Absent means `cast destroy` REFUSES —
+          // and absent is the default, forever, on every environment nobody has
+          // deliberately opened.
+          //
+          // It is a binding and not a flag because a flag is not a gate. `--yes`
+          // is a thing you type without reading, and by the second week it is in
+          // the shell history above the command it was meant to guard. This is a
+          // line a human edits, commits, and merges — and the cutover checklist
+          // deletes it the moment the environment carries real data, after which
+          // destroying that environment costs a PR against the state repo. That is
+          // the correct amount of friction for a verb that ends companies.
+          //
+          // It lives HERE, in private state, next to forbidden_var_patterns, for
+          // exactly the reason that one does: a change on one side must not be
+          // able to lower its own guard. The manifest is a PR against the product
+          // repo; the permission to delete that product's production is not.
+          //
+          // Optional, and read ONLY by destroy (bindings written before it existed
+          // keep loading, and refuse — which is the right answer for a state file
+          // that has never heard of the verb).
+          destroy_allowed: z.boolean().optional(),
           // Per-project state, keyed by repo. Optional: an environment whose
           // server hosts one project needs none of it.
           projects: z.record(ProjectBindingSchema).optional(),

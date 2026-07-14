@@ -204,6 +204,84 @@ export class CoolifyClient {
     );
   }
 
+  // Coolify refuses this itself while the project still holds anything —
+  // `{"message":"Project has resources, so it cannot be deleted."}`, 400
+  // (ProjectController@delete_project, v4.1.2, `if (! $project->isEmpty())`,
+  // where isEmpty() counts every resource in every environment of the project).
+  // `cast destroy --with-project` refuses first and for the same reason, before
+  // it asks for the confirmation — see destroy.ts renderProjectNotEmptiable.
+  async deleteProject(projectUuid: string): Promise<void> {
+    await this.delete_(`/projects/${projectUuid}`);
+  }
+
+  // Every backup CONFIGURATION for a database, with its executions.
+  //
+  // One call answers both halves of the only question that matters at a destroy
+  // prompt — is this database backed up, and did a backup ever actually land —
+  // because the route eager-loads them:
+  // `ScheduledDatabaseBackup::…->with('executions')->where('database_id', …)->get()`
+  // (DatabasesController@database_backup_details_uuid, v4.1.2). The separate
+  // `.../backups/{uuid}/executions` route exists and is not needed here.
+  //
+  // Returned RAW. destroy.ts's readBackupState is the one place that decides what
+  // a shape means, because the vendored OpenAPI documents this response as the
+  // string "Content is very complex. Will be implemented later." and a shape cast
+  // cannot read has to become "unknown", never "none".
+  async databaseBackups(uuid: string): Promise<unknown> {
+    return this.get(`/databases/${encodeURIComponent(uuid)}/backups`);
+  }
+
+  // What a Coolify DELETE removes, made explicit rather than inherited.
+  //
+  // All four are query parameters on DELETE /applications|databases|services/{uuid},
+  // and ALL FOUR DEFAULT TO TRUE — the controller reads them with
+  // `$request->boolean('delete_volumes', true)` and hands them to DeleteResourceJob
+  // ({Applications,Databases,Services}Controller@delete_by_uuid, v4.1.2). cast sends
+  // them anyway: a default is a thing the vendor gets to change, and three of these
+  // decide whether an operator's data still exists afterwards.
+  //
+  //   delete_volumes=true            the resource's Docker volumes are removed
+  //                                  (Application::deleteVolumes → `docker volume rm -f`,
+  //                                  or `docker compose down -v` for a compose app; the
+  //                                  persistent-storage rows go with them). THIS is what
+  //                                  makes a database delete unrecoverable, and it is why
+  //                                  the plan prints a backup line for every database.
+  //   delete_connected_networks=true removes the resource's OWN network — literally
+  //                                  `docker network disconnect {uuid} coolify-proxy` and
+  //                                  `docker network rm {uuid}` (Application::deleteConnectedNetworks,
+  //                                  v4.1.2). The name is the resource's uuid, so this is
+  //                                  NOT the shared destination network the rest of the box
+  //                                  hangs off — a multi-project server keeps its network,
+  //                                  and the two other projects on it keep running. Left at
+  //                                  false it would leak a dead network per resource.
+  //   delete_configurations=true     removes the resource's config directory on the server.
+  //   docker_cleanup=FALSE           and this one is deliberately OFF. It is not scoped to
+  //                                  the resource at all: it dispatches CleanupDocker against
+  //                                  the SERVER — `docker container prune`, an image prune,
+  //                                  `docker builder prune -af` (Actions/Server/CleanupDocker,
+  //                                  v4.1.2) — across every project on that box. The boxes in
+  //                                  this fleet are multi-project by design and one of them
+  //                                  hosts third-party production. A teardown of our project
+  //                                  does not get to prune somebody else's build cache. Coolify
+  //                                  runs its own scheduled cleanup; it does not need ours.
+  static readonly DELETE_RESOURCE_QUERY =
+    "delete_volumes=true&delete_connected_networks=true&delete_configurations=true&docker_cleanup=false";
+
+  // The DELETE itself. It ANSWERS BEFORE IT ACTS: the controller dispatches a
+  // DeleteResourceJob onto the `high` queue and returns 200 "…deletion request
+  // queued." So a 2xx here means "Coolify accepted the deletion", not "the
+  // resource is gone" — which is exactly why --with-project waits for the
+  // environment to actually read back empty before it deletes anything else.
+  async deleteResource(
+    kind: "application" | "database" | "service",
+    uuid: string,
+  ): Promise<void> {
+    const base = kind === "database" ? "databases" : `${kind}s`;
+    await this.delete_(
+      `/${base}/${encodeURIComponent(uuid)}?${CoolifyClient.DELETE_RESOURCE_QUERY}`,
+    );
+  }
+
   async deploy(uuid: string): Promise<void> {
     await this.post(`/deploy?uuid=${encodeURIComponent(uuid)}`);
   }

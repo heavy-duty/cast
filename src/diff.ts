@@ -1,4 +1,5 @@
 import type { ResolvedEnv } from "./envtemplate.js";
+import { isReservedEnvName, reservedConsequence } from "./reserved.js";
 
 export type ResourceKind = "application" | "database" | "service";
 export type Desired = {
@@ -63,10 +64,29 @@ export type Placement = {
   split: boolean;
 };
 
+// A reserved name (SOURCE_COMMIT, COOLIFY_*) found on a LIVE resource.
+//
+// NOT an orphan var, and the distinction is the whole point of this type. An
+// orphan var is a live-only var the manifest does not declare, and its
+// documented disposition is "apply never removes these; read them by eye" —
+// cosmetic residue, filed under a heading that invites being read past. A
+// reserved name is not residue: it is an ACTIVE SUPPRESSION of a value Coolify
+// would otherwise inject (see reserved.ts), it is the difference between
+// /version reporting a commit and reporting "unknown", and it is never
+// cosmetic. So it comes out of that list and is reported as a finding, with the
+// consequence attached.
+//
+// `apply never deletes` still holds, unchanged: cast reports it, a human deletes
+// it in the Coolify UI.
+export type ReservedVar = { kind: ResourceKind; name: string; key: string };
+
 export type DiffReport = {
   mode: "structural" | "full";
   changes: Change[];
   orphans: { kind: ResourceKind; name: string; uuid: string }[];
+  // Findings, not drift-to-repair. Never empty in structural mode by accident:
+  // structural mode reads no env vars at all, so it can find none — and says so.
+  reserved: ReservedVar[];
   placement: Placement;
   clean: boolean;
 };
@@ -92,10 +112,32 @@ function diffEnv(
       diffs.push({ key, state: "change", secret: v.secret });
   }
   for (const key of Object.keys(live)) {
-    if (!(key in desired.vars))
+    // A reserved name is deliberately NOT a remove-candidate: it is collected
+    // separately, as a finding (see ReservedVar). Leaving it here as well would
+    // report the same var twice under two headings, one of which says it is
+    // harmless. It also cannot be an `add`/`change`: the manifest side can never
+    // declare one — resolve.ts refuses the run first.
+    if (!(key in desired.vars) && !isReservedEnvName(key))
       diffs.push({ key, state: "remove-candidate", secret: false });
   }
   return diffs;
+}
+
+// Read off the LIVE side, and off every live resource — not only the ones the
+// manifest declares. A reserved name suppresses Coolify's injection on the box
+// whether or not cast has ever heard of the resource carrying it, so scanning
+// `changes` (which exists only for declared resources) would miss it on exactly
+// the resource nobody is watching. Empty in structural mode, where no env var
+// was read at all.
+function reservedVars(live: Live[]): ReservedVar[] {
+  const found: ReservedVar[] = [];
+  for (const l of live) {
+    for (const key of Object.keys(l.env ?? {})) {
+      if (isReservedEnvName(key))
+        found.push({ kind: l.kind, name: l.name, key });
+    }
+  }
+  return found;
 }
 
 function computePlacement(live: Live[], declared?: string): Placement {
@@ -175,15 +217,26 @@ export function computeDiff(
     .filter((l) => !desired.some((d) => d.kind === l.kind && d.name === l.name))
     .map((l) => ({ kind: l.kind, name: l.name, uuid: l.uuid }));
   const placement = computePlacement(live, opts.declaredDestination);
+  const reserved = reservedVars(live);
   return {
     mode,
     changes,
     orphans,
+    reserved,
     placement,
     // A split project is drift, and drift is not clean — the same disposition
     // as an orphan: reported, counted, and NOT repaired (apply moves nothing
     // between networks; see renderDiff).
-    clean: changes.length === 0 && orphans.length === 0 && !placement.split,
+    //
+    // A reserved name is not clean either, and for a stronger reason than drift:
+    // it is a live defect. The box it sits on is deploying green and reporting
+    // the wrong commit, and a `diff` that answered "clean" over it would be the
+    // last chance anyone had to notice.
+    clean:
+      changes.length === 0 &&
+      orphans.length === 0 &&
+      reserved.length === 0 &&
+      !placement.split,
   };
 }
 
@@ -213,6 +266,19 @@ export function renderDiff(report: DiffReport): string {
   for (const o of report.orphans) {
     lines.push(
       `orphan ${o.kind} ${o.name} (live, not in manifest — removal is a manual runbook act)`,
+    );
+  }
+  // Printed as a FINDING, in its own paragraph, with the consequence attached —
+  // not as a one-line entry in a list of things that are fine. The failure this
+  // catches is green: the deploy worked, the health check passed, and this line
+  // is the only place anything says otherwise. It has to be readable as an
+  // instruction to go and delete something, because that is what it is.
+  for (const r of report.reserved) {
+    lines.push(
+      `FINDING: ${r.kind} ${r.name} carries env var ${r.key} — DELETE IT (Coolify UI)`,
+      `  ${reservedConsequence(r.key)}`,
+      "  cast declares no such var and never will (it refuses a manifest that does),",
+      "  and `apply` never deletes — so this one is yours to remove, by hand, in the UI.",
     );
   }
   const { placement } = report;
@@ -269,8 +335,10 @@ export function renderDiff(report: DiffReport): string {
     report.clean
       ? "clean"
       : `${report.changes.length} change(s), ${report.orphans.length} orphan(s)${
-          placement.split ? ", split placement" : ""
-        }`,
+          report.reserved.length > 0
+            ? `, ${report.reserved.length} reserved-name FINDING(s)`
+            : ""
+        }${placement.split ? ", split placement" : ""}`,
   );
   return lines.join("\n");
 }

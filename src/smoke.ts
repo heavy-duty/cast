@@ -1,11 +1,29 @@
 import type { CoolifyClient } from "./coolify.js";
+import { assertNoReservedEnvNames, reservedHits } from "./reserved.js";
+
+// smoke writes env vars onto a REAL application — the one thing in cast that
+// mutates a live resource purely to learn something. So the reserved-name rule
+// binds it too, and these are the two names it may pick from.
+//
+// Exported, and asserted below, because the rule is about what cast writes, not
+// about what one function happens to have been written to write today: an
+// operator renaming a probe (`COOLIFY_SMOKE_PROBE` reads like the natural name)
+// would otherwise set the very trap this rule exists to prevent, on a live app,
+// and the smoke would pass while suppressing the app's SOURCE_COMMIT injection
+// for as long as the probe lived — and the delete at the end restores nothing:
+// Coolify only injects at deploy time.
+export const SMOKE_KEEP_KEY = "INFRA_SMOKE_KEEP";
+export const SMOKE_PROBE_KEY = "INFRA_SMOKE_PROBE";
 
 export async function smoke(
   client: CoolifyClient,
   targetAppUuid: string,
 ): Promise<void> {
-  const KEEP_KEY = "INFRA_SMOKE_KEEP";
-  const PROBE_KEY = "INFRA_SMOKE_PROBE";
+  const KEEP_KEY = SMOKE_KEEP_KEY;
+  const PROBE_KEY = SMOKE_PROBE_KEY;
+  assertNoReservedEnvNames(
+    reservedHits(`smoke probe on ${targetAppUuid}`, [KEEP_KEY, PROBE_KEY]),
+  );
   const envsPath = `/applications/${targetAppUuid}/envs`;
   type EnvVar = {
     key: string;

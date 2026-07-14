@@ -1,3 +1,4 @@
+import { assertNoReservedEnvNames, isReservedEnvName } from "./reserved.js";
 import type { RequiredSecret } from "./resolve.js";
 
 // What the manifest writes for a provider-generated name. Not the source box's
@@ -108,6 +109,18 @@ export function classify(
   live: LiveEnvs,
   overrides: Record<string, string>,
 ): Classification {
+  // The reserved-name rule, once more at the file (reserved.ts). Unreachable
+  // through the CLI — `requiredSecrets` refuses a manifest declaring one before
+  // capture is ever called — and kept anyway: it is the invariant, not the check
+  // that happens to enforce it today, and the next caller of classify will not
+  // have read resolve.ts. Captured, a SOURCE_COMMIT would put the source box's
+  // (usually empty) value into the age store, under a name a template already
+  // refers to — the trap laundered through the one artifact nobody can read.
+  assertNoReservedEnvNames(
+    required
+      .filter((r) => isReservedEnvName(r.key))
+      .map(({ resource, key }) => ({ resource, key })),
+  );
   const generatedSet = new Set(generated);
   const plan: Disposition[] = [];
   const missing: Classification["missing"] = [];

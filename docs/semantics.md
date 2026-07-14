@@ -218,6 +218,60 @@ softened by an implementation detail):
   of value** — "off" means absent, not `false` (see the README). `apply` also
   refuses `--path` combined with `--env prod`: prod always reads the default
   branch, so a feature-branch checkout can never reach it.
+- **Reserved names:** cast never writes `SOURCE_COMMIT` or a `COOLIFY_*` var,
+  under any manifest, in any environment. See below.
+
+## Reserved env var names (`SOURCE_COMMIT`, `COOLIFY_*`)
+
+Coolify injects a set of values into an application's runtime environment
+itself — `SOURCE_COMMIT`, and the `COOLIFY_*` family (`COOLIFY_URL`,
+`COOLIFY_FQDN`, `COOLIFY_BRANCH`, `COOLIFY_RESOURCE_UUID`,
+`COOLIFY_CONTAINER_NAME`) — and it does so behind one guard
+(`app/Jobs/ApplicationDeploymentJob.php`, v4.1.2):
+
+```php
+if ($this->application->environment_variables->where('key', 'SOURCE_COMMIT')->isEmpty()) {
+    $coolify_envs->put('SOURCE_COMMIT', $this->commit);
+}
+```
+
+**Coolify skips its own injection of a name when the resource already carries an
+env var of that name.** So a resource-level `SOURCE_COMMIT` does not merely fail
+to help — it **suppresses** the value Coolify would otherwise have provided. An
+**empty** one suppresses it exactly as completely: `isEmpty()` is asked of the
+*collection of vars*, never of the value. Presence, not value — the same rule
+`forbidden_var_patterns` holds to, for the same reason.
+
+And it **fails green**. The deploy succeeds, the health check passes, the
+container runs, and the only symptom is that `/version` — which reads
+`process.env.SOURCE_COMMIT` at request time, and which a production cutover is
+gated on — reports `unknown`.
+
+Anything that writes env vars can set that trap, and cast is a thing that writes
+env vars. So the rule is applied at **every** place cast touches one:
+
+| verb | behavior |
+| --- | --- |
+| `apply` / `diff` / `capture` / `inventory` | **refuse.** Any manifest read whose env template declares a reserved name fails the run, before any write, naming the var and the consequence. |
+| `inventory --emit-draft` | **never copies one.** A reserved name read off a live box is dispositioned `suppressed`: kept out of the emitted template *and* out of the age store, its live value read into no artifact, and named in `UNCAPTURED.md` with the reason. |
+| `diff` | **a finding, not an orphan var.** A reserved name on a live resource is *not* filed under `remove-candidate` ("apply never removes these; read them by eye"). It is not cosmetic residue — it is an active suppression — so it prints as a `FINDING`, with the consequence, and the report is **not clean**. |
+| `smoke` | its probe vars are asserted to be outside the reserved space. |
+
+Two things this rule is **not**:
+
+- It is **not** `forbidden_var_patterns`. That one is *policy* — an environment's
+  own choice about its own vars — and it lives in the operator's private state
+  precisely so that a product-side change cannot lower its own guard. This one is
+  a **fact about Coolify**: true on every box, in every environment, for every
+  project. There is no environment in which declaring `SOURCE_COMMIT` is correct,
+  so there is no file in which it can be permitted. It lives in cast's code.
+- It is **not** a deletion. `apply never deletes` holds unchanged: on a live box
+  that already carries one, cast **reports** it and a human removes it in the
+  Coolify UI.
+
+Nothing here applies to cast's own config vars (`COOLIFY_BASE_URL`,
+`COOLIFY_ACCESS_TOKEN`, `COOLIFY_READ_ONLY`): those are read from the operator's
+local instance file and are never written to a resource.
 
 ## The registry (`projects:`)
 
@@ -696,9 +750,11 @@ flat `domains` on a Coolify 4.1.2 service), Basic Auth / custom Traefik labels,
 build and deploy command overrides, backup schedules (not exposed on a database's
 GET — **a rebuild has no backups until you declare them**), database kinds cast
 does not model (MySQL, MariaDB, MongoDB, KeyDB, Dragonfly, ClickHouse — named,
-never silently dropped), env var names a cast template cannot express, and
-applications whose build pack the manifest has no vocabulary for (left *out* of
-the manifest rather than fabricated into the nearest pack).
+never silently dropped), env var names a cast template cannot express, names
+**reserved by the platform** (`SOURCE_COMMIT`, `COOLIFY_*` — suppressed, never
+copied; see [Reserved env var names](#reserved-env-var-names-source_commit-coolify_)),
+and applications whose build pack the manifest has no vocabulary for (left *out*
+of the manifest rather than fabricated into the nearest pack).
 
 It also carries the table below, because that is the file someone will be reading
 at the worst possible moment.

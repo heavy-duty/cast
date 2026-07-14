@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { stringify } from "yaml";
 import { GENERATED_PLACEHOLDER } from "./capture.js";
+import { isReservedEnvName, reservedConsequence } from "./reserved.js";
 import { encryptSecrets } from "./secrets.js";
 
 // `inventory` can already SEE a whole instance (#22). This is it writing down
@@ -275,7 +276,26 @@ export type DraftContext = {
   generatedAt: string;
 };
 
-export type Provenance = "captured" | "generated";
+// What the draft did with a name it read off the live box.
+//
+//   captured    — its value went to the store, and a ${REF} to the template.
+//   generated   — provider-generated (see isProviderGenerated): placeheld, value
+//                 not read into any artifact.
+//   suppressed  — reserved by the platform (see reserved.ts): SOURCE_COMMIT,
+//                 COOLIFY_*. Not in the template, not in the store, not
+//                 anywhere — and named in UNCAPTURED.md, because a name cast
+//                 declines to carry has to be said out loud rather than dropped.
+//
+// `suppressed` is the third one because the second was not enough. Before it,
+// isProviderGenerated was the ONLY filter between a live var and a drafted
+// manifest, and it recognizes SERVICE_* and datastore-connection names — nothing
+// else. `SOURCE_COMMIT` splits to [SOURCE, COMMIT]: no SERVICE_ prefix, no
+// datastore word, no connection word. So it was captured verbatim, with its live
+// (usually EMPTY) value, and drafting a working box reproduced in the new box's
+// manifest the exact var that suppresses Coolify's own injection — which the next
+// `apply` would then dutifully write. The draft's whole promise is that it does
+// not carry a box's traps forward.
+export type Provenance = "captured" | "generated" | "suppressed";
 
 export type DraftDisposition = {
   project: string;
@@ -622,6 +642,10 @@ function planSecrets(
       const sites = byKey.get(key) ?? [];
       sites.push({ resource: r.name, value });
       byKey.set(key, sites);
+      // Dispositioned (above — it gets an entry, and a line in the table), but
+      // never templated: a reserved name in an emitted template is the trap
+      // itself, copied forward. See Provenance / reserved.ts.
+      if (isReservedEnvName(key)) continue;
       usable.push([key, ""]);
     }
     if (usable.length > 0) templates.set(r.name, usable);
@@ -632,12 +656,26 @@ function planSecrets(
   const refOf = new Map<string, string>(); // `${resource}::${key}` -> ref
 
   for (const [key, sites] of byKey) {
-    const provenance: Provenance = isProviderGenerated(key)
-      ? "generated"
-      : "captured";
+    const provenance: Provenance = isReservedEnvName(key)
+      ? "suppressed"
+      : isProviderGenerated(key)
+        ? "generated"
+        : "captured";
+    if (provenance === "suppressed") {
+      // Said out loud, in the file that exists precisely so that what cast
+      // declines to carry is stated rather than dropped. The reader is being
+      // told two things: it is not in your draft, AND it is a live bug on the
+      // box you drafted from.
+      uncaptured.push({
+        project: p.name,
+        setting: `env var ${key}`,
+        detail: `${sites.map((s) => `"${s.resource}"`).join(", ")} set ${key} on this box. It is NOT in this draft — not in a template, not in the store, and its live value was not read into any artifact. ${reservedConsequence(key)} Carrying it into the new box's manifest would reproduce that suppression there, and the first \`apply\` would write it; cast refuses a manifest that declares one. Delete it on the source box too (Coolify UI) — it is suppressing the injection there right now.`,
+      });
+    }
     // A provider-generated name is placeheld everywhere it appears, so two
     // resources disagreeing about its value is not a conflict cast has to
-    // resolve — neither value is being carried.
+    // resolve — neither value is being carried. Same for a suppressed one, and
+    // more so: it is not being carried anywhere at all.
     const distinct = new Set(sites.map((s) => s.value));
     const split = provenance === "captured" && distinct.size > 1;
     if (split) {
@@ -668,8 +706,17 @@ function planSecrets(
         // THE line this whole file is bent around: a provider-generated name is
         // placeheld with the same literal `capture` writes, and the source box's
         // value is not written anywhere — not into a template, not into a store,
-        // not into a log.
-        value: provenance === "generated" ? GENERATED_PLACEHOLDER : s.value,
+        // not into a log. A suppressed name gets no value at all: it is not
+        // placeheld, because there is nothing for it to be a placeholder FOR —
+        // the platform supplies it, and the correct manifest says nothing. The
+        // empty string here never reaches an artifact (planDraft drops suppressed
+        // entries from the store), and it must not start to.
+        value:
+          provenance === "generated"
+            ? GENERATED_PLACEHOLDER
+            : provenance === "suppressed"
+              ? ""
+              : s.value,
       });
       if (provenance === "generated" && !generated.includes(ref))
         generated.push(ref);
@@ -865,6 +912,15 @@ export function renderUncaptured(
     "recognize **will have been copied**. The disposition table printed at the end of",
     "the run is the list to read.",
     "",
+    "Names **reserved by the platform** (`SOURCE_COMMIT`, `COOLIFY_*`) were",
+    "**suppressed**: not written to a template, not written to the store, not carried",
+    "at all. Coolify injects those itself at runtime — and it *skips* its own",
+    "injection when the resource already carries a var of that name, so a var of that",
+    "name (even an EMPTY one) suppresses the platform's value, on a deploy that stays",
+    "green. If one is listed above, it is not merely absent from this draft: it is",
+    "doing that, right now, on the box this was read from. Delete it in the Coolify",
+    "UI.",
+    "",
   );
   return lines.join("\n");
 }
@@ -973,8 +1029,13 @@ export function planDraft(
       });
     }
 
+    // Suppressed names never reach the store. A `SOURCE_COMMIT` in it would be
+    // a name waiting for a template to reference it — and the store is the one
+    // artifact a reviewer does not read, because it is encrypted.
     const vars = Object.fromEntries(
-      secrets.dispositions.map((d) => [d.ref, d.value]),
+      secrets.dispositions
+        .filter((d) => d.provenance !== "suppressed")
+        .map((d) => [d.ref, d.value]),
     );
     if (Object.keys(vars).length > 0) {
       stores.push({
@@ -1288,17 +1349,24 @@ export function renderDraftPlan(
         : a.project.localeCompare(b.project),
     )) {
       const note =
-        d.provenance === "generated" ? `  → ${GENERATED_PLACEHOLDER}` : "";
+        d.provenance === "generated"
+          ? `  → ${GENERATED_PLACEHOLDER}`
+          : d.provenance === "suppressed"
+            ? "  → NOT COPIED (Coolify injects this itself)"
+            : "";
       lines.push(
-        `  ${d.ref.padEnd(width)}  ${d.provenance.padEnd(9)}  ${d.sites.join(", ")}${note}`,
+        `  ${d.ref.padEnd(width)}  ${d.provenance.padEnd(10)}  ${d.sites.join(", ")}${note}`,
       );
     }
     const generated = plan.dispositions.filter(
       (d) => d.provenance === "generated",
     ).length;
+    const suppressed = plan.dispositions.filter(
+      (d) => d.provenance === "suppressed",
+    ).length;
     lines.push(
       "",
-      `${plan.dispositions.length} name(s): ${plan.dispositions.length - generated} captured, ${generated} placeheld as provider-generated.`,
+      `${plan.dispositions.length} name(s): ${plan.dispositions.length - generated - suppressed} captured, ${generated} placeheld as provider-generated${suppressed > 0 ? `, ${suppressed} suppressed (reserved by Coolify — and a live bug on the box you drafted from: see UNCAPTURED.md)` : ""}.`,
       "",
       "A placeheld name's LIVE VALUE WAS NOT READ INTO ANY FILE. A DATABASE_URL copied",
       "off this box points at THIS box's Postgres: a rebuilt box carrying it comes up",

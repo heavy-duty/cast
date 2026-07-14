@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { computeDiff, renderDiff } from "../src/diff.js";
+import { GENERATED_PLACEHOLDER } from "../src/capture.js";
+import { computeDiff, placeholderConflicts, renderDiff } from "../src/diff.js";
 
 const desiredApp = {
   kind: "application" as const,
@@ -87,6 +88,157 @@ describe("computeDiff", () => {
       { kind: "service", name: "old-thing", uuid: "u9" },
     ]);
     expect(r.clean).toBe(false);
+  });
+});
+
+// The second pass of the two-pass bootstrap (#47). The store holds the literal
+// `pending-coolify-generated` for a provider-generated secret; once the first
+// apply has run, Coolify holds the real one. Every fixture here is that state.
+const REAL_URL = "postgres://real:secret@db:5432/app";
+const generatedApp = {
+  kind: "application" as const,
+  name: "core-api",
+  fields: {},
+  env: {
+    vars: {
+      // The env var KEY. In the real manifest the store REF behind it is
+      // `DATABASE_URL_PROD` — the two differ, which is why the guard is keyed
+      // on the store's VALUE and not on the `generated_secrets:` name list.
+      DATABASE_URL: { value: GENERATED_PLACEHOLDER, secret: true },
+      PORT: { value: "3000", secret: false },
+    },
+  },
+};
+const liveGenerated = (env: Record<string, string>) => [
+  {
+    kind: "application" as const,
+    name: "core-api",
+    uuid: "u1",
+    fields: {},
+    env,
+  },
+];
+
+describe("computeDiff generated-secret placeholder", () => {
+  it("flags a placeholder-in-store vs real-value-live as a conflict, not a change", () => {
+    const r = computeDiff(
+      [generatedApp],
+      liveGenerated({ DATABASE_URL: REAL_URL, PORT: "3000" }),
+      "full",
+    );
+    expect(r.changes[0].envDiffs).toEqual([
+      { key: "DATABASE_URL", state: "placeholder-conflict", secret: true },
+    ]);
+    expect(r.clean).toBe(false);
+    expect(placeholderConflicts(r)).toEqual([
+      { kind: "application", name: "core-api", key: "DATABASE_URL" },
+    ]);
+  });
+  it("is clean when the live value is the placeholder too (first apply landed, resource not created yet)", () => {
+    const r = computeDiff(
+      [generatedApp],
+      liveGenerated({ DATABASE_URL: GENERATED_PLACEHOLDER, PORT: "3000" }),
+      "full",
+    );
+    expect(r.clean).toBe(true);
+    expect(placeholderConflicts(r)).toEqual([]);
+  });
+  it("is a plain add — not a conflict — when the var is absent live (the FIRST apply's path)", () => {
+    const r = computeDiff(
+      [generatedApp],
+      liveGenerated({ PORT: "3000" }),
+      "full",
+    );
+    expect(r.changes[0].envDiffs).toEqual([
+      { key: "DATABASE_URL", state: "add", secret: true },
+    ]);
+    expect(placeholderConflicts(r)).toEqual([]);
+  });
+  it("is a plain add on a create — Coolify replaces the placeholder when it makes the resource", () => {
+    const r = computeDiff([generatedApp], [], "full");
+    expect(r.changes[0].op).toBe("create");
+    expect(r.changes[0].envDiffs).toContainEqual({
+      key: "DATABASE_URL",
+      state: "add",
+      secret: true,
+    });
+    expect(placeholderConflicts(r)).toEqual([]);
+  });
+  it("leaves an ordinary secret rotation a plain change", () => {
+    const r = computeDiff(
+      [desiredApp],
+      [
+        {
+          kind: "application" as const,
+          name: "core-api",
+          uuid: "u1",
+          fields: { ...desiredApp.fields },
+          env: { PORT: "3000", MAILGUN_KEY: "mk-OLD" },
+        },
+      ],
+      "full",
+    );
+    expect(r.changes[0].envDiffs).toEqual([
+      { key: "MAILGUN_KEY", state: "change", secret: true },
+    ]);
+    expect(placeholderConflicts(r)).toEqual([]);
+  });
+  // A non-secret template literal that happens to read `pending-coolify-generated`
+  // came from the template, not the store — nothing generated it, and writing it
+  // is what the manifest asked for.
+  it("does not flag a non-secret var whose literal value happens to be the placeholder", () => {
+    const r = computeDiff(
+      [
+        {
+          kind: "application" as const,
+          name: "core-api",
+          fields: {},
+          env: {
+            vars: { NOTE: { value: GENERATED_PLACEHOLDER, secret: false } },
+          },
+        },
+      ],
+      liveGenerated({ NOTE: "something-else" }),
+      "full",
+    );
+    expect(r.changes[0].envDiffs).toEqual([
+      { key: "NOTE", state: "change", secret: false },
+    ]);
+    expect(placeholderConflicts(r)).toEqual([]);
+  });
+  it("is invisible to a structural diff, which reads no env at all", () => {
+    const r = computeDiff(
+      [generatedApp],
+      liveGenerated({ DATABASE_URL: REAL_URL }),
+      "structural",
+    );
+    expect(placeholderConflicts(r)).toEqual([]);
+    expect(r.clean).toBe(true);
+  });
+});
+
+describe("renderDiff generated-secret placeholder", () => {
+  it("says it in words no rotation prints, and never prints the live value", () => {
+    const out = renderDiff(
+      computeDiff(
+        [generatedApp],
+        liveGenerated({ DATABASE_URL: REAL_URL, PORT: "3000" }),
+        "full",
+      ),
+    );
+    expect(out).toContain(
+      "secret DATABASE_URL: store holds the generated-secret PLACEHOLDER, live holds a real value — apply would OVERWRITE it",
+    );
+    // The old line — the one a rotation prints — must NOT be what this reports.
+    expect(out).not.toContain("secret DATABASE_URL differs");
+    // Loud in the tail as well: the summary is the line read before typing apply.
+    expect(out).toContain(
+      "1 generated-secret PLACEHOLDER conflict(s) — apply will REFUSE",
+    );
+    // Names the key, never the value — capture's rule (a secret printed to a
+    // terminal is a secret in a scrollback buffer).
+    expect(out).not.toContain(REAL_URL);
+    expect(out).not.toContain("real:secret");
   });
 });
 

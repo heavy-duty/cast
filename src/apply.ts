@@ -1,4 +1,11 @@
-import type { Change, Desired, DiffReport, ResourceKind } from "./diff.js";
+import { GENERATED_PLACEHOLDER } from "./capture.js";
+import {
+  type Change,
+  type Desired,
+  type DiffReport,
+  type ResourceKind,
+  placeholderConflicts,
+} from "./diff.js";
 import type { ResolvedEnv } from "./envtemplate.js";
 
 export type Executor = {
@@ -93,6 +100,38 @@ export async function applyPlan(
   if (report.mode !== "full") {
     throw new Error(
       "apply requires a full diff (session token with read:sensitive) — refusing on a structural report",
+    );
+  }
+  // REFUSED, not warned about. The placeholder is a promise ("Coolify will make
+  // this"), never a value, and writing it over a secret Coolify has since made
+  // is a data-loss write: it takes DATABASE_URL away from every consumer and
+  // then redeploys them onto it. A warning is no guard at all here, because the
+  // plan line it would sit next to is indistinguishable from a routine rotation
+  // — this is the same fail-closed family as the team assert and the absent-
+  // project gate, and for the same reason: a routine command about to do
+  // something irreversible.
+  //
+  // Before ANY resource is touched, like the not-updatable refusal below: an
+  // apply that pulled the database out from under one app and only THEN refused
+  // on the next would be the worst of both outcomes.
+  //
+  // UPDATE-path only, by construction — computeDiff can only raise this against
+  // a live resource (see diffEnv). A create still sends the placeholder, which
+  // is correct: Coolify replaces it when it makes the resource, and that is the
+  // first pass of the bootstrap this guard exists to let you survive twice.
+  const conflicts = placeholderConflicts(report);
+  if (conflicts.length > 0) {
+    throw new Error(
+      [
+        `refusing apply: the store still holds the ${GENERATED_PLACEHOLDER} placeholder for secret(s) whose live value Coolify has already generated:`,
+        // The key and the resource. Never the live value — capture's rule.
+        ...conflicts.map((c) => `  ${c.key} on ${c.kind} ${c.name}`),
+        "",
+        "Writing the store's value would overwrite the real one and break every consumer.",
+        "Fill the store from the live resource first (`cast capture --generated-only`, #48),",
+        "or, if the name is no longer provider-generated, drop it from the manifest's",
+        "`generated_secrets:` and capture its real value.",
+      ].join("\n"),
     );
   }
   // Every change is checked before the first one is acted on — that is the

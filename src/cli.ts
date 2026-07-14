@@ -65,6 +65,7 @@ import {
   renderInventory,
   renderSweep,
 } from "./inventory.js";
+import { assertNoReservedEnvNames, reservedHits } from "./reserved.js";
 import {
   PATH_IN_PROD_REFUSAL,
   desiredFromManifest,
@@ -2113,6 +2114,16 @@ export function buildExecutor(
       await client.patch(`/${base}/${uuid}`, apiFields);
     },
     async syncEnv(uuid, kind, env) {
+      // The reserved-name rule at the wire (reserved.ts). Nothing can reach here
+      // carrying one — resolve.ts refuses the manifest long before a diff, let
+      // alone an apply — and the check is here anyway, because this is the single
+      // function in cast that puts an env var on a Coolify resource, and the
+      // invariant being protected is exactly "cast never writes one". A future
+      // caller of buildExecutor will not have read resolve.ts; the guard it needs
+      // is the one standing where the write happens.
+      assertNoReservedEnvNames(
+        reservedHits(`${kind} ${uuid}`, Object.keys(env.vars)),
+      );
       // Bulk env update is an UPSERT of listed keys, not a full replace —
       // verified against app/Http/Controllers/Api/{Applications,Databases,
       // Services}Controller.php@create_bulk_envs (coollabsio/coolify

@@ -10,6 +10,11 @@ import {
   templateRefs,
 } from "./envtemplate.js";
 import { loadManifest } from "./manifest.js";
+import {
+  type ReservedHit,
+  assertNoReservedEnvNames,
+  reservedHits,
+} from "./reserved.js";
 
 // How cast authenticated (or failed to authenticate) a clone.
 //
@@ -219,6 +224,17 @@ export function requiredSecrets(
     );
   }
   const required: RequiredSecret[] = [];
+  // Reserved names are checked HERE, and in manifestResources, and in
+  // desiredFromManifest — every function in this file that opens an env
+  // template, rather than once in the verb that writes. The rule is a property
+  // of cast, not of `apply`: a template that declares SOURCE_COMMIT is broken
+  // whether the verb about to run is going to write it (`apply`), store its live
+  // value (`capture`), or merely compare it (`diff`, `inventory`). Refusing in
+  // one place and reporting in another would leave `capture` writing a store for
+  // a manifest `apply` will refuse — a green run that guarantees a red one. See
+  // reserved.ts. (Reads ALL template keys, not just the ${…} refs: a bare
+  // `SOURCE_COMMIT=` literal suppresses the injection exactly as well.)
+  const reserved: ReservedHit[] = [];
   const collect = (resource: string, template?: string) => {
     if (!template) return;
     const file = join(checkoutDir, ".infra", "env", template);
@@ -226,7 +242,9 @@ export function requiredSecrets(
       throw new Error(
         `env template missing: ${file} (referenced by ${resource})`,
       );
-    for (const { key, ref } of templateRefs(readFileSync(file, "utf8"))) {
+    const text = readFileSync(file, "utf8");
+    reserved.push(...reservedHits(resource, templateKeys(text)));
+    for (const { key, ref } of templateRefs(text)) {
       required.push({ ref, resource, key });
     }
   };
@@ -236,6 +254,7 @@ export function requiredSecrets(
   for (const [name, svc] of Object.entries(envSpec.services ?? {})) {
     collect(name, svc.env_template);
   }
+  assertNoReservedEnvNames(reserved);
   const generated = envSpec.generated_secrets ?? [];
   // A generated_secrets entry naming something no template refs is dead
   // config — and dead config in THIS list is not merely untidy, it is
@@ -282,6 +301,7 @@ export function manifestResources(
       `environment ${envName} not in manifest (has: ${Object.keys(manifest.environments).join(", ") || "none"})`,
     );
   }
+  const reserved: ReservedHit[] = [];
   const keysOf = (resource: string, template?: string): string[] => {
     if (!template) return [];
     const file = join(checkoutDir, ".infra", "env", template);
@@ -289,9 +309,11 @@ export function manifestResources(
       throw new Error(
         `env template missing: ${file} (referenced by ${resource})`,
       );
-    return templateKeys(readFileSync(file, "utf8"));
+    const keys = templateKeys(readFileSync(file, "utf8"));
+    reserved.push(...reservedHits(resource, keys));
+    return keys;
   };
-  return [
+  const resources = [
     ...Object.entries(envSpec.applications).map(([name, app]) => ({
       kind: "application" as const,
       name,
@@ -308,6 +330,8 @@ export function manifestResources(
       envKeys: keysOf(name, svc.env_template),
     })),
   ];
+  assertNoReservedEnvNames(reserved);
+  return resources;
 }
 
 export function desiredFromManifest(
@@ -332,6 +356,7 @@ export function desiredFromManifest(
     string,
     { frequency: string; retention: number }
   > = {};
+  const reserved: ReservedHit[] = [];
   const resolveEnvFile = (
     name: string,
     template?: string,
@@ -341,6 +366,7 @@ export function desiredFromManifest(
     if (!existsSync(file))
       throw new Error(`env template missing: ${file} (referenced by ${name})`);
     const env = resolveTemplate(readFileSync(file, "utf8"), secrets);
+    reserved.push(...reservedHits(name, Object.keys(env.vars)));
     resolvedEnvs[name] = env;
     return env;
   };
@@ -406,5 +432,9 @@ export function desiredFromManifest(
       env: resolveEnvFile(name, svc.env_template),
     });
   }
+  // Before the caller can diff it, and long before apply can write it: a
+  // resolved env that carries a reserved name is not desired state, it is a
+  // suppression of the platform's own value dressed up as one. See reserved.ts.
+  assertNoReservedEnvNames(reserved);
   return { desired, resolvedEnvs, backupSchedules };
 }

@@ -345,6 +345,34 @@ export function desiredFromManifest(
     return env;
   };
   for (const [name, app] of Object.entries(envSpec.applications)) {
+    if (app.build.pack === "dockercompose") {
+      // Coolify gates the SOURCE_COMMIT *build arg* behind a per-application
+      // setting — `ApplicationSetting.include_source_commit_in_build`, default
+      // false — and in 4.1.2 that setting has NO API surface. Verified against
+      // the v4.1.2 source: it appears in zero API controllers, and both the
+      // create and the PATCH allowlists in ApplicationsController.php (l.914,
+      // l.2368) reject unrecognized keys outright ("This field is not
+      // allowed."), so sending it would fail the whole request rather than be
+      // quietly ignored. Its only writer is the Livewire Advanced tab
+      // (app/Livewire/Project/Application/Advanced.php:128) — i.e. a human, in
+      // the UI. Do NOT add it to `fields` below expecting apply to set it the
+      // way it sets `connect_to_docker_network` (which *is* in the allowlist,
+      // which is why that one works): apply would 422 on every run. Warning is
+      // the only honest move — a manual step the tool knows about and does not
+      // mention is one that gets forgotten, and this one fails green.
+      //
+      // Scope: the toggle gates the BUILD-time arg only. Coolify's *runtime*
+      // injection of SOURCE_COMMIT is unconditional with respect to it
+      // (ApplicationDeploymentJob.php:2949 — `if (! $forBuildTime || ...)`,
+      // which short-circuits true at runtime), so a service that reads
+      // process.env.SOURCE_COMMIT per request does not need this toggle at all.
+      // What *does* silently suppress that runtime value is an application-level
+      // env var of the same name (ApplicationDeploymentJob.php:2950) — a
+      // different bug, tracked separately.
+      console.warn(
+        `application ${name} builds with dockercompose, but apply cannot enable "Include Source Commit in Build" on Coolify 4.1.2 — the setting is absent from the API's field allowlist. If the build consumes SOURCE_COMMIT as a build arg, enable it in the Coolify UI and redeploy; Coolify injects SOURCE_COMMIT at runtime regardless.`,
+      );
+    }
     desired.push({
       kind: "application",
       name,

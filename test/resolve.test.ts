@@ -3,9 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { computeDiff } from "../src/diff.js";
+import { DERIVED_UNRESOLVED } from "../src/envtemplate.js";
 import {
   cloneFailureMessage,
   desiredFromManifest,
+  fillDesiredDerived,
+  requiredSecrets,
   resolveCheckout,
   resolveGitAuth,
 } from "../src/resolve.js";
@@ -469,6 +472,84 @@ environments:
     );
     expect(() => desiredFromManifest(dir, "prod", {})).toThrow(
       /environment prod not in manifest/,
+    );
+  });
+});
+
+describe("derived resource refs (#60)", () => {
+  // A manifest with one app whose template derives a DB URL, plus the database
+  // the ref names. `dbName` and `attr` are knobs the validation cases turn.
+  const write = (
+    ref = "${resource:postgres.url}",
+    dbBlock = "    databases:\n      postgres: { type: postgresql }\n",
+  ): string => {
+    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    mkdirSync(join(dir, ".infra", "env"), { recursive: true });
+    writeFileSync(
+      join(dir, ".infra", "manifest.yaml"),
+      `project: widget
+environments:
+  staging:
+    applications:
+      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: /apps/core }
+        domains: ["http://api.example.com"]
+        env_template: core.staging.env.template
+${dbBlock}`,
+    );
+    writeFileSync(
+      join(dir, ".infra", "env", "core.staging.env.template"),
+      `DATABASE_URL=${ref}\n`,
+    );
+    return dir;
+  };
+
+  it("emits a derived var (unresolved) and does not demand it as a secret", () => {
+    const dir = write();
+    const { desired } = desiredFromManifest(dir, "staging", {});
+    const app = desired.find((d) => d.name === "core");
+    expect(app?.env?.vars.DATABASE_URL).toEqual({
+      value: DERIVED_UNRESOLVED,
+      secret: true,
+      derived: { resource: "postgres", attr: "url" },
+    });
+    // capture's view: it is NOT a required store secret.
+    const req = requiredSecrets(dir, "staging");
+    expect(req.required.map((r) => r.ref)).not.toContain(
+      "resource:postgres.url",
+    );
+    expect(req.required).toHaveLength(0);
+  });
+
+  it("fillDesiredDerived fills it from a URL map keyed by manifest name", () => {
+    const dir = write();
+    const { desired } = desiredFromManifest(dir, "staging", {});
+    const filled = fillDesiredDerived(desired, {
+      postgres: "postgres://u:p@uuid:5432/db",
+    });
+    const app = filled.find((d) => d.name === "core");
+    expect(app?.env?.vars.DATABASE_URL.value).toBe(
+      "postgres://u:p@uuid:5432/db",
+    );
+  });
+
+  it("hard-refuses a ref naming a database the manifest does not declare", () => {
+    // No databases block at all — the ref points at nothing.
+    const dir = write("${resource:postgres.url}", "");
+    expect(() => desiredFromManifest(dir, "staging", {})).toThrow(
+      /no database named postgres/,
+    );
+    // capture refuses it too, in the same voice — every verb that opens a template.
+    expect(() => requiredSecrets(dir, "staging")).toThrow(
+      /no database named postgres/,
+    );
+  });
+
+  it("hard-refuses an attribute other than .url", () => {
+    const dir = write("${resource:postgres.password}");
+    expect(() => desiredFromManifest(dir, "staging", {})).toThrow(
+      /unknown resource attribute/,
     );
   });
 });

@@ -331,6 +331,16 @@ manifest is what knows `DATABASE_URL` comes from a database it declares. (A
 standing over nothing is worse than no guard, because it reads like one.
 `--generated <NAME>` covers a manifest that hasn't declared them yet.)
 
+> **A database's own URL is better *derived* than stored.** If the value is the
+> URL of a database this manifest declares, write `DATABASE_URL=${resource:postgres.url}`
+> in the template instead of storing it. cast reads it back from the database it
+> created — never into the store, never through a terminal — so there is no
+> placeholder, no two-pass dance, and no stored copy to drift or overwrite. A
+> rotated password is simply *followed* on the next apply. `generated_secrets:`
+> and the pass below stay for the residual class — a provider-generated value
+> that genuinely is not derivable. See [semantics.md](docs/semantics.md) →
+> *Derived resource URLs*.
+
 An **`--override`**'s value is read from `$CAST_CAPTURE_<NAME>`, never from the
 command line: argv is visible in `ps` to every process on the box. It exists for
 values that must not survive the copy — staging and prod sharing a Mailgun

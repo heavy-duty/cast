@@ -852,6 +852,75 @@ mutate the encrypted store and hence the git repo — a much bigger blast radius
 a verb people run on a schedule. A separate, explicit, operator-run verb is the
 right first step.
 
+## Derived resource URLs (`${resource:<name>.url}`)
+
+The two-pass bootstrap above **automates** a hand-dance. Derivation **deletes**
+it. A `DATABASE_URL` is not a secret anybody authored — it is a fact about a
+resource cast itself created, readable from the API that created it, at any time,
+for free. So a template can say so directly:
+
+    DATABASE_URL=${resource:postgres.url}
+    REDIS_URL=${resource:redis.url}
+
+`${resource:<name>.url}` resolves to the **internal** URL of a database the same
+manifest environment declares (`connect_to_docker_network` puts apps on the
+Docker network, so it is the internal URL, not the external one). The value is
+read back from the live resource's `internal_db_url` — the same field, on the
+same `GET /projects/{uuid}/{env}` route, that `capture --generated-only` reads —
+**never** stored in the age store, **never** decrypted, **never** printed.
+
+**It is not a secret ref.** `parseTemplate` classifies `${resource:…}` as a
+distinct *derived* var, so `capture` never goes looking for a store name called
+`resource:postgres.url`, and `templateRefs` (the required-secret set) never lists
+it. The age store shrinks to the things a human actually authored.
+
+**Resolved in two places, one function.** `fillDerivedEnv` is the only code that
+turns a ref into a value, and it runs twice against two different URL maps:
+
+- **at diff/apply time**, against the databases that **already exist** on the
+  box. On a re-apply this is the whole story: the app's live `DATABASE_URL`
+  already equals its database's URL, so the derived var shows **no drift** —
+  which is what deletes the `secret DATABASE_URL differs` line the store-copy
+  approach printed on every plan. And if the two have diverged (a password
+  rotated in Coolify), the diff shows it and `apply` **follows** the live
+  database, rather than reverting it to a stale stored copy.
+- **at apply time in the executor**, against a database this same run just
+  created. On a from-nothing apply nothing existed to resolve against at plan
+  time, so the ref rides through the diff unresolved (rendered `DATABASE_URL:
+  derived from database postgres — apply will set it`) and `syncEnv` fills it
+  after the create. `apply` acts databases-before-applications (see *Apply acts
+  in dependency order*), so the database exists by the time the app's env is
+  written.
+
+**The unresolved sentinel is never written.** Until it resolves, a derived var
+carries a sentinel that is not a legal value; the executor **refuses** to write
+one that never resolved, rather than writing a blank — an empty `DATABASE_URL`
+boots every consumer pointed at nothing. Coolify mints a database's credentials
+at create time and `internal_db_url` is a model accessor built from them (not
+from a running container), so the URL is expected the moment the create returns;
+if a given Coolify only publishes it once the container is up, the refusal names
+the app and the database and says to re-run once it is up — and the second run
+resolves it as an ordinary update, because by then the database is live and the
+diff fills it. It is graceful either way, and single-pass in the expected one.
+
+**Validation is at plan time, in the same voice as the dead-`generated_secrets`
+check.** A `${resource:X.url}` naming a database the manifest does not declare, or
+an attribute other than `.url`, is a hard error before any write — refused by
+every verb that opens a template (`apply`, `diff`, `capture`), because a ref that
+resolves against nothing is broken for all of them, not just the one about to
+write.
+
+**Scope.** This covers only databases cast itself declares and creates. It does
+not touch a service that builds its own URL internally from magic vars against
+its *own* bundled database (Coolify's umami is the example): there is no edge for
+the manifest to declare there, and a value of cast's would never be read.
+`generated_secrets:` and the two-pass bootstrap above **remain** for the residual
+class — a provider-generated value that is genuinely not derivable (a service's
+own generated credential). What leaves is `DATABASE_URL` / `REDIS_URL`: they stop
+being store names at all, so the placeholder they held, and the `apply` refusal
+that guarded it, simply cease to exist for them — there is nothing in the store
+to overwrite, and nothing to re-encrypt on a rebuild-from-nothing.
+
 ## Drafts (`inventory --emit-draft`)
 
 `inventory` with no repo sweeps an instance. `--emit-draft <dir>` writes that

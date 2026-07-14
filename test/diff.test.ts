@@ -217,6 +217,66 @@ describe("computeDiff generated-secret placeholder", () => {
   });
 });
 
+describe("derived resource refs (#60)", () => {
+  const DERIVED_URL = "postgres://u:p@pg-uuid:5432/widget";
+  const derivedApp = {
+    kind: "application" as const,
+    name: "core-api",
+    fields: { build_pack: "nixpacks", domains: ["https://api.example.com"] },
+    env: {
+      vars: {
+        DATABASE_URL: {
+          value: DERIVED_URL,
+          secret: true,
+          derived: { resource: "postgres", attr: "url" },
+        },
+      },
+    },
+  };
+  const liveApp = (env: Record<string, string>) => [
+    {
+      kind: "application" as const,
+      name: "core-api",
+      uuid: "u1",
+      fields: { ...derivedApp.fields },
+      env,
+    },
+  ];
+
+  it("is clean when the app's live URL already equals the database's — no perpetual drift", () => {
+    const r = computeDiff(
+      [derivedApp],
+      liveApp({ DATABASE_URL: DERIVED_URL }),
+      "full",
+    );
+    expect(r.clean).toBe(true);
+  });
+
+  it("renders a drift as derived — not as a secret rotation — and never prints the value", () => {
+    const out = renderDiff(
+      computeDiff(
+        [derivedApp],
+        liveApp({ DATABASE_URL: "postgres://old" }),
+        "full",
+      ),
+    );
+    expect(out).toContain(
+      "DATABASE_URL: derived from database postgres — live differs, apply will follow it",
+    );
+    expect(out).not.toContain("secret DATABASE_URL differs");
+    expect(out).not.toContain(DERIVED_URL);
+    expect(out).not.toContain("postgres://old");
+  });
+
+  it("renders a create as a derived add", () => {
+    const out = renderDiff(computeDiff([derivedApp], [], "full"));
+    expect(out).toContain(
+      "DATABASE_URL: derived from database postgres — apply will set it",
+    );
+    expect(out).not.toContain(DERIVED_URL);
+  });
+});
+
 describe("renderDiff generated-secret placeholder", () => {
   it("says it in words no rotation prints, and never prints the live value", () => {
     const out = renderDiff(

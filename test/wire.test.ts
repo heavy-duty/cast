@@ -10,6 +10,7 @@ import {
 } from "../src/cli.js";
 import { CoolifyClient } from "../src/coolify.js";
 import { computeDiff } from "../src/diff.js";
+import { DERIVED_UNRESOLVED } from "../src/envtemplate.js";
 
 // Pure wire-translation helpers (Desired vocabulary <-> Coolify API
 // vocabulary). Importing src/cli.ts here must not run the CLI — see the
@@ -1132,5 +1133,113 @@ describe("buildExecutor backup schedules", () => {
     await expect(
       exec.updateFields("db-1", "database", { backup: schedule }),
     ).rejects.toThrow(/no s3_destination UUID/);
+  });
+});
+
+// The from-nothing half of derived resource URLs (#60): at plan time the
+// database did not exist, so the app's ${resource:postgres.url} is still
+// unresolved when apply goes to write its env. syncEnv reads the URL back from
+// the environment_details route (the database was created earlier in the same
+// apply) and writes the real value — or refuses, rather than writing a blank.
+describe("buildExecutor syncEnv (derived resource URLs, #60)", () => {
+  const ctx = {
+    projectName: "widget",
+    envName: "prod",
+    serverUuid: "srv-1",
+    githubAppUuid: "gh-1",
+    serverName: "prod-box",
+    orgRepo: "acme/widget",
+    bindingEnv: "prod",
+  };
+  const derivedEnv = {
+    vars: {
+      DATABASE_URL: {
+        value: DERIVED_UNRESOLVED,
+        secret: true,
+        derived: { resource: "postgres", attr: "url" as const },
+      },
+    },
+  };
+  const URL_ = "postgres://u:p@pg-uuid:5432/widget";
+
+  // Serves /projects and the environment_details route; records the envs/bulk
+  // write so a test can assert what value landed (or that none did).
+  function box(internalDbUrl?: string) {
+    const bulkBodies: unknown[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/api/v1/projects")
+        return new Response(
+          JSON.stringify([{ uuid: "proj-1", name: "widget" }]),
+          { status: 200 },
+        );
+      if (path === "/api/v1/projects/proj-1/prod")
+        return new Response(
+          JSON.stringify({
+            postgresqls: [
+              internalDbUrl === undefined
+                ? { name: "postgres" }
+                : { name: "postgres", internal_db_url: internalDbUrl },
+            ],
+          }),
+          { status: 200 },
+        );
+      if (path === "/api/v1/applications/app-1/envs/bulk") {
+        bulkBodies.push(JSON.parse(String(init?.body)));
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    return { fetchImpl, bulkBodies };
+  }
+
+  it("resolves the ref from the live database and writes the real URL", async () => {
+    const { fetchImpl, bulkBodies } = box(URL_);
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await exec.syncEnv("app-1", "application", derivedEnv);
+    expect(bulkBodies).toHaveLength(1);
+    expect(bulkBodies[0]).toEqual({
+      data: [
+        {
+          key: "DATABASE_URL",
+          value: URL_,
+          is_buildtime: false,
+          is_preview: false,
+        },
+      ],
+    });
+  });
+
+  it("refuses — and writes nothing — when the database has no URL yet", async () => {
+    const { fetchImpl, bulkBodies } = box(undefined);
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await expect(
+      exec.syncEnv("app-1", "application", derivedEnv),
+    ).rejects.toThrow(/cannot resolve derived env var/);
+    expect(bulkBodies).toHaveLength(0);
+  });
+
+  it("does not read the box at all when there is nothing derived to resolve", async () => {
+    const { fetchImpl, bulkBodies } = box(URL_);
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await exec.syncEnv("app-1", "application", {
+      vars: { PORT: { value: "3000", secret: false } },
+    });
+    // Straight to the write — no /projects lookup for a derived URL.
+    expect(bulkBodies).toHaveLength(1);
+    expect(
+      (
+        fetchImpl as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls.some(([u]) => String(u).endsWith("/projects")),
+    ).toBe(false);
   });
 });

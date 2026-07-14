@@ -137,13 +137,9 @@ environments:
       join(dir, ".infra", "env", "core-api.staging.env.template"),
       "PORT=3000\nMG=${MG}\n",
     );
-    const { desired, resolvedEnvs, backupSchedules } = desiredFromManifest(
-      dir,
-      "staging",
-      {
-        MG: "secret-v",
-      },
-    );
+    const { desired, resolvedEnvs } = desiredFromManifest(dir, "staging", {
+      MG: "secret-v",
+    });
     expect(desired).toHaveLength(1);
     expect(desired[0]).toMatchObject({
       kind: "application",
@@ -162,9 +158,13 @@ environments:
       value: "secret-v",
       secret: true,
     });
-    expect(backupSchedules).toEqual({});
   });
-  it("routes a database backup block into backupSchedules, not fields", () => {
+  // The reverse of what this file used to assert. `backup` was deliberately
+  // routed AROUND `fields` into a side channel, because live Coolify was
+  // believed not to expose a schedule back; it does (GET
+  // /databases/{uuid}/backups), and the side channel is what made a `backup:`
+  // block added to an existing database silently do nothing (#51).
+  it("puts a database backup block in fields, so it is diffed like any other", () => {
     const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
@@ -180,15 +180,34 @@ environments:
         backup: { frequency: "0 3 * * *", retention: 7 }
 `,
     );
-    const { desired, backupSchedules } = desiredFromManifest(
-      dir,
-      "staging",
-      {},
-    );
-    expect(desired[0].fields).toEqual({ type: "postgresql", version: "17" });
-    expect(backupSchedules).toEqual({
-      postgres: { frequency: "0 3 * * *", retention: 7 },
+    const { desired } = desiredFromManifest(dir, "staging", {});
+    expect(desired[0].fields).toEqual({
+      type: "postgresql",
+      version: "17",
+      backup: { frequency: "0 3 * * *", retention: 7 },
     });
+  });
+  it("leaves `backup` out of fields entirely when none is declared", () => {
+    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    mkdirSync(join(dir, ".infra"), { recursive: true });
+    writeFileSync(
+      join(dir, ".infra", "manifest.yaml"),
+      `project: widget
+environments:
+  staging:
+    applications: {}
+    databases:
+      postgres:
+        type: postgresql
+        version: "17"
+`,
+    );
+    const { desired } = desiredFromManifest(dir, "staging", {});
+    expect(desired[0].fields).toEqual({ type: "postgresql", version: "17" });
+    // Undeclared means uncompared, NOT "delete whatever is there": a live
+    // schedule on a database whose manifest says nothing about backups is left
+    // alone, like every other thing apply never removes.
+    expect("backup" in desired[0].fields).toBe(false);
   });
   it("warns when a service declares domains (unhonorable by apply on Coolify 4.1.2)", () => {
     const dir = mkdtempSync(join(tmpdir(), "infra-co-"));

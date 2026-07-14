@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fetchLive, renderAbsentTarget } from "../src/cli.js";
+import { attachBackup, fetchLive, renderAbsentTarget } from "../src/cli.js";
 import { CoolifyClient } from "../src/coolify.js";
 
 // A Coolify that answers GET /projects with `projects`, and
@@ -132,5 +132,112 @@ describe("renderAbsentTarget", () => {
     expect(msg).toMatch(/has no environment "prod"/);
     expect(msg).toMatch(/production/);
     expect(msg).toMatch(/--env/);
+  });
+});
+
+// The read half of #51: a database's backup schedule is on its own route, so
+// the live side has to go and get it. These pin the mapping from what that
+// route answers onto what the diff is allowed to conclude.
+describe("attachBackup", () => {
+  const db = () => ({
+    kind: "database" as const,
+    name: "postgres",
+    uuid: "db-1",
+    fields: { type: "postgresql" },
+  });
+  // A Coolify whose GET /databases/db-1/backups answers with `body` (or a
+  // status, to exercise the unreachable path).
+  const client = (body: unknown, status = 200) =>
+    new CoolifyClient(
+      "https://coolify.test",
+      "tok",
+      vi.fn(
+        async () =>
+          new Response(status === 200 ? JSON.stringify(body) : "boom", {
+            status,
+          }),
+      ) as unknown as typeof fetch,
+    );
+
+  it("reads a schedule onto the live fields, in the desired key order", async () => {
+    const l = db();
+    await attachBackup(
+      client([
+        {
+          uuid: "s1",
+          frequency: "0 3 * * *",
+          database_backup_retention_amount_locally: 7,
+          enabled: true,
+        },
+      ]),
+      l,
+    );
+    // Key order matters: computeDiff compares by JSON.stringify, against the
+    // object resolve.ts builds. Same keys, same order, or every run drifts.
+    expect(JSON.stringify(l.fields.backup)).toBe(
+      JSON.stringify({ frequency: "0 3 * * *", retention: 7 }),
+    );
+    expect(l.backupNotCompared).toBeUndefined();
+  });
+
+  it("leaves fields.backup absent when the database genuinely has none", async () => {
+    const l = db();
+    await attachBackup(client([]), l);
+    // Absence IS the answer here, and a trustworthy one: a declared backup is
+    // then real drift, and apply creates the schedule.
+    expect("backup" in l.fields).toBe(false);
+    expect(l.backupNotCompared).toBeUndefined();
+  });
+
+  it("carries a disabled schedule through as disabled", async () => {
+    const l = db();
+    await attachBackup(
+      client([
+        {
+          uuid: "s1",
+          frequency: "0 3 * * *",
+          database_backup_retention_amount_locally: 7,
+          enabled: false,
+        },
+      ]),
+      l,
+    );
+    // The row exists (so apply PATCHes rather than POSTing a second one) but it
+    // backs nothing up (so it must not compare equal to a declared block).
+    expect(l.fields.backup).toEqual({
+      frequency: "0 3 * * *",
+      retention: 7,
+      enabled: false,
+    });
+  });
+
+  it("marks the read not-compared when Coolify cannot be read", async () => {
+    const l = db();
+    await attachBackup(client(null, 500), l);
+    expect("backup" in l.fields).toBe(false);
+    expect(l.backupNotCompared).toMatch(/unreachable|does not recognize/);
+  });
+
+  it("marks the read not-compared when a database carries several schedules", async () => {
+    const l = db();
+    await attachBackup(
+      client([
+        {
+          uuid: "s1",
+          frequency: "0 3 * * *",
+          database_backup_retention_amount_locally: 7,
+        },
+        {
+          uuid: "s2",
+          frequency: "0 9 * * *",
+          database_backup_retention_amount_locally: 2,
+        },
+      ]),
+      l,
+    );
+    // A manifest declares one schedule. Picking one of two to compare against
+    // would be a coin toss reported as a fact.
+    expect(l.backupNotCompared).toMatch(/2 schedules/);
+    expect("backup" in l.fields).toBe(false);
   });
 });

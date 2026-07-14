@@ -384,10 +384,63 @@ export type LiveLookup =
       environment: string;
     };
 
+// Attach the live backup schedule to a database, or the reason there isn't one
+// to attach. Split out from fetchLive so the "cast could not read this" paths —
+// the ones that must never lie in either direction — are all visible together.
+//
+// The four answers, and why each is what it is:
+//
+//   unreadable      -> backupNotCompared. Says nothing, claims nothing, prints.
+//   no schedule     -> no `backup` in fields. Read cleanly: a declared backup is
+//                      then REAL drift, and apply creates the schedule. This is
+//                      the case the old side-channel design could never see, and
+//                      the reason a rebuilt database silently had no backups.
+//   one schedule    -> compared, like any other field.
+//   >1 schedule     -> backupNotCompared. cast's manifest declares ONE schedule;
+//                      a database carrying several is outside that vocabulary,
+//                      and picking one to compare against would be a coin toss
+//                      reported as a fact.
+//
+// A DISABLED schedule is deliberately NOT treated as "no schedule": the row
+// exists (so apply must PATCH it, not POST a second one) but it backs nothing
+// up (so it must not read as clean). Carrying `enabled: false` into the compared
+// value gets both — it diffs against a desired block that implies enabled, and
+// the update path re-enables it.
+export async function attachBackup(
+  client: CoolifyClient,
+  db: Live,
+): Promise<void> {
+  const read = await client.databaseBackupSchedules(db.uuid);
+  if (read === undefined) {
+    db.backupNotCompared =
+      "GET /databases/{uuid}/backups was unreachable or returned a shape cast does not recognize";
+    return;
+  }
+  if (read.length > 1) {
+    db.backupNotCompared = `Coolify holds ${read.length} schedules for this database; a manifest declares one`;
+    return;
+  }
+  const schedule = read[0];
+  if (!schedule) return; // read cleanly: no schedule. Absence IS the answer.
+  db.fields.backup = {
+    // Same key order as the desired side (resolve.ts) — computeDiff compares
+    // by JSON.stringify. `enabled` rides along only when false, so the ordinary
+    // healthy case is a two-key object on both sides and compares equal.
+    frequency: schedule.frequency,
+    retention: schedule.retention,
+    ...(schedule.enabled ? {} : { enabled: false }),
+  };
+}
+
 export async function fetchLive(
   client: CoolifyClient,
   projectName: string,
   envName: string,
+  // Backups cost one extra GET per database, so only the callers that actually
+  // compare them ask for them: `diff` and `apply`. The read-side sweeps
+  // (inventory, capture, smoke) walk every project on a box and would pay it on
+  // every database for an answer they never look at.
+  opts: { backups?: boolean } = {},
 ): Promise<LiveLookup> {
   const projects = (await client.get("/projects")) as Array<{
     uuid: string;
@@ -454,15 +507,18 @@ export async function fetchLive(
       destinationId:
         typeof i.destination_id === "number" ? i.destination_id : undefined,
     }));
-  return {
-    found: true,
-    live: [
-      ...map("application", env.applications),
-      ...map("database", env.postgresqls),
-      ...map("database", env.redis),
-      ...map("service", env.services),
-    ],
-  };
+  const live = [
+    ...map("application", env.applications),
+    ...map("database", env.postgresqls),
+    ...map("database", env.redis),
+    ...map("service", env.services),
+  ];
+  if (opts.backups) {
+    for (const db of live.filter((l) => l.kind === "database")) {
+      await attachBackup(client, db);
+    }
+  }
+  return { found: true, live };
 }
 
 // Why `diff` refuses instead of reporting an empty live side: see LiveLookup.
@@ -910,7 +966,7 @@ async function runProject(
     );
   }
   const secrets = decryptSecrets(store, keyFileFor(ctx.envName));
-  let { desired, resolvedEnvs, backupSchedules } = desiredFromManifest(
+  let { desired, resolvedEnvs } = desiredFromManifest(
     checkout,
     ctx.envName,
     secrets,
@@ -930,7 +986,10 @@ async function runProject(
       parseYaml(readFileSync(ctx.hostnameOverlay, "utf8")),
     );
   }
-  const lookup = await fetchLive(ctx.client, projectName, coolifyEnv);
+  // `backups: true` — this is the one path that compares them (see fetchLive).
+  const lookup = await fetchLive(ctx.client, projectName, coolifyEnv, {
+    backups: true,
+  });
   // apply and diff take opposite (and both correct) positions on absence:
   // apply is *allowed* to be the thing that brings a project into existence,
   // so [] is a legitimate starting point. diff is only ever a claim about
@@ -1012,7 +1071,6 @@ async function runProject(
     bindingEnv: ctx.envName,
     destinationUuid: projectBinding?.destination_uuid,
     s3DestinationUuid: ctx.binding.s3_destination,
-    backupSchedules,
     visibleUuids,
   });
   const { mutated } = await applyPlan(report, desired, exec);
@@ -2422,13 +2480,36 @@ export function defaultDatabaseImage(type: string, version: string): string {
   return `${repo}:${version}-alpine`;
 }
 
+// The desired backup schedule, narrowed out of the untyped `fields` bag that
+// both createResource and updateFields are handed. Anything that is not a
+// complete, well-typed schedule reads as "none declared" — the manifest schema
+// (manifest.ts) already requires both keys, so a partial object here would mean
+// a bug upstream, and writing half a schedule is worse than writing none.
+export function desiredBackup(
+  fields: Record<string, unknown>,
+): { frequency: string; retention: number } | undefined {
+  const b = fields.backup as
+    | { frequency?: unknown; retention?: unknown }
+    | undefined;
+  if (!b || typeof b !== "object") return undefined;
+  if (typeof b.frequency !== "string" || typeof b.retention !== "number")
+    return undefined;
+  return { frequency: b.frequency, retention: b.retention };
+}
+
 export function databaseApiFields(
   fields: Record<string, unknown>,
 ): Record<string, unknown> {
   // /databases/postgresql and /databases/redis accept no `type` param (the
   // endpoint path already encodes it) and no `version` param at all — only
   // `image`, a literal Docker image string.
-  const { type, version, ...rest } = fields;
+  //
+  // `backup` is stripped because it is not a column on the database at all: it
+  // is a row on a different route (/databases/{uuid}/backups), written by
+  // writeBackupSchedule. It rides in `fields` so that it can be DIFFED like
+  // any other field; it must never reach the database's own create/update body,
+  // which rejects unknown fields.
+  const { type, version, backup: _backup, ...rest } = fields;
   return {
     ...rest,
     ...(typeof version === "string"
@@ -2796,7 +2877,6 @@ export function buildExecutor(
     // hosts two projects, is the right answer.
     destinationUuid?: string;
     s3DestinationUuid?: string; // raw UUID from environments.yaml — no storage API exists to resolve names
-    backupSchedules: Record<string, { frequency: string; retention: number }>;
     // The live resources of THIS project + environment, by uuid — everything cast
     // can see. Read by exactly one thing: the domain-conflict message, which has to
     // say whether the resource holding the domain is inside the applied project or
@@ -2834,6 +2914,69 @@ export function buildExecutor(
     ctx.projectName,
     ctx.envName,
   );
+  // The body of a backup-schedule write, shared by the create and update paths
+  // so the two cannot drift apart — the create path having been the only one
+  // for so long is precisely how the update path came to not exist.
+  //
+  // `save_s3` + `s3_storage_uuid` are asserted on every write, not compared:
+  // Coolify returns the storage as `s3_storage_id` (an int) and takes it as a
+  // uuid, the same unmappable pair as destination_id (see Placement), so cast
+  // can state its intent here but can never verify it afterwards. Declaring
+  // `backup:` in a manifest means "backed up, to the environment's S3" — that
+  // is what this writes, on create and on update alike.
+  const backupBody = (
+    label: string,
+    schedule: { frequency: string; retention: number },
+  ): Record<string, unknown> => {
+    if (!ctx.s3DestinationUuid) {
+      throw new Error(
+        `database ${label} declares a backup schedule but environments.yaml has no s3_destination UUID for this environment`,
+      );
+    }
+    return {
+      frequency: schedule.frequency,
+      database_backup_retention_amount_locally: schedule.retention,
+      save_s3: true,
+      s3_storage_uuid: ctx.s3DestinationUuid,
+      // Asserted on every write. A schedule row that exists with enabled=false
+      // backs nothing up, and a manifest that declares `backup:` is asking for
+      // backups, not for a disabled row that looks like backups.
+      enabled: true,
+    };
+  };
+  // Make a database's live schedule match the manifest — the half of this that
+  // did not exist. `apply` used to write a schedule ONLY inside the create
+  // branch, so adding `backup:` to an already-live database produced a clean
+  // run and zero backups; that is the defect (#51).
+  //
+  // POST creates, PATCH updates, and which one is right depends on a read — so
+  // this reads first. When the read fails it RAISES rather than guessing: the
+  // alternatives are POSTing (which duplicates the schedule if one was in fact
+  // there) or skipping (which is the silent no-op being fixed). An apply that
+  // promised to set a backup schedule and could not must say so and stop.
+  const reconcileBackupSchedule = async (
+    dbUuid: string,
+    schedule: { frequency: string; retention: number },
+  ): Promise<void> => {
+    const body = backupBody(dbUuid, schedule);
+    const existing = await client.databaseBackupSchedules(dbUuid);
+    if (existing === undefined) {
+      throw new Error(
+        `database ${dbUuid}: cannot set the declared backup schedule — GET /databases/${dbUuid}/backups was unreachable or returned an unrecognized shape, so cast cannot tell whether a schedule already exists (creating one blindly would risk a duplicate). Set it in the Coolify UI, or re-run when the API is reachable.`,
+      );
+    }
+    if (existing.length > 1) {
+      throw new Error(
+        `database ${dbUuid}: Coolify holds ${existing.length} backup schedules for this database and a manifest declares one — cast will not guess which to update. Resolve in the Coolify UI (runbook act).`,
+      );
+    }
+    const current = existing[0];
+    if (current) {
+      await client.patch(`/databases/${dbUuid}/backups/${current.uuid}`, body);
+      return;
+    }
+    await client.post(`/databases/${dbUuid}/backups`, body);
+  };
   // The two instance-wide constraints a create can die on, both of them invisible
   // from cast's project-scoped view, both of them arriving at the FIRST create —
   // after apply has already made the project and the environment. One wrapper, and
@@ -2926,19 +3069,15 @@ export function buildExecutor(
               ...databaseApiFields(fields),
             },
           )) as { uuid: string };
-          const schedule = ctx.backupSchedules[change.name];
+          // A database that was created a moment ago provably has no schedule,
+          // so this POSTs rather than going through reconcileBackupSchedule —
+          // no read to do, and no read that could fail and abort a create.
+          const schedule = desiredBackup(fields);
           if (schedule) {
-            if (!ctx.s3DestinationUuid) {
-              throw new Error(
-                `database ${change.name} declares a backup schedule but environments.yaml has no s3_destination UUID for this environment`,
-              );
-            }
-            await client.post(`/databases/${res.uuid}/backups`, {
-              frequency: schedule.frequency,
-              database_backup_retention_amount_locally: schedule.retention,
-              save_s3: true,
-              s3_storage_uuid: ctx.s3DestinationUuid,
-            });
+            await client.post(
+              `/databases/${res.uuid}/backups`,
+              backupBody(change.name, schedule),
+            );
           }
           return res.uuid;
         }
@@ -2966,7 +3105,20 @@ export function buildExecutor(
           : kind === "service"
             ? serviceApiFields(fields)
             : databaseApiFields(fields);
-      await client.patch(`/${base}/${uuid}`, apiFields);
+      // A backup-only drift strips to an empty body (databaseApiFields drops
+      // `backup`, which belongs to another route) — and PATCHing a database
+      // with `{}` is a write that says nothing. Skip it; the schedule below is
+      // the actual change.
+      if (Object.keys(apiFields).length > 0) {
+        await client.patch(`/${base}/${uuid}`, apiFields);
+      }
+      // The declared schedule is applied on UPDATE, not only on create. This is
+      // what makes adding `backup:` to an existing database do what every reader
+      // of that manifest already assumes it does (#51).
+      if (kind === "database") {
+        const schedule = desiredBackup(fields);
+        if (schedule) await reconcileBackupSchedule(uuid, schedule);
+      }
     },
     async syncEnv(uuid, kind, env) {
       // The reserved-name rule at the wire (reserved.ts). Nothing can reach here

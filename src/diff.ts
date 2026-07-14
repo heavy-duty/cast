@@ -24,6 +24,18 @@ export type Live = {
   // Putting it in `fields` would diff a UUID against an int and report drift
   // that can never be resolved. See Placement.
   destinationId?: number;
+  // Set ONLY when this database declares a `backup` block that cast could not
+  // read back (GET /databases/{uuid}/backups was unreachable, or answered a
+  // shape cast does not recognize — see BackupRead). The string is the reason,
+  // printed verbatim.
+  //
+  // Presence of this means: DO NOT COMPARE `backup` for this resource. Leaving
+  // `backup` merely absent from `fields` would NOT be equivalent — it would
+  // diff desired-against-nothing and report confident drift on a database that
+  // may well be perfectly backed up. An unreadable answer must produce neither
+  // drift nor a clean bill; it produces a line on the report. computeDiff is
+  // where that is enforced.
+  backupNotCompared?: string;
 };
 export type FieldDiff = {
   field: string;
@@ -94,6 +106,11 @@ export type DiffReport = {
   // structural mode reads no env vars at all, so it can find none — and says so.
   reserved: ReservedVar[];
   placement: Placement;
+  // Databases whose declared `backup` block cast could not verify this run.
+  // NOT drift (nothing was read, so nothing can be claimed) and so NOT counted
+  // against `clean` — but printed on every run that has any, because the whole
+  // point is that the assumption goes on screen at the moment it is made.
+  backupsNotCompared: { name: string; reason: string }[];
   clean: boolean;
 };
 
@@ -210,6 +227,7 @@ export function computeDiff(
   opts: { declaredDestination?: string } = {},
 ): DiffReport {
   const changes: Change[] = [];
+  const backupsNotCompared: { name: string; reason: string }[] = [];
   for (const d of desired) {
     const l = live.find((x) => x.kind === d.kind && x.name === d.name);
     if (!l) {
@@ -233,7 +251,17 @@ export function computeDiff(
       });
       continue;
     }
+    // The unreadable-backup escape hatch. `backup` is dropped from the
+    // comparison entirely — not diffed against `undefined`, which is what
+    // "just leave it out of live.fields" would silently mean, and which would
+    // report drift cast has no evidence for and let apply write a schedule it
+    // never checked for. See Live.backupNotCompared.
+    if (l.backupNotCompared && "backup" in d.fields) {
+      backupsNotCompared.push({ name: d.name, reason: l.backupNotCompared });
+    }
+    const skipBackup = l.backupNotCompared !== undefined;
     const fieldDiffs: FieldDiff[] = Object.entries(d.fields)
+      .filter(([field]) => !(skipBackup && field === "backup"))
       .filter(([field, value]) => !eq(value, l.fields[field]))
       .map(([field, value]) => ({
         field,
@@ -265,6 +293,7 @@ export function computeDiff(
     orphans,
     reserved,
     placement,
+    backupsNotCompared,
     // A split project is drift, and drift is not clean — the same disposition
     // as an orphan: reported, counted, and NOT repaired (apply moves nothing
     // between networks; see renderDiff).
@@ -273,6 +302,12 @@ export function computeDiff(
     // it is a live defect. The box it sits on is deploying green and reporting
     // the wrong commit, and a `diff` that answered "clean" over it would be the
     // last chance anyone had to notice.
+    //
+    // `backupsNotCompared` is deliberately NOT in this sum, and it is the one
+    // exception to the rule the line above states: it is an absence of evidence,
+    // not evidence of drift, and a run that failed because a read failed would be
+    // a run operators learn to force past. It gets a line instead — an
+    // unmissable one — rather than a non-zero exit.
     clean:
       changes.length === 0 &&
       orphans.length === 0 &&
@@ -346,6 +381,17 @@ export function renderDiff(report: DiffReport): string {
       `  ${reservedConsequence(r.key)}`,
       "  cast declares no such var and never will (it refuses a manifest that does),",
       "  and `apply` never deletes — so this one is yours to remove, by hand, in the UI.",
+    );
+  }
+  // The honest fallback, on the same principle as the placement line below: cast
+  // read for the schedule and did not understand the answer, so it says so here
+  // rather than dropping the field and letting a clean report imply a backed-up
+  // database. A `backup:` block that produced no line above and no line here IS
+  // compared, and IS clean.
+  for (const b of report.backupsNotCompared) {
+    lines.push(
+      `backup schedule for database ${b.name} declared, NOT compared — verify in the Coolify UI`,
+      `  (${b.reason})`,
     );
   }
   const { placement } = report;

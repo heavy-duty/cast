@@ -341,7 +341,6 @@ export function desiredFromManifest(
 ): {
   desired: Desired[];
   resolvedEnvs: Record<string, ResolvedEnv>;
-  backupSchedules: Record<string, { frequency: string; retention: number }>;
 } {
   const manifest = loadManifest(join(checkoutDir, ".infra", "manifest.yaml"));
   const envSpec = manifest.environments[envName];
@@ -352,10 +351,6 @@ export function desiredFromManifest(
   }
   const desired: Desired[] = [];
   const resolvedEnvs: Record<string, ResolvedEnv> = {};
-  const backupSchedules: Record<
-    string,
-    { frequency: string; retention: number }
-  > = {};
   const reserved: ReservedHit[] = [];
   const resolveEnvFile = (
     name: string,
@@ -428,13 +423,33 @@ export function desiredFromManifest(
     desired.push({
       kind: "database",
       name,
-      fields: { type: db.type, ...(db.version ? { version: db.version } : {}) },
+      fields: {
+        type: db.type,
+        ...(db.version ? { version: db.version } : {}),
+        // `backup` is a DIFFED FIELD, like any other.
+        //
+        // It used to be routed around `fields` into a side channel, on the
+        // stated grounds that "live Coolify state doesn't expose it back" — so
+        // diffing it would flag spurious drift forever. That premise was false:
+        // it is not on the database's own GET, but GET /databases/{uuid}/backups
+        // is a route (cast has always POSTed to it), and frequency/retention
+        // round-trip verbatim through it. The side channel is what made a
+        // `backup:` block added to an EXISTING database do nothing, silently,
+        // and made `diff --full` pass on a production database with no backups.
+        //
+        // Key order matters: computeDiff compares by JSON.stringify, and the
+        // live side (fetchLive in cli.ts) builds this same object in this same
+        // order. Do not reorder one without the other.
+        ...(db.backup
+          ? {
+              backup: {
+                frequency: db.backup.frequency,
+                retention: db.backup.retention,
+              },
+            }
+          : {}),
+      },
     });
-    if (db.backup)
-      backupSchedules[name] = {
-        frequency: db.backup.frequency,
-        retention: db.backup.retention,
-      };
   }
   for (const [name, svc] of Object.entries(envSpec.services ?? {})) {
     if (svc.domains && svc.domains.length > 0) {
@@ -450,12 +465,19 @@ export function desiredFromManifest(
     desired.push({
       kind: "service",
       name,
-      // domains dropped from fields, same as database `backup` above: the
-      // live side (projectLiveFields in cli.ts) can't read service domains
-      // and the write side (serviceApiFields) drops them, so keeping
-      // domains in fields makes every domain-bearing service diff as a
-      // perpetual update. Hostnames stay a manual Coolify UI act (warned
-      // above).
+      // domains dropped from fields: the live side (projectLiveFields in
+      // cli.ts) can't read service domains and the write side
+      // (serviceApiFields) drops them, so keeping domains in fields makes
+      // every domain-bearing service diff as a perpetual update. Hostnames
+      // stay a manual Coolify UI act (warned above).
+      //
+      // This USED to cite database `backup` as its precedent. It no longer
+      // can: `backup` was dropped on the same reasoning and the reasoning
+      // turned out to be false there (a read route existed, unlooked-for —
+      // see the databases loop above). The difference is that this one was
+      // re-checked: Coolify 4.1.2 genuinely exposes no flat `domains` on a
+      // service, on any route. If that is ever disproved the same way, this
+      // belongs in `fields` too.
       fields: { type: svc.type },
       env: resolveEnvFile(name, svc.env_template),
     });
@@ -464,5 +486,5 @@ export function desiredFromManifest(
   // resolved env that carries a reserved name is not desired state, it is a
   // suppression of the platform's own value dressed up as one. See reserved.ts.
   assertNoReservedEnvNames(reserved);
-  return { desired, resolvedEnvs, backupSchedules };
+  return { desired, resolvedEnvs };
 }

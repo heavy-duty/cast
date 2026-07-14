@@ -413,3 +413,136 @@ describe("renderDiff", () => {
     expect(out).toMatch(/env vars not compared \(structural mode/);
   });
 });
+
+// A database's backup schedule is a field like any other — the whole point of
+// #51. These pin the four answers a live read can give, and above all pin the
+// two that must never be confused: "there is no schedule" (drift, fixable) and
+// "cast could not read the schedule" (not drift, not clean, said out loud).
+describe("backup schedules", () => {
+  const wantBackup = {
+    kind: "database" as const,
+    name: "postgres",
+    fields: {
+      type: "postgresql",
+      backup: { frequency: "0 3 * * *", retention: 7 },
+    },
+  };
+  const liveDb = (fields: Record<string, unknown>, extra = {}) => ({
+    kind: "database" as const,
+    name: "postgres",
+    uuid: "db-1",
+    fields: { type: "postgresql", ...fields },
+    ...extra,
+  });
+
+  it("is clean when the live schedule matches", () => {
+    const r = computeDiff(
+      [wantBackup],
+      [liveDb({ backup: { frequency: "0 3 * * *", retention: 7 } })],
+      "full",
+    );
+    expect(r.clean).toBe(true);
+    expect(r.backupsNotCompared).toEqual([]);
+  });
+
+  it("reports drift when the schedule differs", () => {
+    const r = computeDiff(
+      [wantBackup],
+      [liveDb({ backup: { frequency: "0 5 * * *", retention: 3 } })],
+      "full",
+    );
+    expect(r.changes[0].fieldDiffs).toEqual([
+      {
+        field: "backup",
+        desired: { frequency: "0 3 * * *", retention: 7 },
+        live: { frequency: "0 5 * * *", retention: 3 },
+        updatable: true,
+      },
+    ]);
+    expect(r.clean).toBe(false);
+  });
+
+  // The defect in one test: a live database with NO schedule, declared in the
+  // manifest, used to be invisible. It is drift, and apply can fix it.
+  it("reports drift when the database has no schedule at all", () => {
+    const r = computeDiff([wantBackup], [liveDb({})], "full");
+    expect(r.clean).toBe(false);
+    expect(r.changes[0].fieldDiffs[0]).toMatchObject({
+      field: "backup",
+      live: undefined,
+      updatable: true,
+    });
+  });
+
+  // A schedule row that exists but is switched off backs nothing up. It must
+  // not read as clean, and it must not read as absent (apply PATCHes it rather
+  // than POSTing a second one).
+  it("reports drift when the schedule exists but is disabled", () => {
+    const r = computeDiff(
+      [wantBackup],
+      [
+        liveDb({
+          backup: { frequency: "0 3 * * *", retention: 7, enabled: false },
+        }),
+      ],
+      "full",
+    );
+    expect(r.clean).toBe(false);
+    expect(r.changes[0].fieldDiffs[0].field).toBe("backup");
+  });
+
+  // The shape-mismatch path — the one that must not lie in EITHER direction.
+  it("invents no drift when the live schedule could not be read", () => {
+    const r = computeDiff(
+      [wantBackup],
+      [liveDb({}, { backupNotCompared: "unrecognized shape" })],
+      "full",
+    );
+    // Not drift: cast read nothing, so it may claim nothing. In particular it
+    // must NOT diff the declared block against `undefined` and report a
+    // confident change on a database that may be perfectly backed up.
+    expect(r.changes).toEqual([]);
+    // And not silence either.
+    expect(r.backupsNotCompared).toEqual([
+      { name: "postgres", reason: "unrecognized shape" },
+    ]);
+  });
+
+  it("says so on screen, on a run that is otherwise clean", () => {
+    const out = renderDiff(
+      computeDiff(
+        [wantBackup],
+        [liveDb({}, { backupNotCompared: "unrecognized shape" })],
+        "full",
+      ),
+    );
+    expect(out).toContain(
+      "backup schedule for database postgres declared, NOT compared — verify in the Coolify UI",
+    );
+    expect(out).toContain("(unrecognized shape)");
+    // Reported, but not counted as drift — an absence of evidence is not
+    // evidence of drift, and a run that fails on it is a run operators learn
+    // to force past.
+    expect(out).toMatch(/^clean$/m);
+  });
+
+  it("says nothing about backups when none is declared", () => {
+    // An undeclared schedule is uncompared, not deleted: a live schedule on a
+    // database whose manifest is silent is left alone, and unremarked.
+    const out = renderDiff(
+      computeDiff(
+        [
+          {
+            kind: "database" as const,
+            name: "postgres",
+            fields: { type: "postgresql" },
+          },
+        ],
+        [liveDb({}, { backupNotCompared: "unrecognized shape" })],
+        "full",
+      ),
+    );
+    expect(out).not.toContain("backup");
+    expect(out).toMatch(/^clean$/m);
+  });
+});

@@ -1,5 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
-import { CoolifyClient } from "../src/coolify.js";
+import { CoolifyClient, parseBackupSchedules } from "../src/coolify.js";
+
+// A row as Coolify actually serializes one: a raw ScheduledDatabaseBackup
+// Eloquent model (DatabasesController@database_backup_details_uuid, v4.1.2),
+// so every column is present and `executions` is eager-loaded alongside.
+const row = (over: Record<string, unknown> = {}) => ({
+  id: 3,
+  uuid: "sched-1",
+  team_id: 1,
+  enabled: true,
+  save_s3: true,
+  frequency: "0 3 * * *",
+  database_backup_retention_amount_locally: 7,
+  database_id: 9,
+  database_type: "App\\Models\\StandalonePostgresql",
+  s3_storage_id: 2,
+  executions: [],
+  ...over,
+});
 
 function mockFetch(routes: Record<string, unknown>) {
   return vi.fn(async (url: string | URL, init?: RequestInit) => {
@@ -59,5 +77,94 @@ describe("CoolifyClient", () => {
     ) as unknown as typeof fetch;
     const c = new CoolifyClient("https://coolify.test", "tok", fetchImpl);
     await expect(c.version()).resolves.toBe("4.1.2");
+  });
+  it("reads a database's backup schedules", async () => {
+    const c = new CoolifyClient(
+      "https://coolify.test",
+      "tok",
+      mockFetch({ "GET /api/v1/databases/db-1/backups": [row()] }),
+    );
+    await expect(c.databaseBackupSchedules("db-1")).resolves.toEqual([
+      { uuid: "sched-1", frequency: "0 3 * * *", retention: 7, enabled: true },
+    ]);
+  });
+  // The dangerous 404. fetchLive reads a 404 as "no live environment" three
+  // routes up, and that instinct is WRONG here: Coolify answers a database with
+  // no schedules with 200 [], never 404 — a 404 means the database wasn't found.
+  // Reading it as "no backups" would report an unbacked-up database as clean and
+  // make apply POST a duplicate schedule onto one that already had one.
+  it("does not turn a failed read into 'this database has no backups'", async () => {
+    const c = new CoolifyClient("https://coolify.test", "tok", mockFetch({}));
+    await expect(c.databaseBackupSchedules("db-1")).resolves.toBeUndefined();
+  });
+});
+
+// The shape cast cannot afford to be wrong about. Every unreadable answer must
+// land on `undefined` ("cast cannot say"), and ONLY a genuinely empty list may
+// land on `[]` ("there are none") — the two mean opposite things to every
+// caller downstream, and to the operator staring at a cutover.
+describe("parseBackupSchedules", () => {
+  it("reads a well-formed collection", () => {
+    expect(parseBackupSchedules([row()])).toEqual([
+      { uuid: "sched-1", frequency: "0 3 * * *", retention: 7, enabled: true },
+    ]);
+  });
+  it("reads an empty list as a trustworthy 'no schedule', not as unknown", () => {
+    expect(parseBackupSchedules([])).toEqual([]);
+  });
+  it("reads the spec's own placeholder body as unknown, not as 'no schedule'", () => {
+    // What the vendored OpenAPI literally documents for this route. If Coolify
+    // ever really answered this, cast must not read it as "no backups".
+    expect(
+      parseBackupSchedules(
+        "Content is very complex. Will be implemented later.",
+      ),
+    ).toBeUndefined();
+  });
+  it.each([
+    ["a non-array object", { data: [] }],
+    ["null", null],
+    ["a row that is not an object", ["nope"]],
+    ["a row with no frequency", [row({ frequency: undefined })]],
+    ["a row with a non-string frequency", [row({ frequency: 3 })]],
+    [
+      "a row with a null retention",
+      [row({ database_backup_retention_amount_locally: null })],
+    ],
+    [
+      "a row with a non-numeric retention",
+      [row({ database_backup_retention_amount_locally: "many" })],
+    ],
+  ])("reads %s as unknown", (_label, body) => {
+    expect(parseBackupSchedules(body)).toBeUndefined();
+  });
+  it("collapses the WHOLE read when any one row is unreadable", () => {
+    // A partial list is indistinguishable from a complete one downstream, and
+    // the caller worth protecting is the one asking "is this backed up?".
+    expect(
+      parseBackupSchedules([row(), row({ uuid: 7, frequency: null })]),
+    ).toBeUndefined();
+  });
+  it("reads a disabled schedule as disabled, however Coolify spells it", () => {
+    // `enabled` has no cast on the model (v4.1.2 casts() covers only the two
+    // float storage fields), so a tinyint column can serialize as 1/0.
+    expect(parseBackupSchedules([row({ enabled: 0 })])?.[0].enabled).toBe(
+      false,
+    );
+    expect(parseBackupSchedules([row({ enabled: false })])?.[0].enabled).toBe(
+      false,
+    );
+    expect(parseBackupSchedules([row({ enabled: 1 })])?.[0].enabled).toBe(true);
+    // Absent reads as enabled: Coolify's create path defaults it to true.
+    expect(
+      parseBackupSchedules([row({ enabled: undefined })])?.[0].enabled,
+    ).toBe(true);
+  });
+  it("accepts an integer retention however it is serialized", () => {
+    expect(
+      parseBackupSchedules([
+        row({ database_backup_retention_amount_locally: "7" }),
+      ])?.[0].retention,
+    ).toBe(7);
   });
 });

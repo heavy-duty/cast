@@ -506,6 +506,80 @@ Coolify says so in the same response (*"can cause routing conflicts and unpredic
 behavior"*). Nothing in cast can send that flag, and no retry may ever set it — if it
 is ever wanted, it is an explicit operator act in the UI, not a tool's decision.
 
+## Backup schedules
+
+A manifest database's `backup` block (`frequency`, `retention`) is a **diffed
+field like any other**: compared on every run, written on create *and* on
+update. Declaring `backup:` on a database that already exists starts backing it
+up — which is what every reader of that manifest already assumed it did.
+
+It did not always work that way, and the reason is worth keeping: the schedule
+used to be write-only, applied inside `apply`'s create branch and then never
+looked at again, because *"live Coolify state doesn't expose it back"*. That was
+false. A schedule is not on the database's own `GET` — but it was never supposed
+to be. It has **its own route**, which cast had been POSTing to all along and had
+simply never read:
+
+```
+GET    /databases/{uuid}/backups                     ← list a database's schedules
+POST   /databases/{uuid}/backups                     ← create
+PATCH  /databases/{uuid}/backups/{scheduled_backup_uuid}  ← update
+```
+
+The cost of not looking was exact: a database created before its `backup:` block
+was declared never got one, a schedule deleted in the UI was invisible, and the
+`--full` diff that gates a production cutover passed with an unbacked-up
+production database (#51).
+
+**What the route returns.** The vendored OpenAPI documents the body as *"Content
+is very complex. Will be implemented later."*, so the shape comes from the source:
+`DatabasesController@database_backup_details_uuid` (v4.1.2) returns
+`ScheduledDatabaseBackup::…->with('executions')->where('database_id', …)->get()`
+straight to `response()->json()` — a **JSON array of raw Eloquent rows** (no API
+resource, no `removeSensitiveData`), whose columns are the model's `$fillable`:
+`uuid`, `enabled`, `save_s3`, `frequency`,
+`database_backup_retention_amount_locally`, … plus an eager-loaded `executions`
+array cast ignores. `retention` is
+`database_backup_retention_amount_locally` — the same field cast has always sent
+on create.
+
+**`frequency` round-trips verbatim**, which is what makes it diffable at all: the
+controller *validates* it (`validate_cron_expression`, which only returns a bool)
+and then stores `$request->only($backupConfigFields)` unchanged, with no mutator
+on the model. `"0 3 * * *"` reads back as `"0 3 * * *"`; the preset words
+(`daily`, `weekly`, …) read back as themselves. The old "diffing it would flag
+spurious drift every run" fear was a guess about a read nobody had performed.
+
+**A disabled schedule is not a backup.** A row with `enabled: false` exists but
+backs nothing up, so it is neither clean (it diffs against a declared block) nor
+absent (`apply` PATCHes it, rather than adding a second schedule). Every cast
+write asserts `enabled: true`.
+
+**What is still NOT compared**, and says so on screen when it applies:
+
+- **An unreadable answer.** If the route is unreachable, or answers a shape cast
+  does not recognize, cast reports `backup schedule for database <name>
+  declared, NOT compared — verify in the Coolify UI` and treats it as neither
+  drift nor clean. An absence of evidence is not evidence of drift: cast will not
+  invent a change it cannot see, nor certify a database it could not read. On the
+  write side the same read failure **raises** rather than guessing — POSTing blind
+  would duplicate a schedule that may already exist, and skipping is the silent
+  no-op this whole section exists to kill.
+- **More than one schedule.** A manifest declares one; a database carrying
+  several is outside that vocabulary, and choosing one to compare against would
+  be a coin toss reported as a fact. Reported, not compared, not written.
+- **The S3 target.** Coolify returns the storage as `s3_storage_id` (an int) and
+  takes it as a UUID, the same unmappable pair as `destination_id` (see
+  Placement). cast **asserts** `save_s3: true` + the environment's
+  `s3_destination` on every write and can never verify it afterwards.
+- **An undeclared schedule.** A live schedule on a database whose manifest says
+  nothing about backups is left alone, unremarked — `apply` never removes.
+
+**A backup change redeploys the database.** `apply` redeploys any resource it
+mutates, and a schedule change is a mutation of the database, so changing
+`frequency` restarts the container. Consistent with every other field, and worth
+knowing before you edit a schedule on a live production database.
+
 ## Instance selection
 
 **The Coolify a command talks to is an explicit, named value** — not a property
@@ -791,8 +865,12 @@ and rebuild a *different box*. Per resource, it names what was seen and could no
 be written: `destination_id` (which Docker network — no destinations API in 4.1.2
 to resolve it to the UUID `destination_uuid:` wants, #21), service hostnames (no
 flat `domains` on a Coolify 4.1.2 service), Basic Auth / custom Traefik labels,
-build and deploy command overrides, backup schedules (not exposed on a database's
-GET — **a rebuild has no backups until you declare them**), database kinds cast
+build and deploy command overrides, backup schedules (**a rebuild has no backups
+until you declare them** — *not* because they cannot be read, which is what this
+line used to say and #51 disproved, but because `inventory --emit-draft` has not
+yet been taught to read them: `GET /databases/{uuid}/backups` answers, and `diff`
+and `apply` now use it. Until the draft path does too, a blueprint still omits
+them and still says so), database kinds cast
 does not model (MySQL, MariaDB, MongoDB, KeyDB, Dragonfly, ClickHouse — named,
 never silently dropped), env var names a cast template cannot express, names
 **reserved by the platform** (`SOURCE_COMMIT`, `COOLIFY_*` — suppressed, never
@@ -946,15 +1024,23 @@ one used — verified against a live private clone.
 
 **Known limitations, not defects:**
 
-- **Backup schedules are create-time only.** A manifest database's `backup`
-  block (`frequency`, `retention`) is applied only when the database is
-  first created; it is deliberately kept out of the diffed `fields` (live
-  Coolify state doesn't expose it back, so diffing it would flag spurious
-  drift every run — breaking idempotency). Changing a schedule on an
-  existing database is a runbook act, done by hand in the Coolify UI.
+- **~~Backup schedules are create-time only.~~** **Corrected (#51).** This entry
+  used to claim that a database's `backup` block was create-time only and kept
+  out of the diffed `fields` because *"live Coolify state doesn't expose it
+  back"*. The parenthesis was load-bearing and it was false — `GET
+  /databases/{uuid}/backups` is a route, and cast had been POSTing to it all
+  along without ever reading it. Backup schedules are now compared on every run
+  and written on create *and* update; see **Backup schedules** above for what
+  is still not compared (an unreadable answer, several schedules, the S3
+  target) and how each says so out loud. Kept here, struck through, because
+  this entry is *why nobody looked*: a limitation filed as a defect gets fixed,
+  and a defect filed as a limitation does not.
 - **A service's `domains` cannot be applied via the API in Coolify 4.1.2,
-  and is deliberately kept out of the diffed `fields` for the same
-  idempotency reason as backup schedules above.** The `/services`
+  and is deliberately kept out of the diffed `fields` for idempotency.** (This
+  used to cite backup schedules as its precedent; it can't any more — that
+  reasoning was disproved above. This one was re-checked and holds: Coolify
+  4.1.2 exposes no flat `domains` on a service, on any route. If that is ever
+  disproved the same way, `domains` belongs in `fields` too.) The `/services`
   create/update payload takes a structured per-container `urls` list, not
   the manifest's flat `domains: string[]`, and the manifest has no
   per-container name to build that list correctly from — so cast

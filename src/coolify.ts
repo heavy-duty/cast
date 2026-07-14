@@ -20,6 +20,105 @@ export class HttpError extends Error {
   }
 }
 
+// A database's scheduled backup, as cast is able to read it back.
+//
+// `retention` is Coolify's `database_backup_retention_amount_locally` — the
+// same field cast has always POSTed on create. `enabled` is carried because a
+// DISABLED schedule is a row that exists and backs nothing up: reporting that
+// database as backed-up is the one lie this whole path exists to prevent.
+export type LiveBackup = {
+  uuid: string;
+  frequency: string;
+  retention: number;
+  enabled: boolean;
+};
+
+// The result of trying to read a database's schedules. The two absences are
+// NOT the same fact and must never collapse into one another (the LiveLookup
+// lesson, one level down):
+//
+//   []        — read cleanly, this database has NO schedule. Trustworthy, and
+//               therefore real drift if the manifest declares one.
+//   undefined — NOT READ: transport error, or a body cast does not recognize.
+//               Says nothing. Must never become "no backups" (which would
+//               invent drift, and make apply POST a duplicate schedule) nor
+//               "backed up" (which would pass a cutover on an unbacked-up db).
+export type BackupRead = LiveBackup[] | undefined;
+
+// Coolify's int columns arrive as ints, but a tinyint `enabled` has no cast on
+// ScheduledDatabaseBackup (v4.1.2 casts() covers only the two float storage
+// fields), so it can serialize as 1/0 rather than true/false. Accept both; only
+// an explicit falsey value disables. An ABSENT `enabled` is read as enabled —
+// Coolify's own create path defaults it to true (DatabasesController, v4.1.2).
+function readEnabled(raw: Record<string, unknown>): boolean {
+  const v = raw.enabled;
+  if (v === undefined || v === null) return true;
+  return !(v === false || v === 0 || v === "0");
+}
+
+// Strict on purpose: a value cast cannot read EXACTLY is not coerced into a
+// guess, it collapses the whole read to `undefined` (= "not compared", said out
+// loud). Silence about a backup is the failure being fixed here; a wrong number
+// about one would be worse than the silence.
+function readInt(v: unknown): number | undefined {
+  if (typeof v === "number" && Number.isInteger(v)) return v;
+  if (typeof v === "string" && /^\d+$/.test(v)) return Number(v);
+  return undefined;
+}
+
+// Parse GET /databases/{uuid}/backups.
+//
+// The vendored OpenAPI documents this body as "Content is very complex. Will be
+// implemented later." — so the shape here comes from the source instead:
+// DatabasesController@database_backup_details_uuid (v4.1.2) ends with
+//
+//   $backupConfig = ScheduledDatabaseBackup::ownedByCurrentTeamAPI($teamId)
+//       ->with('executions')->where('database_id', $database->id)->get();
+//   return response()->json($backupConfig);
+//
+// i.e. a raw Eloquent collection — a JSON ARRAY of ScheduledDatabaseBackup rows
+// (no API resource, no removeSensitiveData), whose columns are the model's
+// $fillable: uuid, enabled, save_s3, frequency,
+// database_backup_retention_amount_locally, ... plus an eager-loaded
+// `executions` array cast ignores.
+//
+// `frequency` round-trips VERBATIM: the controller validates it
+// (validate_cron_expression, which only returns a bool) and then stores
+// $request->only($backupConfigFields) unchanged — there is no mutator on the
+// model. So "0 3 * * *" reads back as "0 3 * * *", and the preset words
+// (daily, weekly, ...) read back as themselves. That is what makes this field
+// diffable at all, and it is the fact the old "spurious drift" fear assumed
+// away without checking.
+export function parseBackupSchedules(raw: unknown): BackupRead {
+  // Not an array = not the documented collection. Unknown answer, not "none".
+  if (!Array.isArray(raw)) return undefined;
+  const schedules: LiveBackup[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) return undefined;
+    const row = item as Record<string, unknown>;
+    const uuid = row.uuid;
+    const frequency = row.frequency;
+    const retention = readInt(row.database_backup_retention_amount_locally);
+    // One unreadable row makes the whole read unreadable. A partial list would
+    // be indistinguishable from a complete one to every caller downstream, and
+    // the caller most worth protecting is the one asking "is this backed up?".
+    if (
+      typeof uuid !== "string" ||
+      typeof frequency !== "string" ||
+      retention === undefined
+    ) {
+      return undefined;
+    }
+    schedules.push({
+      uuid,
+      frequency,
+      retention,
+      enabled: readEnabled(row),
+    });
+  }
+  return schedules;
+}
+
 export class CoolifyClient {
   constructor(
     private readonly baseUrl: string,
@@ -280,6 +379,28 @@ export class CoolifyClient {
     await this.delete_(
       `/${base}/${encodeURIComponent(uuid)}?${CoolifyClient.DELETE_RESOURCE_QUERY}`,
     );
+  }
+
+  // The SAME route as databaseBackups above, PARSED for the diff/apply half of
+  // the story (#51). destroy reads the raw body because it decides shape-meaning
+  // itself (readBackupState); diff/apply need a settled `frequency`/`retention`
+  // to compare and write, so this parses on top of the one HTTP call rather than
+  // duplicating it — one place fetches, two callers read it their own way.
+  //
+  // `undefined` means "could not read", which is a DIFFERENT fact from "has
+  // none" (see BackupRead). Every failure lands on `undefined`, INCLUDING a 404:
+  // it is tempting to read 404 as "no backups" (fetchLive does exactly that for a
+  // missing environment), but here a 404 is Coolify saying *the database* was not
+  // found, never "the database has no schedules" — the handler returns a plain
+  // `[]` for that, with a 200. Reading 404 as "none" would let a mistyped uuid
+  // report an unbacked-up database as clean, and let apply POST a second schedule
+  // onto a database that already had one.
+  async databaseBackupSchedules(uuid: string): Promise<BackupRead> {
+    try {
+      return parseBackupSchedules(await this.databaseBackups(uuid));
+    } catch {
+      return undefined;
+    }
   }
 
   async deploy(uuid: string): Promise<void> {

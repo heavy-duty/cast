@@ -198,7 +198,6 @@ describe("buildExecutor createResource (application, dockercompose)", () => {
       serverName: "prod-box",
       orgRepo: "acme/widget",
       bindingEnv: "prod",
-      backupSchedules: {},
     });
     const uuid = await exec.createResource({
       kind: "application",
@@ -255,7 +254,6 @@ describe("buildExecutor createResource (application, dockercompose)", () => {
       serverName: "prod-box",
       orgRepo: "acme/widget",
       bindingEnv: "prod",
-      backupSchedules: {},
     });
     await exec.createResource({
       kind: "application",
@@ -361,7 +359,6 @@ describe("buildExecutor createResource (destination placement)", () => {
         orgRepo: "acme/widget",
         bindingEnv: "prod",
         destinationUuid: "dest-abc",
-        backupSchedules: {},
       });
       await exec.createResource(change);
       expect(bodies[path]?.destination_uuid).toBe("dest-abc");
@@ -390,7 +387,6 @@ describe("buildExecutor createResource (destination placement)", () => {
         serverName: "prod-box",
         orgRepo: "acme/widget",
         bindingEnv: "prod",
-        backupSchedules: {},
       });
       await exec.createResource(change);
       expect(bodies[path]).not.toHaveProperty("destination_uuid");
@@ -562,7 +558,6 @@ describe("buildExecutor createResource (environment reconcile)", () => {
         serverName: "prod-box",
         orgRepo: "acme/widget",
         bindingEnv: "prod",
-        backupSchedules: {},
       },
     );
   }
@@ -796,7 +791,6 @@ describe("buildExecutor createResource (multi-destination 400, #41)", () => {
       serverName: "prod-box",
       orgRepo: "heavy-duty/incubator",
       bindingEnv: "prod",
-      backupSchedules: {},
     });
 
   const kinds = [
@@ -891,5 +885,221 @@ describe("databaseVersionFromImage / defaultDatabaseImage", () => {
   it("round-trips through defaultDatabaseImage for postgres", () => {
     const image = defaultDatabaseImage("postgresql", "17");
     expect(databaseVersionFromImage(image)).toBe("17");
+  });
+});
+
+// The write half of #51. Backup schedules live on their own route
+// (/databases/{uuid}/backups), so `apply` has to read that route to know
+// whether to POST or PATCH — and used to do neither outside the create branch.
+describe("buildExecutor backup schedules", () => {
+  type Call = { method: string; path: string; body?: unknown };
+
+  // Records every request so a test can assert not just what was written, but
+  // what was NOT — a schedule silently skipped is the whole defect.
+  function recorder(handler: (path: string, init?: RequestInit) => Response): {
+    calls: Call[];
+    fetchImpl: typeof fetch;
+  } {
+    const calls: Call[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      calls.push({
+        method: init?.method ?? "GET",
+        path,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      });
+      return handler(path, init);
+    }) as unknown as typeof fetch;
+    return { calls, fetchImpl };
+  }
+
+  const ctx = {
+    projectName: "widget",
+    envName: "prod",
+    serverUuid: "srv-1",
+    githubAppUuid: "gh-1",
+    serverName: "prod-box",
+    orgRepo: "acme/widget",
+    bindingEnv: "prod",
+    s3DestinationUuid: "s3-1",
+  };
+
+  const schedule = { frequency: "0 3 * * *", retention: 7 };
+  const liveRow = {
+    uuid: "sched-1",
+    frequency: "0 5 * * *",
+    database_backup_retention_amount_locally: 3,
+    enabled: true,
+  };
+
+  // THE FIX. A database that exists and has no schedule gets one on update —
+  // before this, `apply` wrote a schedule only inside the create branch, so
+  // adding `backup:` to a live database was a clean run and zero backups.
+  it("CREATES the schedule on update when the database has none", async () => {
+    const { calls, fetchImpl } = recorder((path, init) => {
+      if (path === "/api/v1/databases/db-1/backups" && init?.method === "POST")
+        return new Response(JSON.stringify({ uuid: "sched-new" }), {
+          status: 201,
+        });
+      if (path === "/api/v1/databases/db-1/backups")
+        return new Response(JSON.stringify([]), { status: 200 }); // read: none
+      return new Response("{}", { status: 200 });
+    });
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await exec.updateFields("db-1", "database", { backup: schedule });
+    const post = calls.find((c) => c.method === "POST");
+    expect(post?.path).toBe("/api/v1/databases/db-1/backups");
+    expect(post?.body).toEqual({
+      frequency: "0 3 * * *",
+      database_backup_retention_amount_locally: 7,
+      save_s3: true,
+      s3_storage_uuid: "s3-1",
+      enabled: true,
+    });
+  });
+
+  it("PATCHES the existing schedule rather than adding a second one", async () => {
+    const { calls, fetchImpl } = recorder((path, init) => {
+      if (path === "/api/v1/databases/db-1/backups" && init?.method === "GET")
+        return new Response(JSON.stringify([liveRow]), { status: 200 });
+      return new Response("{}", { status: 200 });
+    });
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await exec.updateFields("db-1", "database", { backup: schedule });
+    expect(calls.filter((c) => c.method === "POST")).toEqual([]);
+    const patch = calls.find((c) => c.method === "PATCH");
+    expect(patch?.path).toBe("/api/v1/databases/db-1/backups/sched-1");
+    expect(patch?.body).toMatchObject({
+      frequency: "0 3 * * *",
+      database_backup_retention_amount_locally: 7,
+      // Re-enabled: declaring `backup:` asks for backups, not for a disabled
+      // row that looks like backups.
+      enabled: true,
+    });
+  });
+
+  it("does not PATCH the database itself for a backup-only change", async () => {
+    const { calls, fetchImpl } = recorder((path, init) => {
+      if (path === "/api/v1/databases/db-1/backups" && init?.method === "GET")
+        return new Response(JSON.stringify([liveRow]), { status: 200 });
+      return new Response("{}", { status: 200 });
+    });
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await exec.updateFields("db-1", "database", { backup: schedule });
+    // `backup` is not a column on the database — it must never reach the
+    // database's own update body, and an empty body is not worth a write.
+    expect(calls.some((c) => c.path === "/api/v1/databases/db-1")).toBe(false);
+  });
+
+  // Degrade honestly: an apply that promised a backup schedule and cannot tell
+  // whether one already exists must STOP, not guess. POSTing blind would
+  // duplicate an existing schedule; skipping is the silent no-op being fixed.
+  it("refuses to guess when the schedule read fails", async () => {
+    const { calls, fetchImpl } = recorder((path, init) => {
+      if (path === "/api/v1/databases/db-1/backups" && init?.method === "GET")
+        return new Response("gateway timeout", { status: 504 });
+      return new Response("{}", { status: 200 });
+    });
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await expect(
+      exec.updateFields("db-1", "database", { backup: schedule }),
+    ).rejects.toThrow(/cannot set the declared backup schedule/);
+    expect(calls.filter((c) => c.method === "POST")).toEqual([]);
+  });
+
+  it("refuses to guess which of several schedules the manifest meant", async () => {
+    const { fetchImpl } = recorder((path, init) => {
+      if (path === "/api/v1/databases/db-1/backups" && init?.method === "GET")
+        return new Response(
+          JSON.stringify([liveRow, { ...liveRow, uuid: "sched-2" }]),
+          { status: 200 },
+        );
+      return new Response("{}", { status: 200 });
+    });
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await expect(
+      exec.updateFields("db-1", "database", { backup: schedule }),
+    ).rejects.toThrow(/holds 2 backup schedules/);
+  });
+
+  it("leaves an undeclared schedule alone (apply never removes)", async () => {
+    const { calls, fetchImpl } = recorder(
+      () => new Response("{}", { status: 200 }),
+    );
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await exec.updateFields("db-1", "database", { version: "17" });
+    expect(calls.some((c) => c.path.includes("/backups"))).toBe(false);
+  });
+
+  it("still POSTs the schedule on create, without a read", async () => {
+    const { calls, fetchImpl } = recorder((path) => {
+      if (path === "/api/v1/projects")
+        return new Response(
+          JSON.stringify([{ uuid: "proj-1", name: "widget" }]),
+          { status: 200 },
+        );
+      if (path === "/api/v1/projects/proj-1/environments")
+        return new Response(JSON.stringify([{ name: "prod" }]), {
+          status: 200,
+        });
+      if (path === "/api/v1/databases/postgresql")
+        return new Response(JSON.stringify({ uuid: "db-9" }), { status: 201 });
+      return new Response(JSON.stringify({ uuid: "sched-9" }), { status: 201 });
+    });
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await exec.createResource({
+      kind: "database",
+      name: "postgres",
+      op: "create",
+      fieldDiffs: [
+        { field: "type", desired: "postgresql", updatable: false },
+        { field: "backup", desired: schedule, updatable: true },
+      ],
+      envDiffs: [],
+    });
+    // A database created a moment ago provably has no schedule: POST straight
+    // out, with no read that could fail and abort the create.
+    expect(
+      calls.some((c) => c.method === "GET" && c.path.includes("/backups")),
+    ).toBe(false);
+    const post = calls.find((c) => c.path === "/api/v1/databases/db-9/backups");
+    expect(post?.body).toMatchObject({ frequency: "0 3 * * *", save_s3: true });
+    // And `backup` never reaches the database's own create body.
+    const create = calls.find((c) => c.path === "/api/v1/databases/postgresql");
+    expect(create?.body).not.toHaveProperty("backup");
+  });
+
+  it("refuses a declared schedule with no s3_destination configured", async () => {
+    const { fetchImpl } = recorder(
+      () => new Response(JSON.stringify([]), { status: 200 }),
+    );
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      { ...ctx, s3DestinationUuid: undefined },
+    );
+    await expect(
+      exec.updateFields("db-1", "database", { backup: schedule }),
+    ).rejects.toThrow(/no s3_destination UUID/);
   });
 });

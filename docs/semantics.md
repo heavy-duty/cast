@@ -553,6 +553,79 @@ the plan. There is no `--yes`: a store written without someone reading the
 provenance column is the outcome the verb exists to prevent. A closed stdin
 aborts rather than hanging.
 
+### Pass 2 (`capture --generated-only`)
+
+An environment that declares `generated_secrets:` **bootstraps in two passes, by
+construction** — the value does not exist until Coolify makes it:
+
+    capture  →  apply  →  capture --generated-only
+    (placeholds)  (Coolify generates)  (the store learns the real value)
+
+Without pass 2 the store's value for `DATABASE_URL` stays a placeholder while the
+live value is real — which is exactly the state in which the next routine `apply`
+overwrites a working secret (#47). **The absence of pass 2 is what leaves that gun
+loaded**, and it is on the DR path: *rebuild the control plane from state* means
+apply-from-nothing, which means every generated secret in every store is a
+placeholder again. This used to be a hand `age` re-encrypt against production —
+decrypt a fourteen-name store, edit two lines, re-encrypt to the environment's
+recipient, holding the prod key, with a `jq` filter that must not pick the wrong row.
+
+`--generated-only` **inverts** capture's disposition rule and changes nothing else:
+the names in `generated_secrets` are the ones it *fills*, and every other name is
+left **exactly as the store has it, byte for byte** — never re-read from the box,
+which is what makes it safe to run against an environment whose other secrets have
+since been rotated by hand. Same verb, same store-writing code path, same typed
+confirmation.
+
+| | |
+| --- | --- |
+| **fill** | a generated name holding the placeholder → the value from the database that owns it |
+| **keep** | every other name → carried over from the store, untouched |
+| **UNMAPPED** | cast cannot attribute the name to exactly one database → **refuses** |
+| **OCCUPIED** | a generated name already holding a real value → **refuses** (without `--force`) |
+| **ABSENT** | a generated name the store does not carry at all → **refuses** |
+| **PENDING** | a placeholder in a name nothing here fills → **refuses** |
+
+**The value is read from the resource that OWNS it.** A generated URL never appears
+on the consuming application's env — the app's env holds whatever the template
+resolved to, which at this point in the bootstrap is *the placeholder itself*.
+Reading the app back would faithfully capture the lie pass 2 exists to correct. It
+lives on the **database**, as `internal_db_url`.
+
+**Resolved inside the project + environment, never instance-wide.** cast reads
+`GET /projects/{uuid}/{env}`, whose `postgresqls` / `redis` relations are *this*
+environment's and nothing else's. It never calls `GET /databases`, which lists
+every database on the box — other projects', and umami's own bundled Postgres —
+where picking ours out means matching by name across a list in which a collision
+is both possible and silent (#29 in another hat, and the reason the hand-run `jq`
+carried a comment about not taking the third row). The scoping is **structural**
+rather than a filter cast has to remember to get right.
+
+**cast will not guess which database a name comes from.** Nothing in the system
+carries that edge: `generated_secrets:` is a flat list of *names*, the env template
+knows only `DATABASE_URL=${DATABASE_URL}`, and the box does not say. So the
+inference is made **only when it cannot be wrong** — one generated name, one
+database, no other candidate — and otherwise the run refuses and hands back the
+flag: `--from DATABASE_URL=incubator-db`. Reading the type out of the *name*
+(`REDIS_URL` → the redis one) is precisely the bug this must not have: a
+name-directed pick is wrong **silently**, and what it writes is a perfectly
+well-formed URL to somebody else's database.
+
+**And it asserts the postcondition it exists for** — against the ciphertext now on
+disk, decrypted back, not trusted from memory. Zero `pending-coolify-generated`
+remain, and the name count is unchanged. Both claims, because they fail in opposite
+directions: a store that still holds a placeholder is still a lie, and a store that
+*lost* a name on the way through re-encrypts perfectly, reads back perfectly, and
+surfaces at the next `apply` as a missing secret in an environment whose plaintext
+nobody has any more. That assertion used to be a line in a human runbook — which is
+to say, a step that could be skipped.
+
+`apply` deliberately does **not** do this automatically after a create. It would
+close the window entirely, but it would make the verb that mutates Coolify also
+mutate the encrypted store and hence the git repo — a much bigger blast radius for
+a verb people run on a schedule. A separate, explicit, operator-run verb is the
+right first step.
+
 ## Drafts (`inventory --emit-draft`)
 
 `inventory` with no repo sweeps an instance. `--emit-draft <dir>` writes that

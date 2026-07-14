@@ -14,11 +14,17 @@ import {
   smokeTargetFor,
 } from "./bindings.js";
 import {
+  type GeneratedSource,
   type LiveEnvs,
   absentResources,
+  assertGeneratedComplete,
   classify,
+  generatedPlanRefuses,
+  planGenerated,
   renderAbsentResources,
   renderCapturePlan,
+  renderGeneratedPlan,
+  resolveGeneratedSources,
 } from "./capture.js";
 import {
   type CoolifyInstance,
@@ -88,6 +94,7 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
        cast diff      <org>/<repo> --env <env> [--full] [--project <name>] [--environment <name>]
        cast diff      --env <env> --all [--full]          # no repo: EVERY registered project
        cast capture   <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--generated <NAME>] [--override <NAME>] [--force]
+       cast capture   <org>/<repo> --env <env> --generated-only [--from <NAME>=<db>] [--force]   # pass 2, AFTER apply
        cast inventory <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--resource <m>=<l>]
        cast inventory --env <env> [--instance <name>]     # no repo: SWEEP the whole instance
        cast inventory --env <env> --emit-draft <dir> [--recipient age1…] [--no-secrets]
@@ -151,6 +158,24 @@ capture (adopt a hand-built instance into the age secret store):
                        The VALUE is read from \$CAST_CAPTURE_<NAME>, never from the
                        command line — argv is visible in \`ps\`. Repeatable.
   --force              overwrite an existing store (refused by default).
+
+capture --generated-only (PASS 2 — run it AFTER \`apply\` has created the resources):
+  a manifest with \`generated_secrets:\` bootstraps in two passes, because the value
+  does not exist until Coolify makes it: pass 1 \`capture\` placeholds those names,
+  \`apply\` creates the database, and this fills the store with the URL Coolify then
+  generated. It INVERTS capture's rule — it fills the generated names and leaves
+  every other name in the store exactly as it is. The store must already exist.
+  The value is read from the DATABASE that owns it (\`internal_db_url\`), resolved
+  inside this project+environment only — never from a consuming app's env, where a
+  generated URL never appears, and never from the instance-wide database list.
+  --from <NAME>=<db>   which live database NAME is filled from. Required whenever
+                       more than one database could be meant: nothing in the
+                       manifest, the templates or the box says that DATABASE_URL
+                       comes from the postgres one, and cast refuses to guess by
+                       name rather than write another database's credentials into
+                       your store. Repeatable.
+  --force              fill a generated name that already holds a REAL value
+                       (refused by default — it is a silent credential rotation).
 
 inventory --emit-draft (write down what a box has, as a PROPOSAL):
   --emit-draft <dir>   emit what the sweep saw as a draft of cast's own inputs — a
@@ -574,6 +599,48 @@ export function parseResourceAliases(
   return alias;
 }
 
+// `--from <NAME>=<database>` — the edge nothing else in the system carries.
+//
+// The right side is the database as COOLIFY names it, in this project and
+// environment (which is what `capture --generated-only`'s own refusal prints
+// for you). Not the manifest's name: --resource exists to reconcile those two
+// vocabularies for the diff, and pass 2 reads its value straight off the live
+// resource, so the live name is the one that can be checked.
+export function parseFromPairs(
+  pairs: string[],
+  generated: string[],
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const pair of pairs) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0 || eq === pair.length - 1) {
+      throw new Error(`--from expects <NAME>=<database-name>, got "${pair}"`);
+    }
+    const ref = pair.slice(0, eq).trim();
+    const db = pair.slice(eq + 1).trim();
+    // A --from naming something that is not a generated secret is a no-op that
+    // LOOKS like it did something: pass 2 fills generated names and nothing
+    // else, so the flag would be silently ignored and the operator would walk
+    // away believing they had set a value.
+    if (!generated.includes(ref)) {
+      throw new Error(
+        [
+          `--from ${ref}=${db}: ${ref} is not a generated secret in this environment`,
+          "",
+          `  generated:  ${generated.join(", ") || "(none declared)"}`,
+          "",
+          "--generated-only fills the generated names only. A name that is not one of",
+          "them is carried over from the store untouched, and --from cannot change that.",
+          "Declare it in the manifest's `generated_secrets:` (or pass --generated <NAME>)",
+          "if it really is provider-generated.",
+        ].join("\n"),
+      );
+    }
+    out[ref] = db;
+  }
+  return out;
+}
+
 // Rename live resources to the manifest's vocabulary, once, at the boundary.
 // Everything downstream — computeDiff, classify, reconcile — then matches by
 // name as it always has, and none of them needs to know a box was involved.
@@ -609,6 +676,62 @@ async function fetchEnv(
     throw err;
   })) as Array<{ key: string; real_value?: string; value: string }>;
   return Object.fromEntries(envs.map((e) => [e.key, e.real_value ?? e.value]));
+}
+
+// The databases inside ONE project+environment, each carrying the value it
+// OWNS. This is `capture --generated-only`'s only read of the box.
+//
+// Deliberately NOT `GET /databases`. That route lists every database on the
+// INSTANCE — other projects', and umami's own bundled Postgres — so finding
+// ours in it means matching by name across a list where a collision is both
+// possible and silent (#29 in another hat; the hand-run jq this verb replaces
+// had a comment warning not to pick the third row). `GET /projects/{uuid}/{env}`
+// cannot express that bug: it eager-loads `postgresqls` and `redis` for THIS
+// environment and nothing else (ProjectController@environment_details,
+// coollabsio/coolify v4.1.2), so the scoping is structural rather than a filter
+// cast has to remember to get right.
+//
+// `internal_db_url` is an appended model attribute — `protected $appends =
+// ['internal_db_url', 'external_db_url', 'database_type', 'server_status']` on
+// BOTH app/Models/StandalonePostgresql.php and app/Models/StandaloneRedis.php
+// @ v4.1.2. Same key on both; only the URL it builds differs
+// (`postgres://user:pw@{uuid}:5432/{db}` vs `redis://user:pw@{uuid}:6379/0`).
+// environment_details serializes the models whole — serializeApiResponse
+// (bootstrap/helpers/api.php) only sorts keys, and unlike DatabasesController
+// it calls no removeSensitiveData() — so the field is present here WITHOUT the
+// sensitive-read token permission that `GET /databases` gates it behind
+// (`can_read_sensitive` → makeHidden(['internal_db_url', …])). The vendored
+// OpenAPI documents neither route's body ("Content is very complex. Will be
+// implemented later."); the spec's silence is not evidence of absence (#46).
+async function fetchGeneratedSources(
+  client: CoolifyClient,
+  projectName: string,
+  envName: string,
+): Promise<{ sources: GeneratedSource[]; urlless: string[] }> {
+  const uuid = await client.projectUuid(projectName);
+  const raw = (await client.get(
+    `/projects/${uuid}/${encodeURIComponent(envName)}`,
+  )) as {
+    postgresqls?: Array<Record<string, unknown>>;
+    redis?: Array<Record<string, unknown>>;
+  } | null;
+  const sources: GeneratedSource[] = [];
+  const urlless: string[] = [];
+  const take = (type: string, items: Array<Record<string, unknown>> = []) => {
+    for (const i of items) {
+      const url = i.internal_db_url;
+      // A database that is THERE but will not tell us its URL. Never a fill of
+      // "" — that re-encrypts cleanly and boots the app pointed at nothing.
+      if (typeof url !== "string" || url === "") {
+        urlless.push(String(i.name));
+        continue;
+      }
+      sources.push({ resource: String(i.name), type, url });
+    }
+  };
+  take("postgresql", raw?.postgresqls);
+  take("redis", raw?.redis);
+  return { sources, urlless };
 }
 
 // The value for an --override, read from the ENVIRONMENT rather than argv.
@@ -1053,6 +1176,8 @@ async function main(): Promise<number> {
         generated: { type: "string", multiple: true },
         override: { type: "string", multiple: true },
         force: { type: "boolean", default: false },
+        "generated-only": { type: "boolean", default: false },
+        from: { type: "string", multiple: true },
       },
     });
     const orgRepo = positionals[0];
@@ -1061,6 +1186,9 @@ async function main(): Promise<number> {
       console.error(USAGE);
       return 2;
     }
+    // Pass 2 of a two-pass bootstrap. Not a different verb: same ceremony, same
+    // store-writing code path, one inverted disposition rule. See capture.ts.
+    const generatedOnly = values["generated-only"];
     const stateDir = stateDirFrom(values.state);
     const repoShort = orgRepo.split("/")[1];
     const projectName = values.project ?? repoShort;
@@ -1070,11 +1198,63 @@ async function main(): Promise<number> {
     // vocabulary.
     const coolifyEnv = values.environment ?? envName;
     const store = secretsFileFor(stateDir, repoShort, envName);
+    // Flag pairings that can never be honored, refused up front — before a state
+    // file, a store, an age key or a Coolify is opened (same disposition as
+    // PATH_IN_PROD_REFUSAL). --override supplies a value for a name cast would
+    // otherwise CAPTURE, and --generated-only captures nothing; --from names the
+    // database a GENERATED name comes from, and only pass 2 fills those.
+    if (generatedOnly && (values.override ?? []).length > 0) {
+      console.error(
+        "refuses --override with --generated-only: pass 2 fills the generated names and leaves every other name exactly as the store has it — there is nothing for an override to override. Set the value in pass 1 (`cast capture --override`), or edit it there.",
+      );
+      return 2;
+    }
+    if (!generatedOnly && (values.from ?? []).length > 0) {
+      console.error(
+        "refuses --from without --generated-only: --from names the database a generated secret is filled FROM, and plain `capture` never fills one — it placeholds them (that is the point of pass 1).",
+      );
+      return 2;
+    }
+    // --resource reconciles the MANIFEST's vocabulary with the box's for the
+    // env-reading pass, and pass 2 reads no env: it takes its value straight off
+    // the live database, which --from names in the box's own vocabulary. Left
+    // accepted, the flag would be silently ignored — the exact "the flag missed
+    // and nothing said so" failure parseResourceAliases refuses for.
+    if (generatedOnly && (values.resource ?? []).length > 0) {
+      console.error(
+        "refuses --resource with --generated-only: pass 2 reads no application env, so there is no manifest-to-box name mapping for it to use. --from names the live database directly, in the box's own vocabulary.",
+      );
+      return 2;
+    }
+    // The two passes take OPPOSITE positions on the store, and both are the same
+    // rule: never destroy values that exist nowhere else.
+    //
+    // Pass 1 writes the store from nothing, so an existing one is something it
+    // must not clobber. Pass 2 fills names INTO the store pass 1 wrote, so an
+    // absent one is not a blank slate — it means this run is pointed somewhere
+    // unexpected, and writing would produce a store holding two names out of
+    // fourteen.
+    if (generatedOnly && !existsSync(store)) {
+      console.error(
+        [
+          `refusing to capture --generated-only: ${store} does not exist`,
+          "",
+          "Pass 2 FILLS the generated names in a store that pass 1 already wrote — it does",
+          "not create one. A store written from here would hold only the generated names,",
+          "and every other name the manifest requires would be silently absent from it.",
+          "",
+          "Run `cast capture` first (pass 1), then `apply`, then this.",
+        ].join("\n"),
+      );
+      return 2;
+    }
     // Never overwrite a store by accident. `apply` never deletes; the verb
     // that WRITES the store gets the same disposition, because the thing it
     // would destroy is the only copy of values that may not exist anywhere
-    // else any more.
-    if (existsSync(store) && !values.force) {
+    // else any more. (Pass 2 is exempt: it REQUIRES the store to exist, and
+    // reuses --force for the finer refusal — overwriting a generated name that
+    // already holds a real value. See planGenerated.)
+    if (!generatedOnly && existsSync(store) && !values.force) {
       console.error(
         [
           `refusing to capture: ${store} already exists`,
@@ -1135,6 +1315,101 @@ async function main(): Promise<number> {
         }),
       );
       return 2;
+    }
+    if (generatedOnly) {
+      // Pass 2 needs the age IDENTITY, not just the recipient: it fills names
+      // into a store it must first read. Everything it does not fill is carried
+      // over from here byte for byte — never re-read from the box, which is what
+      // makes this safe to run against a live environment whose other secrets
+      // have since been rotated by hand.
+      const keyFile = keyFileFor(envName);
+      const before = decryptSecrets(store, keyFile);
+      const generatedNames = [
+        ...new Set([...generated, ...(values.generated ?? [])]),
+      ];
+      const { sources, urlless } = await fetchGeneratedSources(
+        client,
+        projectName,
+        coolifyEnv,
+      );
+      // A database that exists but will not report its URL. The only way this
+      // happens on this route is a Coolify whose shape we do not know — so it
+      // stops, rather than filling a name with something that is not a URL.
+      if (urlless.length > 0) {
+        console.error(
+          [
+            `refusing to capture --generated-only: ${urlless.length} database(s) report no internal_db_url`,
+            "",
+            `  ${urlless.join(", ")}`,
+            "",
+            "`internal_db_url` is an appended attribute on Coolify's StandalonePostgresql /",
+            "StandaloneRedis models (v4.1.2) and this route serializes them whole, so its",
+            "absence means this Coolify is not the shape cast knows. Filling a secret with an",
+            "empty value would re-encrypt cleanly and boot the app pointed at nothing.",
+          ].join("\n"),
+        );
+        return 2;
+      }
+      const { mapping, unmapped } = resolveGeneratedSources(
+        generatedNames,
+        sources,
+        parseFromPairs(values.from ?? [], generatedNames),
+      );
+      const plan = planGenerated(generatedNames, before, mapping, unmapped, {
+        force: values.force,
+      });
+      console.log(
+        renderGeneratedPlan(plan, {
+          orgRepo,
+          env: envName,
+          instance: values.instance ?? binding.instance ?? "default",
+          store,
+          recipient,
+          project: projectName,
+          environment: coolifyEnv,
+        }),
+      );
+      if (generatedPlanRefuses(plan)) return 2;
+      if (plan.fills.length === 0) {
+        console.log(
+          "\nnothing to fill — this environment declares no generated secrets, and no name in the store is still pending.",
+        );
+        return 0;
+      }
+      if (!(await confirmCapture(envName))) {
+        console.error("aborted — nothing written");
+        return 2;
+      }
+      encryptSecrets(recipient, store, {
+        ...before,
+        ...Object.fromEntries(plan.fills.map((f) => [f.ref, f.value])),
+      });
+      // The postcondition this verb exists for, asserted against the ciphertext
+      // that is now on disk — decrypted back, not trusted from memory. In the
+      // hand-run procedure this was a line in a runbook, which is to say a step
+      // that could be skipped, and was only ever as good as the operator's
+      // attention at the end of a long careful thing.
+      const after = decryptSecrets(store, keyFile);
+      const violations = assertGeneratedComplete(before, after);
+      if (violations.length > 0) {
+        console.error(
+          [
+            "",
+            `POSTCONDITION FAILED — ${store} was written, and it is not what it should be:`,
+            "",
+            ...violations.map((v) => `  - ${v}`),
+            "",
+            "This store is suspect. Do not apply from it. Restore the previous ciphertext",
+            "from the state repo (it is committed) and report this — cast wrote a store whose",
+            "shape it does not itself accept, which is a bug in cast, not in your invocation.",
+          ].join("\n"),
+        );
+        return 2;
+      }
+      console.log(
+        `\nwrote ${store} — ${plan.fills.length} name(s) filled, ${Object.keys(after).length} name(s) total (unchanged), zero pending-coolify-generated remaining, encrypted to ${recipient}`,
+      );
+      return 0;
     }
     const aliases = parseResourceAliases(
       values.resource ?? [],

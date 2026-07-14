@@ -68,6 +68,7 @@ cast apply     --env <env> --all                # no repo: EVERY registered proj
 cast diff      <org>/<repo> --env <env> [--full]
 cast diff      --env <env> --all [--full]       # no repo: EVERY registered project
 cast capture   <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
+cast capture   <org>/<repo> --env <env> --generated-only [--from <NAME>=<db>]
 cast inventory <org>/<repo> --env <env>
 cast inventory --env <env> [--emit-draft <dir> [--recipient age1…] [--no-secrets]]
 cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
@@ -104,7 +105,10 @@ cast team [--env <env>]
   point-in-time blueprint of a box. See *Drafting a box that was never declared*.
 - **`capture`** — the adoption path: reads a hand-built instance's live env and
   writes the environment's age store from it. See *Adopting a hand-built
-  instance* below.
+  instance* below. With **`--generated-only`** it is instead **pass 2 of a
+  bootstrap**: run *after* `apply`, it fills the store's provider-generated names
+  (a Coolify-made `DATABASE_URL`) with the values Coolify generated. See *The
+  bootstrap is two-pass* below.
 - **`server add`** — uploads a server's private key and registers it with Coolify.
 - **`smoke`** — contract test against the project's `smoke_target`: proves
   Coolify's bulk env endpoint still *upserts* rather than replacing. Run it after
@@ -326,6 +330,69 @@ The store is encrypted to the environment's `age_recipient` (add it to
 `environments.yaml` — it's the public half, safe to commit). Plaintext goes to
 `age` on stdin: it is never a temp file, never on stdout, never in your shell
 history. An existing store is not overwritten without `--force`.
+
+## The bootstrap is two-pass: `capture --generated-only`
+
+Those placeheld names are the reason bootstrapping an environment **cannot be one
+pass**. The value does not exist until Coolify makes it:
+
+```sh
+cast capture heavy-duty/incubator --env prod          # 1. the store learns every
+                                                      #    name; generated ones are
+                                                      #    placeheld — nothing has
+                                                      #    created them yet
+cast apply   heavy-duty/incubator --env prod          # 2. Coolify creates the
+                                                      #    database, and generates
+                                                      #    the real URL
+cast capture heavy-duty/incubator --env prod \        # 3. the store learns THAT
+  --generated-only --from DATABASE_URL=incubator-db   #    value
+```
+
+Until step 3 runs, the store says `pending-coolify-generated` while the live value
+is real — the exact state in which the next routine `apply` overwrites a working
+secret. It is also on the DR path: *rebuild the control plane from state* means
+apply-from-nothing, so every generated secret in every store is a placeholder
+again. This used to be a hand `age` re-encrypt against production, with the prod
+key in a process substitution.
+
+`--generated-only` **inverts** capture's rule and changes nothing else: it fills
+the `generated_secrets` names and leaves every other name in the store **exactly as
+it is, byte for byte** — never re-read from the box, so a secret you rotated by
+hand last month survives it. Same typed confirmation, same names-never-values plan.
+The store must already exist: pass 2 *fills* names, it does not create them.
+
+It reads each value from the **database that owns it** (`internal_db_url`) —
+never from the consuming app's env, where a generated URL never appears (the app's
+env holds what the template resolved to, which at this point is *the placeholder
+itself*). And it resolves that database **inside your project and environment
+only**, never from the instance-wide `GET /databases` list, which holds every
+database on the box — other projects', and umami's own bundled Postgres.
+
+**It will not guess which database a name comes from.** Nothing carries that edge:
+`generated_secrets:` is a flat list of names, and the template knows only
+`DATABASE_URL=${DATABASE_URL}`. So cast infers it only when it *cannot* be wrong
+(one name, one database) and otherwise refuses, printing the flag you need. A pick
+made from the *name* (`REDIS_URL` → the redis one) is wrong **silently**, and what
+it writes is a well-formed URL to somebody else's database.
+
+Four refusals, each a thing that used to be a step in a runbook:
+
+| | |
+| --- | --- |
+| **UNMAPPED** | more than one database could be meant → say which, with `--from` |
+| **OCCUPIED** | the name already holds a *real* value → filling it silently rotates a live credential. `--force` to mean it |
+| **ABSENT** | the name is not in the store at all → pass 1 has not run, or you are pointed at the wrong store |
+| **PENDING** | a placeholder in a name nothing here fills → the store would still be a lie |
+
+Afterwards it **asserts the postcondition**, against the ciphertext now on disk: zero
+`pending-coolify-generated` remain, and the name count is unchanged. A store that
+lost a name re-encrypts perfectly and reads back perfectly — you would find out at
+the next `apply`, in an environment whose plaintext nobody has any more.
+
+`apply` deliberately does not do this for you after a create. It would close the
+window entirely, but it would make the verb that mutates Coolify also mutate the
+encrypted store — and hence the git repo — which is a much bigger blast radius for
+a verb people run on a schedule.
 
 **[docs/semantics.md](docs/semantics.md)** is the contract behind those
 commands: what `apply` guarantees (never deletes, never recreates a database,

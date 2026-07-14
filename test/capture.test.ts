@@ -4,8 +4,14 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   GENERATED_PLACEHOLDER,
+  type GeneratedSource,
+  assertGeneratedComplete,
   classify,
+  generatedPlanRefuses,
+  planGenerated,
   renderCapturePlan,
+  renderGeneratedPlan,
+  resolveGeneratedSources,
 } from "../src/capture.js";
 import { requiredSecrets } from "../src/resolve.js";
 
@@ -304,6 +310,287 @@ environments:
     );
     expect(() => requiredSecrets(dir, "prod")).toThrow(
       /generated_secrets names DATABASE_URL_TYPO/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pass 2 — capture --generated-only
+// ---------------------------------------------------------------------------
+
+// The live shape this verb exists for: the incubator, mid-bootstrap. Two
+// databases in the project+environment, and a third Postgres that belongs to
+// umami — the row the hand-run `jq | head` had to be careful not to pick, and
+// the one a name-directed lookup across `GET /databases` would eventually take.
+const PG: GeneratedSource = {
+  resource: "incubator-db",
+  type: "postgresql",
+  url: "postgres://u:REAL-PG-PASSWORD@abc123:5432/app",
+};
+const REDIS: GeneratedSource = {
+  resource: "incubator-redis",
+  type: "redis",
+  url: "redis://default:REAL-REDIS-PASSWORD@def456:6379/0",
+};
+
+// Pass 1 left these two placeheld; every other name is real and must survive.
+const STORE = {
+  DATABASE_URL: GENERATED_PLACEHOLDER,
+  REDIS_URL: GENERATED_PLACEHOLDER,
+  MAILGUN_API_KEY: "key-REAL",
+  ADMIN_EMAIL: "operator@example.com",
+};
+const GENERATED = ["DATABASE_URL", "REDIS_URL"];
+
+const GCTX = {
+  orgRepo: "heavy-duty/incubator",
+  env: "prod",
+  instance: "default",
+  store: "/s/secrets/incubator.prod.env.age",
+  recipient: "age1abc",
+  project: "incubator",
+  environment: "production",
+};
+
+// The mapping is stated, then the plan is built from it.
+const planWith = (
+  from: Record<string, string>,
+  store = STORE,
+  databases = [PG, REDIS],
+  opts?: { force: boolean },
+) => {
+  const { mapping, unmapped } = resolveGeneratedSources(
+    GENERATED,
+    databases,
+    from,
+  );
+  return planGenerated(GENERATED, store, mapping, unmapped, opts);
+};
+
+describe("resolveGeneratedSources", () => {
+  // The whole point: the value comes off the DATABASE, not off an app.
+  it("maps each generated name to the database the operator named", () => {
+    const { mapping, unmapped } = resolveGeneratedSources(
+      GENERATED,
+      [PG, REDIS],
+      { DATABASE_URL: "incubator-db", REDIS_URL: "incubator-redis" },
+    );
+    expect(unmapped).toEqual([]);
+    expect(mapping.DATABASE_URL).toEqual(PG);
+    expect(mapping.REDIS_URL).toEqual(REDIS);
+  });
+
+  // #29 wearing a different hat. Nothing anywhere says DATABASE_URL comes from
+  // the postgres one — inferring it from the NAME is exactly the silent wrong
+  // pick this refuses, because what it writes is a well-formed URL to somebody
+  // else's database.
+  it("refuses to guess when more than one database could be meant", () => {
+    const { mapping, unmapped } = resolveGeneratedSources(
+      GENERATED,
+      [PG, REDIS],
+      {},
+    );
+    expect(mapping).toEqual({});
+    expect(unmapped.map((u) => u.ref)).toEqual(["DATABASE_URL", "REDIS_URL"]);
+    expect(unmapped[0].why).toMatch(/will not pick by name/);
+    // It names the candidates rather than picking one.
+    expect(unmapped[0].why).toContain("incubator-db:postgresql");
+    expect(unmapped[0].why).toContain("incubator-redis:redis");
+  });
+
+  // The one inference that cannot be wrong: nothing else it could be.
+  it("infers the only database when there is exactly one, for one name", () => {
+    const { mapping, unmapped } = resolveGeneratedSources(
+      ["DATABASE_URL"],
+      [PG],
+      {},
+    );
+    expect(unmapped).toEqual([]);
+    expect(mapping.DATABASE_URL).toEqual(PG);
+  });
+
+  // ...and still refuses two names against that one database: filling REDIS_URL
+  // from the Postgres would be a perfectly well-formed lie.
+  it("does not infer when one database must serve two generated names", () => {
+    const { unmapped } = resolveGeneratedSources(GENERATED, [PG], {});
+    expect(unmapped.map((u) => u.ref)).toEqual(["DATABASE_URL", "REDIS_URL"]);
+  });
+
+  it("refuses a --from naming a database that is not in this project+env", () => {
+    const { unmapped } = resolveGeneratedSources(GENERATED, [PG, REDIS], {
+      DATABASE_URL: "umami-db",
+      REDIS_URL: "incubator-redis",
+    });
+    expect(unmapped).toHaveLength(1);
+    expect(unmapped[0].why).toMatch(/no database named "umami-db" exists/);
+  });
+
+  it("refuses when the environment holds no database at all", () => {
+    const { unmapped } = resolveGeneratedSources(["DATABASE_URL"], [], {});
+    expect(unmapped[0].why).toMatch(/no database exists/);
+  });
+});
+
+describe("planGenerated", () => {
+  it("fills the generated names and keeps every other one byte for byte", () => {
+    const p = planWith({
+      DATABASE_URL: "incubator-db",
+      REDIS_URL: "incubator-redis",
+    });
+    expect(p.fills).toEqual([
+      {
+        ref: "DATABASE_URL",
+        from: { resource: "incubator-db", type: "postgresql" },
+        value: PG.url,
+      },
+      {
+        ref: "REDIS_URL",
+        from: { resource: "incubator-redis", type: "redis" },
+        value: REDIS.url,
+      },
+    ]);
+    // Untouched — and NOT re-read from the box, which is what makes pass 2 safe
+    // to run against an environment whose other secrets were rotated by hand.
+    expect(p.kept).toEqual(["ADMIN_EMAIL", "MAILGUN_API_KEY"]);
+    expect(p.occupied).toEqual([]);
+    expect(p.absent).toEqual([]);
+    expect(p.stillPending).toEqual([]);
+  });
+
+  // The refusal that stops a silent credential rotation: someone already filled
+  // it (a previous pass 2, or by hand) and the value is live.
+  it("refuses to overwrite a generated name that already holds a real value", () => {
+    const p = planWith(
+      { DATABASE_URL: "incubator-db", REDIS_URL: "incubator-redis" },
+      { ...STORE, DATABASE_URL: "postgres://already:filled@live/db" },
+    );
+    expect(p.occupied).toEqual(["DATABASE_URL"]);
+    expect(p.fills.map((f) => f.ref)).toEqual(["REDIS_URL"]);
+    expect(generatedPlanRefuses(p)).toBe(true);
+  });
+
+  it("--force fills it anyway, deliberately", () => {
+    const p = planWith(
+      { DATABASE_URL: "incubator-db", REDIS_URL: "incubator-redis" },
+      { ...STORE, DATABASE_URL: "postgres://already:filled@live/db" },
+      [PG, REDIS],
+      { force: true },
+    );
+    expect(p.occupied).toEqual([]);
+    expect(p.fills.map((f) => f.ref)).toEqual(["DATABASE_URL", "REDIS_URL"]);
+    expect(generatedPlanRefuses(p)).toBe(false);
+  });
+
+  // Pass 2 FILLS names; it does not add them. A store missing one did not come
+  // from pass 1, and the name-count postcondition could not hold anyway.
+  it("refuses a generated name the store does not carry at all", () => {
+    const { REDIS_URL, ...withoutRedis } = STORE;
+    const p = planWith(
+      { DATABASE_URL: "incubator-db", REDIS_URL: "incubator-redis" },
+      withoutRedis,
+    );
+    expect(p.absent).toEqual(["REDIS_URL"]);
+    expect(generatedPlanRefuses(p)).toBe(true);
+  });
+
+  // A placeholder standing in a name nothing here fills: the run would
+  // "succeed" and the store would still be a lie.
+  it("refuses when a name nobody fills would be left still pending", () => {
+    const p = planWith(
+      { DATABASE_URL: "incubator-db", REDIS_URL: "incubator-redis" },
+      { ...STORE, SESSION_SECRET: GENERATED_PLACEHOLDER },
+    );
+    expect(p.stillPending).toEqual(["SESSION_SECRET"]);
+    expect(generatedPlanRefuses(p)).toBe(true);
+  });
+
+  it("a refused name is not also reported as kept", () => {
+    const p = planWith({});
+    expect(p.kept).toEqual(["ADMIN_EMAIL", "MAILGUN_API_KEY"]);
+    expect(p.unmapped).toHaveLength(2);
+  });
+});
+
+describe("renderGeneratedPlan", () => {
+  // capture.ts:166's rule, unchanged: names, provenance, and the resource a
+  // value came FROM. The only value-shaped thing printed is the placeholder
+  // literal being replaced.
+  it("prints names and never a value", () => {
+    const out = renderGeneratedPlan(
+      planWith({ DATABASE_URL: "incubator-db", REDIS_URL: "incubator-redis" }),
+      GCTX,
+    );
+    expect(out).not.toContain("REAL-PG-PASSWORD");
+    expect(out).not.toContain("REAL-REDIS-PASSWORD");
+    expect(out).not.toContain("key-REAL");
+    expect(out).toContain("DATABASE_URL");
+    expect(out).toContain("incubator-db (postgresql) internal_db_url");
+    expect(out).toContain(GENERATED_PLACEHOLDER);
+    // The store is not being rewritten around the names it keeps, and says so.
+    expect(out).toMatch(/MAILGUN_API_KEY\s+keep/);
+  });
+
+  it("hands back a ready-to-paste --from when it will not guess", () => {
+    const out = renderGeneratedPlan(planWith({}), GCTX);
+    expect(out).toMatch(/refusing to write the store/);
+    expect(out).toContain("--from DATABASE_URL=<database name>");
+    expect(out).toContain("--from REDIS_URL=<database name>");
+  });
+
+  it("says a fill would rotate a live credential", () => {
+    const out = renderGeneratedPlan(
+      planWith(
+        { DATABASE_URL: "incubator-db", REDIS_URL: "incubator-redis" },
+        { ...STORE, DATABASE_URL: "postgres://live" },
+      ),
+      GCTX,
+    );
+    expect(out).toMatch(/OCCUPIED/);
+    expect(out).toMatch(/rotate a live credential/);
+    expect(out).not.toContain("postgres://live");
+  });
+});
+
+// The assertion that was a line in a human runbook ("assert 14 names / zero
+// placeholders"), which is to say a step that could be skipped.
+describe("assertGeneratedComplete", () => {
+  it("passes when every placeholder is gone and the name set is unchanged", () => {
+    const after = { ...STORE, DATABASE_URL: PG.url, REDIS_URL: REDIS.url };
+    expect(assertGeneratedComplete(STORE, after)).toEqual([]);
+  });
+
+  it("catches a placeholder left standing", () => {
+    const after = { ...STORE, DATABASE_URL: PG.url };
+    const v = assertGeneratedComplete(STORE, after);
+    expect(v).toHaveLength(1);
+    expect(v[0]).toMatch(
+      /still hold the pending-coolify-generated literal: REDIS_URL/,
+    );
+  });
+
+  // A store that LOST a name re-encrypts perfectly and reads back perfectly.
+  // The failure surfaces at the next apply, in an environment whose plaintext
+  // nobody has any more.
+  it("catches a name dropped on the way through", () => {
+    const { MAILGUN_API_KEY, ...lost } = {
+      ...STORE,
+      DATABASE_URL: PG.url,
+      REDIS_URL: REDIS.url,
+    };
+    const v = assertGeneratedComplete(STORE, lost);
+    expect(v.join(" ")).toMatch(/went in with 4 name\(s\) and came out with 3/);
+    expect(v.join(" ")).toMatch(/names LOST: MAILGUN_API_KEY/);
+  });
+
+  it("catches a name that was never supposed to be added", () => {
+    const after = {
+      ...STORE,
+      DATABASE_URL: PG.url,
+      REDIS_URL: REDIS.url,
+      SURPRISE: "x",
+    };
+    expect(assertGeneratedComplete(STORE, after).join(" ")).toMatch(
+      /names ADDED: SURPRISE/,
     );
   });
 });

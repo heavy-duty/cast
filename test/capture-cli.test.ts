@@ -11,7 +11,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { decryptSecrets } from "../src/secrets.js";
+import { decryptSecrets, encryptSecrets } from "../src/secrets.js";
 
 // End-to-end: the real CLI, a real age identity, a stub Coolify holding real
 // live values. The point is the store that comes out the other side — it is
@@ -106,10 +106,16 @@ OPENROUTER_API_KEY=\${OPENROUTER_API_KEY}
 ADMIN_EMAIL=\${ADMIN_EMAIL}
 `;
 
-function fixture(url: string, opts: { template?: string } = {}) {
+function fixture(
+  url: string,
+  opts: { template?: string; manifest?: string } = {},
+) {
   const checkout = mkdtempSync(join(tmpdir(), "cast-co-"));
   mkdirSync(join(checkout, ".infra", "env"), { recursive: true });
-  writeFileSync(join(checkout, ".infra", "manifest.yaml"), MANIFEST);
+  writeFileSync(
+    join(checkout, ".infra", "manifest.yaml"),
+    opts.manifest ?? MANIFEST,
+  );
   writeFileSync(
     join(checkout, ".infra", "env", "core.staging.env.template"),
     opts.template ?? TEMPLATE,
@@ -330,5 +336,372 @@ describe("cast capture (end to end)", () => {
     expect(r.output).toMatch(/refusing to capture/);
     expect(r.output).toMatch(/no project named "typo"/);
     expect(r.output).not.toMatch(/MISSING/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pass 2 — `cast capture --generated-only` (end to end)
+//
+// The bootstrap this closes: pass 1 wrote a store in which the generated names
+// are placeholders, `apply` then created the database, and Coolify generated the
+// real URL. Until this runs, the store's value is a lie while the live value is
+// real — which is the state that makes the next routine apply overwrite a
+// working secret (#47). Everything here runs against a real age identity and a
+// real `dist/cli.js`; the store is decrypted afterwards and asserted on.
+// ---------------------------------------------------------------------------
+
+// The values Coolify generated when it created the resources. NOT reachable from
+// any application's env — the app's env holds what the template resolved to,
+// which at this point in the bootstrap is the placeholder itself.
+const PG_URL = "postgres://postgres:GENERATED-PG-PASSWORD@abc123:5432/app";
+const REDIS_URL = "redis://default:GENERATED-REDIS-PASSWORD@def456:6379/0";
+// Another project's database entirely. `GET /databases` would list it right next
+// to ours — it is umami's bundled Postgres, the row the hand-run `jq` had to be
+// careful not to pick. A name-directed lookup across the instance eventually
+// takes it, and what it writes is a well-formed URL to the wrong database.
+const UMAMI_URL = "postgres://umami:UMAMI-PASSWORD@zzz999:5432/umami";
+
+const GEN_MANIFEST = `project: incubator
+environments:
+  staging:
+    generated_secrets: [DATABASE_URL, REDIS_URL]
+    applications:
+      core:
+        source: { repo: heavy-duty/incubator, branch: main }
+        build: { pack: nixpacks, base_directory: / }
+        domains: ["http://core.example.com"]
+        env_template: core.staging.env.template
+    databases:
+      incubator-db: { type: postgresql }
+      incubator-redis: { type: redis }
+`;
+
+const GEN_TEMPLATE = `NODE_ENV=production
+DATABASE_URL=\${DATABASE_URL}
+REDIS_URL=\${REDIS_URL}
+MAILGUN_API_KEY=\${MAILGUN_API_KEY}
+`;
+
+// What pass 1 left behind: the two generated names placeheld, the real secret
+// captured. Pass 2 must fill the first two and not disturb the third.
+const PASS1_STORE = {
+  DATABASE_URL: "pending-coolify-generated",
+  REDIS_URL: "pending-coolify-generated",
+  MAILGUN_API_KEY: "key-REAL-MAILGUN-SECRET",
+};
+
+// Records every path the CLI asks for, so a test can assert on what cast did
+// NOT call — `GET /databases` is instance-wide, and never reaching for it is the
+// point, not an implementation detail.
+async function stubCoolifyWithDatabases(): Promise<Stub & { hits: string[] }> {
+  const hits: string[] = [];
+  const server = createServer((req, res) => {
+    const path = (req.url ?? "").replace("/api/v1", "");
+    hits.push(path);
+    const json = (body: unknown) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (path === "/teams/current") return json({ id: 0, name: "Root Team" });
+    if (path === "/projects")
+      return json([
+        { uuid: "p1", name: "incubator" },
+        { uuid: "p2", name: "analytics" },
+      ]);
+    // The project+environment document. Coolify's environment_details eager-loads
+    // these relations and serializes the models whole, so `internal_db_url` (an
+    // appended attribute on StandalonePostgresql / StandaloneRedis) rides along.
+    if (path === "/projects/p1/staging")
+      return json({
+        applications: [{ name: "core", uuid: "a1" }],
+        postgresqls: [
+          { name: "incubator-db", uuid: "abc123", internal_db_url: PG_URL },
+        ],
+        redis: [
+          {
+            name: "incubator-redis",
+            uuid: "def456",
+            internal_db_url: REDIS_URL,
+          },
+        ],
+      });
+    // Instance-wide: OURS and somebody else's, indistinguishable by name alone.
+    // Nothing in cast may read this.
+    if (path === "/databases")
+      return json([
+        { name: "incubator-db", internal_db_url: PG_URL },
+        { name: "incubator-redis", internal_db_url: REDIS_URL },
+        { name: "incubator-db", internal_db_url: UMAMI_URL },
+      ]);
+    // The app's env — it holds the PLACEHOLDER, which is exactly why the value
+    // must be read off the database instead.
+    if (path === "/applications/a1/envs")
+      return json([
+        {
+          key: "DATABASE_URL",
+          real_value: "pending-coolify-generated",
+          value: "REDACTED",
+        },
+        {
+          key: "MAILGUN_API_KEY",
+          real_value: "key-REAL-MAILGUN-SECRET",
+          value: "REDACTED",
+        },
+      ]);
+    res.writeHead(404);
+    res.end("{}");
+  });
+  await new Promise<void>((r) => {
+    server.listen(0, "127.0.0.1", r);
+  });
+  const stub = {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    close: () =>
+      new Promise<void>((r) => {
+        server.close(() => r());
+      }),
+    hits,
+  };
+  stubs.push(stub);
+  return stub;
+}
+
+// A fixture whose store is already what pass 1 would have written.
+function genFixture(url: string, store: Record<string, string> = PASS1_STORE) {
+  const f = fixture(url, { manifest: GEN_MANIFEST, template: GEN_TEMPLATE });
+  encryptSecrets(recipient, f.store, store);
+  return f;
+}
+
+const genBase = (f: ReturnType<typeof fixture>) => [
+  ...base(f),
+  "--generated-only",
+];
+
+// Pass 2 reads the store before it fills it, so it needs the age IDENTITY —
+// not just the recipient pass 1 needed.
+const withKey = () => ({ CAST_AGE_KEY_FILE_STAGING: keyFile });
+
+const FROM = [
+  "--from",
+  "DATABASE_URL=incubator-db",
+  "--from",
+  "REDIS_URL=incubator-redis",
+];
+
+describe("cast capture --generated-only (end to end)", () => {
+  it("fills the generated names from the databases that own them, and leaves the rest alone", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url);
+    const r = await runCapture([...genBase(f), ...FROM], {
+      stdin: "staging\n",
+      env: withKey(),
+    });
+    expect(r.code).toBe(0);
+
+    const store = decryptSecrets(f.store, keyFile);
+    // The postcondition, asserted on the actual ciphertext: zero placeholders,
+    // and the name count unchanged.
+    expect(Object.keys(store).sort()).toEqual([
+      "DATABASE_URL",
+      "MAILGUN_API_KEY",
+      "REDIS_URL",
+    ]);
+    expect(Object.values(store)).not.toContain("pending-coolify-generated");
+    // Each from the resource that OWNS it — and the redis one is a redis URL,
+    // not the Postgres URL under a redis name.
+    expect(store.DATABASE_URL).toBe(PG_URL);
+    expect(store.REDIS_URL).toBe(REDIS_URL);
+    // Carried over byte for byte. Pass 2 never re-read it from the box.
+    expect(store.MAILGUN_API_KEY).toBe("key-REAL-MAILGUN-SECRET");
+    // Never the other project's database.
+    expect(store.DATABASE_URL).not.toContain("UMAMI");
+    expect(r.output).toMatch(/zero pending-coolify-generated remaining/);
+  });
+
+  // The #29 hazard, structurally: the value is resolved inside the project and
+  // environment, so the instance-wide list is never even consulted.
+  it("never reads the instance-wide database list", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url);
+    const r = await runCapture([...genBase(f), ...FROM], {
+      stdin: "staging\n",
+      env: withKey(),
+    });
+    expect(r.code).toBe(0);
+    expect(stub.hits).toContain("/projects/p1/staging");
+    expect(stub.hits).not.toContain("/databases");
+  });
+
+  // capture.ts:166's rule holds in pass 2: the only value-shaped thing printed
+  // is the placeholder literal being replaced.
+  it("never prints a secret value to the console", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url);
+    const r = await runCapture([...genBase(f), ...FROM], {
+      stdin: "staging\n",
+      env: withKey(),
+    });
+    expect(r.code).toBe(0);
+    for (const value of [PG_URL, REDIS_URL, "key-REAL-MAILGUN-SECRET"]) {
+      expect(r.output).not.toContain(value);
+    }
+    expect(r.output).not.toContain("GENERATED-PG-PASSWORD");
+    // The NAMES, and where each value came from, are the plan.
+    expect(r.output).toMatch(/DATABASE_URL\s+fill/);
+    expect(r.output).toContain("incubator-db (postgresql) internal_db_url");
+    expect(r.output).toMatch(/MAILGUN_API_KEY\s+keep/);
+  });
+
+  // Nothing in the manifest, the templates or the box says DATABASE_URL comes
+  // from the postgres one. cast will not guess — it hands back the flag.
+  it("refuses to guess which database a name comes from, and says how to say it", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url);
+    const r = await runCapture(genBase(f), {
+      stdin: "staging\n",
+      env: withKey(),
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/UNMAPPED/);
+    expect(r.output).toContain("--from DATABASE_URL=<database name>");
+    // Refused BEFORE the store was touched.
+    expect(decryptSecrets(f.store, keyFile)).toEqual(PASS1_STORE);
+  });
+
+  // The refusal that keeps this from being a silent credential rotation.
+  it("refuses to overwrite a generated name that already holds a real value", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url, {
+      ...PASS1_STORE,
+      DATABASE_URL: "postgres://set:BY-HAND@live:5432/app",
+    });
+    const r = await runCapture([...genBase(f), ...FROM], {
+      stdin: "staging\n",
+      env: withKey(),
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/OCCUPIED/);
+    expect(r.output).toMatch(/rotate a live credential/);
+    expect(r.output).toMatch(/--force/);
+    // Untouched — including the name it COULD have filled. A refusal is a stop,
+    // not a partial write.
+    const store = decryptSecrets(f.store, keyFile);
+    expect(store.DATABASE_URL).toBe("postgres://set:BY-HAND@live:5432/app");
+    expect(store.REDIS_URL).toBe("pending-coolify-generated");
+  });
+
+  it("--force rotates it deliberately", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url, {
+      ...PASS1_STORE,
+      DATABASE_URL: "postgres://set:BY-HAND@live:5432/app",
+    });
+    const r = await runCapture([...genBase(f), ...FROM, "--force"], {
+      stdin: "staging\n",
+      env: withKey(),
+    });
+    expect(r.code).toBe(0);
+    expect(decryptSecrets(f.store, keyFile).DATABASE_URL).toBe(PG_URL);
+  });
+
+  // Pass 2 fills a store; it does not create one. A store written from here
+  // would hold the generated names and nothing else.
+  it("refuses when the store does not exist — pass 1 has not run", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = fixture(stub.url, {
+      manifest: GEN_MANIFEST,
+      template: GEN_TEMPLATE,
+    });
+    const r = await runCapture([...genBase(f), ...FROM], {
+      stdin: "staging\n",
+      env: withKey(),
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/does not exist/);
+    expect(r.output).toMatch(/Pass 2 FILLS the generated names/);
+    expect(existsSync(f.store)).toBe(false);
+  });
+
+  // A placeholder nobody fills would leave the store still lying — and the next
+  // apply would push that literal at a live app.
+  it("refuses to leave a placeholder standing in a name it does not fill", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url, {
+      ...PASS1_STORE,
+      MAILGUN_API_KEY: "pending-coolify-generated",
+    });
+    const r = await runCapture([...genBase(f), ...FROM], {
+      stdin: "staging\n",
+      env: withKey(),
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/MAILGUN_API_KEY\s+PENDING/);
+    expect(r.output).toMatch(/would still hold the/);
+  });
+
+  // The confirmation is the same last gate as pass 1, and it is not "y".
+  it("aborts, writing nothing, when the confirmation does not name the env", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url);
+    const r = await runCapture([...genBase(f), ...FROM], {
+      stdin: "y\n",
+      env: withKey(),
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/aborted/);
+    expect(decryptSecrets(f.store, keyFile)).toEqual(PASS1_STORE);
+  });
+
+  // A flag pairing that can never be honored: pass 2 captures nothing, so there
+  // is nothing for an override to override.
+  it("refuses --override with --generated-only", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url);
+    const r = await runCapture(
+      [...genBase(f), ...FROM, "--override", "MAILGUN_API_KEY"],
+      { stdin: "staging\n", env: withKey() },
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/refuses --override with --generated-only/);
+  });
+
+  it("refuses --from without --generated-only", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = fixture(stub.url, {
+      manifest: GEN_MANIFEST,
+      template: GEN_TEMPLATE,
+    });
+    const r = await runCapture([...base(f), ...FROM], { stdin: "staging\n" });
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/refuses --from without --generated-only/);
+  });
+
+  // A --from for a name that is not generated would be silently ignored, and
+  // the operator would walk away believing they had set a value.
+  it("refuses a --from naming something that is not a generated secret", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url);
+    const r = await runCapture(
+      [...genBase(f), "--from", "MAILGUN_API_KEY=incubator-db"],
+      { stdin: "staging\n", env: withKey() },
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/is not a generated secret/);
+  });
+});
+
+// --resource maps manifest names to box names for the env-reading pass, and pass
+// 2 reads no env. Accepted, it would be silently ignored.
+describe("cast capture --generated-only (flag hygiene)", () => {
+  it("refuses --resource with --generated-only", async () => {
+    const stub = await stubCoolifyWithDatabases();
+    const f = genFixture(stub.url);
+    const r = await runCapture(
+      [...genBase(f), ...FROM, "--resource", "core=Core"],
+      { stdin: "staging\n", env: withKey() },
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.output).toMatch(/refuses --resource with --generated-only/);
   });
 });

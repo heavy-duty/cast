@@ -624,6 +624,33 @@ one used — verified against a live private clone.
   Coolify 4.1.2 services — configure hostnames manually in the Coolify UI`)
   once per run for every service that declared any. Set service hostnames
   in the Coolify UI by hand.
+- **"Include Source Commit in Build" cannot be enabled via the API in Coolify
+  4.1.2 — `apply` warns instead.** A dockercompose application whose build
+  consumes `SOURCE_COMMIT` as a **build arg** only receives it if the
+  per-application setting *Include Source Commit in Build* is on; Coolify
+  withholds it by default to preserve build cache. That setting
+  (`ApplicationSetting.include_source_commit_in_build`, default `false`) has no
+  API surface in 4.1.2: it appears in **zero** API controllers, and both the
+  create and PATCH allowlists in `ApplicationsController.php` (l.914, l.2368)
+  reject unrecognized keys outright (`"This field is not allowed."`), so cast
+  cannot smuggle it through — sending it would fail the whole request. Its only
+  writer is the Livewire *Advanced* tab
+  (`app/Livewire/Project/Application/Advanced.php:128`), i.e. a human in the UI.
+  Contrast `connect_to_docker_network`, which *is* in both allowlists and which
+  `apply` therefore does set on create. So `desiredFromManifest` **warns** once
+  per dockercompose application (`application <name> builds with dockercompose,
+  but apply cannot enable "Include Source Commit in Build" on Coolify 4.1.2 …`)
+  rather than pretending it is desired state. Enable it in the Coolify UI and
+  redeploy if your image bakes the SHA in at build time.
+
+  **This toggle gates the build-time arg only.** Coolify's **runtime** injection
+  of `SOURCE_COMMIT` is unconditional with respect to it
+  (`ApplicationDeploymentJob.php:2949` — `if (! $forBuildTime || …)`
+  short-circuits true at runtime), so a service that reads
+  `process.env.SOURCE_COMMIT` per request does **not** need the toggle at all.
+  What silently suppresses *that* value is an application-level env var of the
+  same name (`ApplicationDeploymentJob.php:2950`) — a distinct trap, and the
+  actual cause of a live box reporting `{"sha":"unknown"}`.
 - **The redis default image is an unverified extrapolation.** Coolify's
   "New Resource" wizard drives PostgreSQL version selection through a
   verified `postgres:<version>-alpine` image string; Redis has no version

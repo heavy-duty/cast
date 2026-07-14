@@ -305,7 +305,9 @@ environments:
       join(dir, ".infra", "env", "core.prod.env.template"),
       "PORT=3000\n",
     );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { desired } = desiredFromManifest(dir, "prod", {});
+    warn.mockRestore();
     expect(desired).toHaveLength(1);
     expect(desired[0]).toMatchObject({
       kind: "application",
@@ -324,6 +326,56 @@ environments:
     expect(desired[0].fields).not.toHaveProperty("port");
     expect(desired[0].fields).not.toHaveProperty("healthcheck");
     expect(desired[0].fields).not.toHaveProperty("domains");
+  });
+  it('warns that apply cannot enable "Include Source Commit in Build" on a dockercompose app (unsettable via the Coolify 4.1.2 API)', () => {
+    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    mkdirSync(join(dir, ".infra"), { recursive: true });
+    writeFileSync(
+      join(dir, ".infra", "manifest.yaml"),
+      `project: widget
+environments:
+  prod:
+    applications:
+      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: dockercompose, base_directory: /, compose_file: docker-compose.yaml }
+        service_domains:
+          api: ["https://api.widget.example.com"]
+`,
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { desired } = desiredFromManifest(dir, "prod", {});
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/application core/);
+    expect(warn.mock.calls[0][0]).toMatch(/Include Source Commit in Build/);
+    expect(warn.mock.calls[0][0]).toMatch(/Coolify UI/);
+    warn.mockRestore();
+    // The setting is absent from Coolify 4.1.2's create/PATCH allowlists, which
+    // reject unknown keys outright — so it must never reach `fields`, or apply
+    // would 422 on every run. Guards the fix a future reader would reach for.
+    expect(desired[0].fields).not.toHaveProperty(
+      "include_source_commit_in_build",
+    );
+  });
+  it("does not warn about the source-commit toggle for a non-dockercompose app (the build arg is a compose concern)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    mkdirSync(join(dir, ".infra"), { recursive: true });
+    writeFileSync(
+      join(dir, ".infra", "manifest.yaml"),
+      `project: widget
+environments:
+  prod:
+    applications:
+      site:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: / }
+        domains: ["https://widget.example.com"]
+`,
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    desiredFromManifest(dir, "prod", {});
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
   it("throws when the env is missing from the manifest", () => {
     const dir = mkdtempSync(join(tmpdir(), "infra-co-"));

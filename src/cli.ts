@@ -1664,9 +1664,9 @@ async function main(): Promise<number> {
 async function resolveOrCreateProject(
   client: CoolifyClient,
   name: string,
-): Promise<string> {
+): Promise<{ uuid: string; created: boolean }> {
   try {
-    return await client.projectUuid(name);
+    return { uuid: await client.projectUuid(name), created: false };
   } catch (err) {
     // projectUuid's resolver-miss (CoolifyClient.resolve) throws this exact
     // message with no `status` — that's the only case we treat as "create
@@ -1677,10 +1677,84 @@ async function resolveOrCreateProject(
       err.message === `not found in Coolify: project ${name}`
     ) {
       const p = (await client.post("/projects", { name })) as { uuid: string };
-      return p.uuid;
+      return { uuid: p.uuid, created: true };
     }
     throw err;
   }
+}
+
+// The environment every resource create names in `environment_name` has to
+// EXIST before the create, and cast is the only thing that can be relied on to
+// make it so: POST /projects gives a new project Coolify's OWN default
+// environment ("production"), not ours, so the first apply against a project
+// cast itself created 404s on the first resource — "Environment not found" —
+// with the project left behind, created and empty (#38).
+//
+// It went unseen for as long as it did because every environment cast had met
+// until then was built by hand in a UI and adopted, so it already existed under
+// whatever name someone typed — which is the same history that put `--environment`
+// in the tool. The genuinely-from-nothing apply is the one path nobody had run.
+//
+// Idempotent by construction, so it is safe on EVERY apply and not just the
+// first: absent -> create, present -> nothing. Reading before writing is also
+// what keeps this change from being able to break an apply that works TODAY —
+// an environment that already exists (every environment cast has ever touched)
+// takes the read and stops, and the create route is never called at all. The
+// 409 is the same answer as "present" (Coolify's create-environment 409s on a
+// duplicate name), reached when something else wins the race between our read
+// and our write.
+//
+// Coolify's own default environment is left exactly where it is: cast does not
+// remove things (see renderDiff — an orphan is reported and NOT repaired,
+// "removal is a manual runbook act"), and an empty `production` beside the
+// environment everything lives in is the mildest possible case of that. It is
+// reported for the same reason an orphan is: so the operator knows, and decides.
+async function ensureEnvironment(
+  client: CoolifyClient,
+  projectUuid: string,
+  projectName: string,
+  envName: string,
+  projectWasCreated: boolean,
+): Promise<void> {
+  // The read that decides. On a project cast just created, it is also the list
+  // of environments Coolify gave it by itself — which is what `strays` reports.
+  const existing = await client.environments(projectUuid);
+  if (!existing.includes(envName)) {
+    try {
+      await client.post(`/projects/${projectUuid}/environments`, {
+        name: envName,
+      });
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 409) throw err;
+    }
+  }
+  const strays = projectWasCreated ? existing.filter((e) => e !== envName) : [];
+  if (strays.length > 0) {
+    console.log(
+      `note: new project ${projectName} carries Coolify's default environment(s): ${strays.join(", ")} — empty, unused, and cast never removes (delete by hand if unwanted)`,
+    );
+  }
+}
+
+// Project + environment, reconciled once per run and then remembered — the pair
+// a resource create has to name before it can name anything else.
+function projectEnvironmentResolver(
+  client: CoolifyClient,
+  projectName: string,
+  envName: string,
+): () => Promise<string> {
+  let once: Promise<string> | undefined;
+  return () => {
+    once ??= (async () => {
+      const { uuid, created } = await resolveOrCreateProject(
+        client,
+        projectName,
+      );
+      await ensureEnvironment(client, uuid, projectName, envName, created);
+      return uuid;
+    })();
+    return once;
+  };
 }
 
 // --- Desired-vocabulary -> Coolify wire-vocabulary field mapping ---
@@ -1806,13 +1880,21 @@ export function buildExecutor(
   const destination = ctx.destinationUuid
     ? { destination_uuid: ctx.destinationUuid }
     : {};
+  // Lazy, so a run with nothing to create touches neither route, and memoized,
+  // so a run with five creates reconciles the project and its environment once
+  // rather than five times.
+  const projectEnv = projectEnvironmentResolver(
+    client,
+    ctx.projectName,
+    ctx.envName,
+  );
   return {
     async createResource(change) {
       // Field payloads assembled from change.fieldDiffs (desired values):
       const fields = Object.fromEntries(
         change.fieldDiffs.map((f) => [f.field, f.desired]),
       );
-      const projectUuid = await resolveOrCreateProject(client, ctx.projectName);
+      const projectUuid = await projectEnv();
       if (change.kind === "application") {
         const res = (await client.post("/applications/private-github-app", {
           project_uuid: projectUuid,

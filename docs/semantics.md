@@ -144,6 +144,17 @@ softened by an implementation detail):
 - Apply never deletes. Resource removal or rename is a manual runbook act;
   `diff` reports the orphan as such until that act happens.
 - Apply never recreates a database resource under any circumstances.
+- Apply creates the **project** and its **environment** when they are absent —
+  the two things a resource create has to name before it can name anything
+  else. Coolify hands a project it has just created its OWN default environment
+  (`production`), never ours, so without this the first apply against a
+  from-nothing project 404s on its first resource — *"Environment not found"* —
+  and leaves the project behind, created and empty (#38). Read-before-write, so
+  an environment that already exists is never written to: adoption keeps working
+  exactly as it did, and this cannot regress an apply that works today.
+- That default environment is **left alone**, per *apply never deletes*. An
+  empty `production` beside the environment everything lives in is reported
+  (the same courtesy an orphan gets) and removed by hand, or not at all.
 - On drift in a field the API cannot update in place (`build_pack`, a
   database's `type`/`version`, a service's `type`), apply **fails loudly
   naming the field** rather than recreating.

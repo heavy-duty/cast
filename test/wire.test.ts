@@ -177,6 +177,10 @@ describe("buildExecutor createResource (application, dockercompose)", () => {
           JSON.stringify([{ uuid: "proj-1", name: "widget" }]),
           { status: 200 },
         );
+      if (path === "/api/v1/projects/proj-1/environments")
+        return new Response(JSON.stringify([{ name: "prod" }]), {
+          status: 200,
+        });
       if (path === "/api/v1/applications/private-github-app") {
         createBody = JSON.parse(String(init?.body));
         return new Response(JSON.stringify({ uuid: "app-1" }), {
@@ -227,6 +231,10 @@ describe("buildExecutor createResource (application, dockercompose)", () => {
           JSON.stringify([{ uuid: "proj-1", name: "widget" }]),
           { status: 200 },
         );
+      if (path === "/api/v1/projects/proj-1/environments")
+        return new Response(JSON.stringify([{ name: "prod" }]), {
+          status: 200,
+        });
       if (path === "/api/v1/applications/private-github-app") {
         createBody = JSON.parse(String(init?.body));
         return new Response(JSON.stringify({ uuid: "app-2" }), {
@@ -272,6 +280,12 @@ describe("buildExecutor createResource (destination placement)", () => {
           JSON.stringify([{ uuid: "proj-1", name: "widget" }]),
           { status: 200 },
         );
+      // The environment a create names has to exist, so apply reads it first
+      // (#38). This project is an existing one and already carries `prod`.
+      if (path === "/api/v1/projects/proj-1/environments")
+        return new Response(JSON.stringify([{ name: "prod" }]), {
+          status: 200,
+        });
       if (
         path === "/api/v1/applications/private-github-app" ||
         path === "/api/v1/databases/postgresql" ||
@@ -370,6 +384,197 @@ describe("buildExecutor createResource (destination placement)", () => {
       expect(bodies[path]).not.toHaveProperty("destination_uuid");
     },
   );
+});
+
+// #38: the first apply against a project that does not exist yet. POST /projects
+// hands the new project Coolify's OWN default environment ("production"), never
+// ours — so a create that names `environment_name: prod` 404s with "Environment
+// not found" and leaves the project behind, created and empty. Every environment
+// cast had touched until then was hand-built in a UI and adopted, which is why
+// the from-nothing path is the one that had never run.
+describe("buildExecutor createResource (environment reconcile)", () => {
+  // A Coolify with ONE project's worth of state, driven by what the test hands
+  // it: `projects` is what GET /projects answers, `environments` what the
+  // project carries. Both mutate as cast writes, so the mock stays honest about
+  // what a second read would see.
+  function fakeCoolify(opts: {
+    projects?: Array<{ uuid: string; name: string }>;
+    environments?: string[];
+    envCreateStatus?: number;
+  }) {
+    const projects = opts.projects ?? [];
+    let environments = opts.environments ?? [];
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      const method = init?.method ?? "GET";
+      calls.push(`${method} ${path}`);
+      if (path === "/api/v1/projects" && method === "GET")
+        return new Response(JSON.stringify(projects), { status: 200 });
+      if (path === "/api/v1/projects" && method === "POST") {
+        projects.push({ uuid: "proj-new", name: "widget" });
+        // Coolify's doing, not ours: a brand-new project comes with this.
+        environments = ["production"];
+        return new Response(JSON.stringify({ uuid: "proj-new" }), {
+          status: 201,
+        });
+      }
+      const envRoute = /^\/api\/v1\/projects\/([^/]+)\/environments$/.exec(
+        path,
+      );
+      if (envRoute && method === "GET")
+        return new Response(
+          JSON.stringify(environments.map((name) => ({ name }))),
+          { status: 200 },
+        );
+      // CoolifyClient.environments falls back to the project show route when
+      // the list route answers empty — it carries the same names as a relation.
+      if (/^\/api\/v1\/projects\/[^/]+$/.test(path) && method === "GET")
+        return new Response(
+          JSON.stringify({
+            environments: environments.map((name) => ({ name })),
+          }),
+          { status: 200 },
+        );
+      if (envRoute && method === "POST") {
+        const name = JSON.parse(String(init?.body)).name as string;
+        const status = opts.envCreateStatus ?? 201;
+        if (status === 409) {
+          // A 409 is Coolify saying the name is TAKEN — so in the world the
+          // mock is modelling it exists, created by whoever won the race
+          // between our read and our write. The environment is there; only our
+          // create lost. A 409 whose environment did not exist is not a state
+          // Coolify can be in, and pretending otherwise would test nothing.
+          if (!environments.includes(name)) environments.push(name);
+          return new Response(
+            JSON.stringify({
+              message: "Environment with this name already exists.",
+            }),
+            { status: 409 },
+          );
+        }
+        if (status !== 201)
+          return new Response(JSON.stringify({ message: "boom" }), { status });
+        environments.push(name);
+        return new Response(JSON.stringify({ uuid: "env-1" }), { status: 201 });
+      }
+      if (path === "/api/v1/applications/private-github-app") {
+        // Coolify's actual rule, and the whole of #38: a create names an
+        // environment, and an environment that is not there is a 404. Without
+        // it this mock would happily accept the create that a real box refuses,
+        // and the test below would pass against the very bug it exists to catch.
+        const body = JSON.parse(String(init?.body)) as {
+          environment_name: string;
+        };
+        if (!environments.includes(body.environment_name))
+          return new Response(
+            JSON.stringify({ message: "Environment not found." }),
+            { status: 404 },
+          );
+        return new Response(JSON.stringify({ uuid: "app-1" }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+    return { calls, fetchImpl, environments: () => environments };
+  }
+
+  const app = {
+    kind: "application" as const,
+    name: "core",
+    op: "create" as const,
+    fieldDiffs: [
+      { field: "build_pack", desired: "nixpacks", updatable: false },
+    ],
+    envDiffs: [],
+  };
+
+  function exec(fetchImpl: typeof fetch) {
+    return buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      {
+        projectName: "widget",
+        envName: "prod",
+        serverUuid: "srv-1",
+        githubAppUuid: "gh-1",
+        backupSchedules: {},
+      },
+    );
+  }
+
+  it("creates the environment on a project it just created, and the create names it", async () => {
+    const coolify = fakeCoolify({ projects: [] });
+    const uuid = await exec(coolify.fetchImpl).createResource(app);
+
+    expect(uuid).toBe("app-1");
+    // The fix: our environment is created BEFORE the resource that names it.
+    expect(coolify.calls).toContain(
+      "POST /api/v1/projects/proj-new/environments",
+    );
+    expect(coolify.environments()).toContain("prod");
+    const order = coolify.calls.indexOf(
+      "POST /api/v1/projects/proj-new/environments",
+    );
+    const create = coolify.calls.indexOf(
+      "POST /api/v1/applications/private-github-app",
+    );
+    expect(order).toBeGreaterThan(-1);
+    expect(order).toBeLessThan(create);
+  });
+
+  // The half of idempotence that protects every apply that works today: an
+  // environment that already exists must not be written to at all.
+  it("never touches the create route when the environment already exists", async () => {
+    const coolify = fakeCoolify({
+      projects: [{ uuid: "proj-1", name: "widget" }],
+      environments: ["prod", "staging"],
+    });
+    await exec(coolify.fetchImpl).createResource(app);
+
+    expect(coolify.calls).toContain("GET /api/v1/projects/proj-1/environments");
+    expect(coolify.calls).not.toContain(
+      "POST /api/v1/projects/proj-1/environments",
+    );
+  });
+
+  // Coolify 409s a duplicate environment name — the same answer as "present",
+  // reached when something else wins the race between our read and our write.
+  it("treats a 409 from the environment create as already-there", async () => {
+    const coolify = fakeCoolify({
+      projects: [{ uuid: "proj-1", name: "widget" }],
+      environments: [],
+      envCreateStatus: 409,
+    });
+    const uuid = await exec(coolify.fetchImpl).createResource(app);
+    expect(uuid).toBe("app-1");
+  });
+
+  // A 5xx is NOT "already there" — apply must not go on to create resources
+  // into an environment it has no reason to believe exists.
+  it("surfaces a non-409 failure from the environment create", async () => {
+    const coolify = fakeCoolify({
+      projects: [{ uuid: "proj-1", name: "widget" }],
+      environments: [],
+      envCreateStatus: 500,
+    });
+    await expect(exec(coolify.fetchImpl).createResource(app)).rejects.toThrow(
+      /environments → 500/,
+    );
+  });
+
+  // Five creates in a run must reconcile the project and its environment once,
+  // not five times.
+  it("reconciles once across several creates", async () => {
+    const coolify = fakeCoolify({ projects: [] });
+    const e = exec(coolify.fetchImpl);
+    await e.createResource(app);
+    await e.createResource({ ...app, name: "core-api" });
+
+    const envReads = coolify.calls.filter((c) => c.endsWith("/environments"));
+    expect(envReads).toHaveLength(2); // one GET + one POST, not two of each
+    expect(
+      coolify.calls.filter((c) => c === "POST /api/v1/projects").length,
+    ).toBe(1);
+  });
 });
 
 describe("databaseVersionFromImage / defaultDatabaseImage", () => {

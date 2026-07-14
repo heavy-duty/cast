@@ -174,6 +174,30 @@ softened by an implementation detail):
   (`instant_deploy` on create, `/deploy` or `/restart` on update) — API
   mutations land in Coolify's DB, not in running containers, so a create or
   update that skipped this would silently not take effect.
+- **Apply acts in dependency order, not manifest order** — `database` →
+  `service` → `application` (#45), for creates *and* updates: a redeploy is a
+  redeploy, and an application restarted against a database whose own pending
+  change has not landed is the same failure one apply later. The order cannot be
+  computed — nothing in a manifest declares that `core` needs `postgres`, no
+  resource names another, so there is no graph to walk — so it is a fixed
+  kind-order (`KIND_ORDER` in `apply.ts`). The direction between the three kinds
+  is not in question, and three is few enough to legislate. `cast destroy` tears
+  down in its exact reverse: things come up in the order their dependencies
+  allow and go down in the reverse. Only the *acting* order changes; the diff
+  report still reads in manifest order (a resource is read where its author
+  wrote it), and nothing about clean/orphans/placement moves with it.
+
+  What that buys, and what it does not: an application is no longer created and
+  deployed against databases that **do not exist**, which made a first apply's
+  deploy fail by construction — a full build, a red deployment, and an operator
+  told to ignore it. It is **not** a readiness barrier.
+  `DeployController@deploy_resource` (v4.1.2) *queues*:
+  `queue_application_deployment(...)` for an application and
+  `StartDatabase::dispatch($resource)` for a database (only a service starts
+  synchronously, `StartService::run`). So cast orders its **requests**, and
+  Coolify runs them on its own queues. An app whose first boot must find a
+  *listening* database still races it; apply guarantees the database exists and
+  was asked to start first, not that it is up.
 - Direction is one-way, manifest → Coolify, always.
 - **Environment guards:** `apply` refuses if a var matching that environment's
   `forbidden_var_patterns` is present in the resolved env **at all, regardless

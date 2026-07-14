@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   type Executor,
+  KIND_ORDER,
   applyHostnameOverlay,
   applyPlan,
 } from "../src/apply.js";
-import { type Desired, computeDiff } from "../src/diff.js";
+import { type Desired, type Live, computeDiff } from "../src/diff.js";
 
 const desired: Desired[] = [
   {
@@ -15,12 +16,12 @@ const desired: Desired[] = [
   },
 ];
 
-function recorder() {
+function recorder(uuidFor: (name: string) => string = () => "new-uuid") {
   const calls: string[] = [];
   const exec: Executor = {
     createResource: async (c) => {
       calls.push(`create ${c.name}`);
-      return "new-uuid";
+      return uuidFor(c.name);
     },
     updateFields: async (uuid, _k, fields) => {
       calls.push(`update ${uuid} ${Object.keys(fields).join(",")}`);
@@ -121,6 +122,138 @@ describe("applyPlan", () => {
     const r = await applyPlan(report, desired, exec);
     expect(calls).toEqual([]);
     expect(r.mutated).toEqual([]);
+  });
+});
+
+// The order resolve.ts actually emits (`desiredFromManifest`: applications,
+// then databases, then services) and `computeDiff` faithfully preserves. This
+// is the input that used to build and deploy `core` against nothing.
+const manifestOrder: Desired[] = [
+  {
+    kind: "application",
+    name: "core",
+    fields: { build_pack: "dockercompose" },
+    env: { vars: { DATABASE_URL: { value: "postgres://x", secret: true } } },
+  },
+  { kind: "database", name: "postgres", fields: { type: "postgresql" } },
+  { kind: "database", name: "redis", fields: { type: "redis" } },
+  { kind: "service", name: "metabase", fields: { type: "metabase" } },
+];
+const named = (name: string) => `${name}-uuid`;
+
+describe("applyPlan ordering (#45)", () => {
+  it("creates databases, then services, then applications — never the manifest's order", async () => {
+    const { calls, exec } = recorder(named);
+    const report = computeDiff(manifestOrder, [], "full");
+    // The report itself reads in manifest order: application first.
+    expect(report.changes.map((c) => c.name)).toEqual([
+      "core",
+      "postgres",
+      "redis",
+      "metabase",
+    ]);
+    const r = await applyPlan(report, manifestOrder, exec);
+    // …and apply ACTS in dependency order. `core` is created and deployed last,
+    // by which point both databases and the service exist. Within a kind the
+    // manifest's order survives (postgres before redis) — the sort is stable.
+    expect(calls).toEqual([
+      "create postgres",
+      "redeploy postgres-uuid",
+      "create redis",
+      "redeploy redis-uuid",
+      "create metabase",
+      "redeploy metabase-uuid",
+      "create core",
+      "env core-uuid",
+      "redeploy core-uuid",
+    ]);
+    expect(r.mutated).toEqual(["postgres", "redis", "metabase", "core"]);
+  });
+
+  it("orders updates too, not only creates", async () => {
+    // The apply that adds a Redis and points an existing app at it: the
+    // database must be created and started before the app redeploys onto it.
+    const { calls, exec } = recorder(named);
+    const withRedis: Desired[] = [
+      {
+        kind: "application",
+        name: "core",
+        fields: { build_pack: "dockercompose" },
+        env: {
+          vars: { REDIS_URL: { value: "redis://redis:6379", secret: false } },
+        },
+      },
+      { kind: "database", name: "redis", fields: { type: "redis" } },
+    ];
+    const live: Live[] = [
+      {
+        kind: "application",
+        name: "core",
+        uuid: "u-core",
+        fields: { build_pack: "dockercompose" },
+        env: {},
+      },
+    ];
+    const r = await applyPlan(
+      computeDiff(withRedis, live, "full"),
+      withRedis,
+      exec,
+    );
+    expect(calls).toEqual([
+      "create redis",
+      "redeploy redis-uuid",
+      "env u-core",
+      "redeploy u-core",
+    ]);
+    expect(r.mutated).toEqual(["redis", "core"]);
+  });
+
+  it("still refuses non-updatable drift before ANY mutation, even one that now sorts first", async () => {
+    // The regression the reorder could have introduced: the database sorts
+    // ahead of the application, so a check folded into the ordered walk would
+    // create postgres and only then refuse. The refusal is a full scan first.
+    const { calls, exec } = recorder(named);
+    const live: Live[] = [
+      {
+        kind: "application",
+        name: "core",
+        uuid: "u-core",
+        fields: { build_pack: "nixpacks" }, // NON_UPDATABLE drift
+        env: { DATABASE_URL: "postgres://x" },
+      },
+    ];
+    await expect(
+      applyPlan(computeDiff(manifestOrder, live, "full"), manifestOrder, exec),
+    ).rejects.toThrow(/build_pack/);
+    expect(calls).toEqual([]);
+  });
+
+  it("does not reorder the report itself — the diff reads in manifest order", async () => {
+    // renderDiff and the fleet summary read `report.changes`; sorting it in
+    // place would silently reshuffle what the operator sees.
+    const { exec } = recorder(named);
+    const report = computeDiff(manifestOrder, [], "full");
+    await applyPlan(report, manifestOrder, exec);
+    expect(report.changes.map((c) => c.name)).toEqual([
+      "core",
+      "postgres",
+      "redis",
+      "metabase",
+    ]);
+    // and the rest of the report is untouched by ordering
+    expect(report.clean).toBe(false);
+    expect(report.orphans).toEqual([]);
+  });
+
+  it("exports the forward kind-order, whose reverse is the teardown order", () => {
+    expect(KIND_ORDER).toEqual(["database", "service", "application"]);
+    // `cast destroy` (#43) is the exact reverse — up in dependency order, down
+    // in reverse. It defines its own constant today; a follow-up unifies them.
+    expect([...KIND_ORDER].reverse()).toEqual([
+      "application",
+      "service",
+      "database",
+    ]);
   });
 });
 

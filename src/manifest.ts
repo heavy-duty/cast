@@ -2,15 +2,47 @@ import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 import { z } from "zod";
 
+// Coolify validates every checkout-relative path on create and 422s anything
+// that is not absolute. Transcribed from coolify v4.1.2:
+// `bootstrap/helpers/api.php::sharedDataApplications()` binds
+// `base_directory`/`publish_directory` to `ValidationPatterns::directoryPathRules()`
+// and `docker_compose_location` to `ValidationPatterns::filePathRules()`, and
+// `app/Support/ValidationPatterns.php` defines the two patterns below. The only
+// difference between them: a file path needs at least one character after the
+// slash, a directory path may be the bare `/` (the checkout root).
+const COOLIFY_FILE_PATH = /^\/[a-zA-Z0-9._/~@+-]+$/;
+const COOLIFY_DIRECTORY_PATH = /^\/[a-zA-Z0-9._/~@+-]*$/;
+
+// These are refinements, not normalizations, and must stay that way: cast does
+// not quietly rewrite what the manifest says. A value that would 422 gets fixed
+// in the file, in a commit, once — not repaired in memory on every run. And the
+// check belongs here, at parse time, because it is a property of the manifest
+// and of nothing else: by the time a create returns its bare 422, `apply` has
+// already made the project and the environment, and the run is half-applied.
+const composeFilePath = z
+  .string()
+  .regex(
+    COOLIFY_FILE_PATH,
+    "compose_file must be an absolute path inside the repo checkout (Coolify 4.1.2 rejects the create otherwise) — write /docker-compose.yaml, not docker-compose.yaml",
+  );
+
+const repoDirectoryPath = (field: string) =>
+  z
+    .string()
+    .regex(
+      COOLIFY_DIRECTORY_PATH,
+      `${field} must be an absolute path inside the repo checkout (Coolify 4.1.2 rejects the create otherwise) — write /apps/core, not apps/core; the checkout root is /`,
+    );
+
 const AppSpecSchema = z
   .object({
     source: z.object({ repo: z.string(), branch: z.string() }).strict(),
     build: z
       .object({
         pack: z.enum(["nixpacks", "static", "dockerfile", "dockercompose"]),
-        base_directory: z.string(),
-        publish_directory: z.string().optional(),
-        compose_file: z.string().optional(),
+        base_directory: repoDirectoryPath("base_directory"),
+        publish_directory: repoDirectoryPath("publish_directory").optional(),
+        compose_file: composeFilePath.optional(),
       })
       .strict(),
     port: z.number().int().optional(),

@@ -55,7 +55,7 @@ environments:
     applications:
       core:
         source: { repo: acme/widget, branch: main }
-        build: { pack: dockercompose, base_directory: /, compose_file: docker-compose.yaml }
+        build: { pack: dockercompose, base_directory: /, compose_file: /docker-compose.yaml }
         service_domains:
           api: ["https://api.example.com"]
         env_template: core.prod.env.template
@@ -63,7 +63,7 @@ environments:
     });
     const app = m.environments.prod.applications.core;
     expect(app.build.pack).toBe("dockercompose");
-    expect(app.build.compose_file).toBe("docker-compose.yaml");
+    expect(app.build.compose_file).toBe("/docker-compose.yaml");
     expect(app.service_domains).toEqual({ api: ["https://api.example.com"] });
     expect(app.port).toBeUndefined();
     expect(app.healthcheck).toBeUndefined();
@@ -86,7 +86,11 @@ environments:
       }),
     ).toThrow(/compose_file/);
   });
-  it("rejects a dockercompose app with top-level domains", () => {
+  // Coolify 4.1.2 validates docker_compose_location against
+  // ValidationPatterns::FILE_PATH_PATTERN on create and 422s a path with no
+  // leading slash — after `apply` has already made the project and the
+  // environment. The manifest knows this before any API call, so it refuses.
+  it("rejects a compose_file with no leading slash, and names the fix", () => {
     expect(() =>
       loadManifest(`${FIX}manifest.yaml`, {
         overrideText: `
@@ -97,6 +101,92 @@ environments:
       core:
         source: { repo: acme/widget, branch: main }
         build: { pack: dockercompose, base_directory: /, compose_file: docker-compose.yaml }
+        service_domains:
+          api: ["https://api.example.com"]
+`,
+      }),
+    ).toThrow(/compose_file must be an absolute path.*\/docker-compose\.yaml/s);
+  });
+  it("rejects a compose_file that is the bare root (a directory, not a file)", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: `
+project: widget
+environments:
+  prod:
+    applications:
+      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: dockercompose, base_directory: /, compose_file: / }
+        service_domains:
+          api: ["https://api.example.com"]
+`,
+      }),
+    ).toThrow(/compose_file must be an absolute path/);
+  });
+  it("rejects a base_directory with no leading slash", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: `
+project: widget
+environments:
+  prod:
+    applications:
+      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: apps/core }
+        domains: ["https://api.example.com"]
+`,
+      }),
+    ).toThrow(/base_directory must be an absolute path/);
+  });
+  it("rejects a publish_directory with no leading slash", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: `
+project: widget
+environments:
+  prod:
+    applications:
+      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: static, base_directory: /, publish_directory: dist }
+        domains: ["https://api.example.com"]
+`,
+      }),
+    ).toThrow(/publish_directory must be an absolute path/);
+  });
+  // Coolify's DIRECTORY_PATH_PATTERN admits the bare "/" where FILE_PATH_PATTERN
+  // does not — every manifest in the wild says `base_directory: /`, so a shared
+  // "absolute path" rule that rejected it would refuse every manifest cast has.
+  it("accepts / as base_directory and a nested absolute publish_directory", () => {
+    const m = loadManifest(`${FIX}manifest.yaml`, {
+      overrideText: `
+project: widget
+environments:
+  prod:
+    applications:
+      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: static, base_directory: /, publish_directory: /apps/web/dist }
+        domains: ["https://api.example.com"]
+`,
+    });
+    const app = m.environments.prod.applications.core;
+    expect(app.build.base_directory).toBe("/");
+    expect(app.build.publish_directory).toBe("/apps/web/dist");
+  });
+  it("rejects a dockercompose app with top-level domains", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: `
+project: widget
+environments:
+  prod:
+    applications:
+      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: dockercompose, base_directory: /, compose_file: /docker-compose.yaml }
         service_domains:
           api: ["https://api.example.com"]
         domains: ["https://api.example.com"]

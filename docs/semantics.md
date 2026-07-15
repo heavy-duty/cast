@@ -921,6 +921,60 @@ being store names at all, so the placeholder they held, and the `apply` refusal
 that guarded it, simply cease to exist for them — there is nothing in the store
 to overwrite, and nothing to re-encrypt on a rebuild-from-nothing.
 
+## Derived domains (`${domain:<app>[.<service>]}`)
+
+Symmetric with `${resource:…}`, and for the same reason: a base URL an app is
+told to call itself at is not a secret anybody authored — it is a domain the
+manifest *already declares*, on the very resource cast is about to create. Hand-
+transcribing it into an env template (incubator's `LANDING_BASE_URL`,
+`ADMIN_WEB_BASE_URL`) makes a second copy that drifts from the `domains` /
+`service_domains` cast parses anyway. So a template can name the domain
+directly:
+
+    LANDING_BASE_URL=${domain:landing}
+    ADMIN_WEB_BASE_URL=${domain:core.admin}
+
+- `${domain:<app>}` resolves to `applications.<app>.domains[0]` — the app's
+  **primary** domain.
+- `${domain:<app>.<service>}` resolves to
+  `applications.<app>.service_domains.<service>[0]` — a compose app's primary
+  domain for that service.
+
+The value is the domain string **verbatim**, scheme and all
+(`https://new.heavyduty.builders`). **Applications only:** cast's service creates
+send no domains, and Coolify 4.1.2 cannot set service domains at all (see
+*Hostname overlay* and the service loop), so there is no service domain to
+derive.
+
+**The one way it differs from a derived resource URL — and it is the whole
+design — is that a domain is not read back from a live box; it is PURE MANIFEST
+DATA.** A `${resource:…}` URL needs the database Coolify made, so it defers: it
+rides through the diff unresolved and the executor fills it after the create. A
+domain is known the instant the manifest is parsed, so it resolves at **plan
+time**, inside `desiredFromManifest`, against a map built straight from the
+manifest — and it **always** resolves there. There is no deferral, no executor
+step, no unresolved-sentinel that a diff or an apply can legitimately carry:
+`fillDomainEnv` replaces the transient sentinel in the same plan, drops the
+derived-domain marker, and what remains is a plain resolved value
+indistinguishable from a literal. So the diff needs no domain-awareness, and
+apply writes it like any other env var.
+
+**It is public, not a secret.** Unlike a resolved resource URL (secret, never
+printed), a derived domain resolves to `secret: false` — it prints in a diff like
+any literal, because a public hostname is not a thing to hide. It is not a store
+ref either: `capture` never goes looking for a store name called `domain:landing`,
+and it never enters `required` / `generated`.
+
+**Validation is at plan time, in the same voice as the other ref checks** — and
+refused by every verb that opens a template (`apply`, `diff`, `capture`), because
+a ref that resolves against nothing is broken for all of them. A `${domain:…}` is
+a hard error, named before any write, when it points at an application the
+manifest does not declare, when it omits a service on a compose app whose domains
+live per service (it lists them), when it names a service on an app that declares
+a plain `domains` list, when it names a service the app's `service_domains` does
+not declare, or when the selected list is declared but empty. The sentinel never
+escapes: the assert throws before `desiredFromManifest` returns.
+
 ## Drafts (`inventory --emit-draft`)
 
 `inventory` with no repo sweeps an instance. `--emit-draft <dir>` writes that

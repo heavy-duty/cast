@@ -6,11 +6,14 @@ import type { Desired } from "./diff.js";
 import {
   type ResolvedEnv,
   fillDerivedEnv,
+  fillDomainEnv,
   resolveTemplate,
+  templateDomainRefs,
   templateKeys,
   templateRefs,
   templateResourceRefs,
 } from "./envtemplate.js";
+import type { EnvironmentSpec } from "./manifest.js";
 import { loadManifest } from "./manifest.js";
 import {
   type ReservedHit,
@@ -252,6 +255,117 @@ function assertResourceRefs(
   }
 }
 
+// The domains an environment's manifest declares, flattened to the map keys a
+// ${domain:…} ref resolves against: `<app>` → `applications.<app>.domains[0]`,
+// and `<app>.<service>` → `applications.<app>.service_domains.<service>[0]`. The
+// [0] is the PRIMARY domain — a domain list may carry several, and a ref names
+// the app, not an index. A malformed (missing/empty) array is simply not added:
+// the lookup then misses and assertDomainRefs reports it, rather than this
+// helper throwing far from the ref that caused it. Applications only — Coolify
+// 4.1.2 cannot set service domains, and a service's own domains are unhonorable
+// by apply anyway (see the service loop).
+function buildDomainMap(envSpec: EnvironmentSpec): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const [name, app] of Object.entries(envSpec.applications)) {
+    if (app.domains && app.domains.length > 0) map[name] = app.domains[0];
+    for (const [svc, arr] of Object.entries(app.service_domains ?? {})) {
+      if (arr.length > 0) map[`${name}.${svc}`] = arr[0];
+    }
+  }
+  return map;
+}
+
+// The dead-reference check for domain refs, in the same voice as
+// assertResourceRefs. A ${domain:…} ref is pure manifest data, so a ref that
+// does not resolve is a ref that names something the manifest does not declare —
+// caught at plan time, before the sentinel can escape, and refused by every verb
+// that opens a template (`apply`, `diff`, `capture`). Each branch names what IS
+// declared, so the fix is one edit away.
+function assertDomainRefs(
+  envName: string,
+  applications: EnvironmentSpec["applications"],
+  refs: Array<{ key: string; app: string; service?: string }>,
+): void {
+  const appNames = Object.keys(applications).sort();
+  for (const r of refs) {
+    const app = applications[r.app];
+    if (!app) {
+      throw new Error(
+        [
+          `manifest environment ${envName}: ${r.key} refers to \${domain:${r.app}${r.service ? `.${r.service}` : ""}}, but the manifest declares no application named ${r.app}`,
+          "",
+          `  declares:   ${appNames.join(", ") || "(no applications)"}`,
+          "",
+          "A ${domain:…} ref resolves to a public domain this manifest declares. One",
+          "that names an application the manifest does not declare resolves to nothing,",
+          "on every box, forever — the likeliest cause is a typo. Fix the name, or",
+          "declare the application.",
+        ].join("\n"),
+      );
+    }
+    // Which SHAPE the app is, by KEY PRESENCE — not by array non-emptiness. The
+    // manifest schema makes `domains` and `service_domains` mutually exclusive
+    // and requires exactly one (AppSpecSchema superRefine: a non-compose app
+    // requires `domains` and forbids `service_domains`; a compose app the
+    // reverse), so a present-but-empty `domains: []` is still a domains app —
+    // asking about its array length here would mis-route a `${domain:app.svc}`
+    // ref into the unknown-service branch below with a misleading message.
+    const hasDomains = app.domains !== undefined;
+    const hasServiceDomains = app.service_domains !== undefined;
+    const svcNames = Object.keys(app.service_domains ?? {}).sort();
+    if (!r.service && hasServiceDomains && !hasDomains) {
+      throw new Error(
+        [
+          `manifest environment ${envName}: ${r.key} refers to \${domain:${r.app}}, but ${r.app} is a compose app whose domains live per service`,
+          "",
+          `  services:   ${svcNames.join(", ")}`,
+          "",
+          `Name one: write \${domain:${r.app}.<service>}.`,
+        ].join("\n"),
+      );
+    }
+    if (r.service && hasDomains && !hasServiceDomains) {
+      throw new Error(
+        [
+          `manifest environment ${envName}: ${r.key} refers to \${domain:${r.app}.${r.service}}, but ${r.app} declares a plain \`domains\` list, not per-service domains`,
+          "",
+          `Drop the service: write \${domain:${r.app}}.`,
+        ].join("\n"),
+      );
+    }
+    if (r.service && !(r.service in (app.service_domains ?? {}))) {
+      throw new Error(
+        [
+          `manifest environment ${envName}: ${r.key} refers to \${domain:${r.app}.${r.service}}, but ${r.app} declares no service named ${r.service}`,
+          "",
+          `  services:   ${svcNames.join(", ") || "(none)"}`,
+          "",
+          "Fix the service name, or declare it under the app's service_domains.",
+        ].join("\n"),
+      );
+    }
+    // The selected array — the exact list this ref resolves against — must
+    // actually hold a domain. Missing, empty (`domains: []`), or a blank first
+    // entry (`domains: [""]`, which is schema-valid: a non-empty array of
+    // strings) all resolve to nothing, and the last would slip past buildDomainMap
+    // (it stores `""`) and past fillDomainEnv (whose `!== ""` guard reads `""` as
+    // unresolved) to leave the sentinel in a returned env. Caught here, so this
+    // assert stays the single gate and the sentinel can never escape.
+    const arr = r.service ? app.service_domains?.[r.service] : app.domains;
+    if (!arr || arr.length === 0 || arr[0] === "") {
+      throw new Error(
+        [
+          `manifest environment ${envName}: ${r.key} refers to \${domain:${r.app}${r.service ? `.${r.service}` : ""}}, but that domain list is empty or its first entry is blank`,
+          "",
+          "A ${domain:…} ref resolves to the FIRST domain in the list. An empty list,",
+          "or one whose first entry is an empty string, has none to resolve to —",
+          "declare a real domain, or drop the ref.",
+        ].join("\n"),
+      );
+    }
+  }
+}
+
 // Exactly the set of secret names an environment's manifest demands — the same
 // set `apply` will later insist on, read from the same templates by the same
 // parser. `capture` uses this to know what to go and fetch; nothing else has to
@@ -273,6 +387,7 @@ export function requiredSecrets(
   const required: RequiredSecret[] = [];
   const resourceRefs: Array<{ key: string; resource: string; attr: string }> =
     [];
+  const domainRefs: Array<{ key: string; app: string; service?: string }> = [];
   // Reserved names are checked HERE, and in manifestResources, and in
   // desiredFromManifest — every function in this file that opens an env
   // template, rather than once in the verb that writes. The rule is a property
@@ -294,6 +409,7 @@ export function requiredSecrets(
     const text = readFileSync(file, "utf8");
     reserved.push(...reservedHits(resource, templateKeys(text)));
     resourceRefs.push(...templateResourceRefs(text));
+    domainRefs.push(...templateDomainRefs(text));
     for (const { key, ref } of templateRefs(text)) {
       required.push({ ref, resource, key });
     }
@@ -310,6 +426,10 @@ export function requiredSecrets(
     new Set(Object.keys(envSpec.databases ?? {})),
     resourceRefs,
   );
+  // Domain refs are validated even by capture — a ref that names an undeclared
+  // app/service is broken for every verb — but they never enter `required`: a
+  // domain is manifest data, not a secret the store must hold.
+  assertDomainRefs(envName, envSpec.applications, domainRefs);
   const generated = envSpec.generated_secrets ?? [];
   // A generated_secrets entry naming something no template refs is dead
   // config — and dead config in THIS list is not merely untidy, it is
@@ -409,6 +529,12 @@ export function desiredFromManifest(
   const reserved: ReservedHit[] = [];
   const resourceRefs: Array<{ key: string; resource: string; attr: string }> =
     [];
+  const domainRefs: Array<{ key: string; app: string; service?: string }> = [];
+  // A domain is pure manifest data, so its map is built once from the manifest
+  // itself — independent of any template — and every resolved env is filled
+  // against it at plan time. assertDomainRefs at the end throws on any ref that
+  // did not resolve, so the sentinel never escapes into a returned env.
+  const domainMap = buildDomainMap(envSpec);
   const resolveEnvFile = (
     name: string,
     template?: string,
@@ -418,9 +544,10 @@ export function desiredFromManifest(
     if (!existsSync(file))
       throw new Error(`env template missing: ${file} (referenced by ${name})`);
     const text = readFileSync(file, "utf8");
-    const env = resolveTemplate(text, secrets);
+    const env = fillDomainEnv(resolveTemplate(text, secrets), domainMap);
     reserved.push(...reservedHits(name, Object.keys(env.vars)));
     resourceRefs.push(...templateResourceRefs(text));
+    domainRefs.push(...templateDomainRefs(text));
     resolvedEnvs[name] = env;
     return env;
   };
@@ -575,6 +702,10 @@ export function desiredFromManifest(
     new Set(Object.keys(envSpec.databases ?? {})),
     resourceRefs,
   );
+  // Throws BEFORE the desired set is returned, so an invalid domain ref never
+  // ships the sentinel: every env in `resolvedEnvs` and every `desired[].env` is
+  // already domain-filled by resolveEnvFile above.
+  assertDomainRefs(envName, envSpec.applications, domainRefs);
   return { desired, resolvedEnvs };
 }
 

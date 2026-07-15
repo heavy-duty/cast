@@ -341,6 +341,16 @@ standing over nothing is worse than no guard, because it reads like one.
 > that genuinely is not derivable. See [semantics.md](docs/semantics.md) →
 > *Derived resource URLs*.
 
+> **A declared domain is better *derived* than transcribed.** If the value is a
+> base URL an app is told to call itself (or a sibling) at, write
+> `LANDING_BASE_URL=${domain:landing}` — or `${domain:core.admin}` for a compose
+> app's per-service domain — instead of copying the hostname into the template by
+> hand. It resolves to the manifest's own `domains` / `service_domains` (verbatim,
+> scheme and all), at plan time, so there is nothing to drift. Unlike a resource
+> URL a domain is **public**, not a secret: it is not stored, not captured, and it
+> prints in a diff like any literal. Applications only. See
+> [semantics.md](docs/semantics.md) → *Derived domains*.
+
 An **`--override`**'s value is read from `$CAST_CAPTURE_<NAME>`, never from the
 command line: argv is visible in `ps` to every process on the box. It exists for
 values that must not survive the copy — staging and prod sharing a Mailgun

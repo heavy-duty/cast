@@ -7,6 +7,17 @@
 // live box, not decrypted.
 export type ResourceRef = { resource: string; attr: string };
 
+// A ${domain:<app>[.<service>]} reference — a public domain THIS manifest
+// already declares (`applications.<app>.domains[0]`, or a compose app's
+// `service_domains.<service>[0]`). Symmetric with ${resource:…} but simpler in
+// the one way that matters: a resource URL is a fact read back from the live box
+// (#60), while a domain is PURE MANIFEST DATA, known the instant the manifest is
+// parsed. So it needs no live read, no age key, no deferral — it resolves at
+// plan time, from the same manifest that declared it. It is also PUBLIC, not a
+// secret: it prints in a diff like any literal (unlike the secret-flagged
+// resource URL).
+export type DomainRef = { app: string; service?: string };
+
 // The value a derived var carries until it is resolved against the live
 // resource. NEVER a legal thing to WRITE — the executor refuses it, the same
 // fail-closed shape as the generated-secret placeholder — because a database URL
@@ -21,6 +32,19 @@ export type ResourceRef = { resource: string; attr: string };
 // whole source file as binary and its diff unreviewable.)
 export const DERIVED_UNRESOLVED = "cast:unresolved-derived-resource-url";
 
+// The value a domain var carries between resolveTemplate and fillDomainEnv.
+// Unlike DERIVED_UNRESOLVED, which is a legitimate transient state a derived var
+// can be diffed and applied in (the from-nothing case, resolved later by the
+// executor), this sentinel must NEVER survive validation: a domain is manifest
+// data, so a ref that does not resolve is a ref that names an app/service the
+// manifest does not declare, and `assertDomainRefs` throws on it before the
+// desired set is ever returned. It exists for one reason only — so
+// resolveTemplate need not know the manifest (the domain map is built later, in
+// resolve.ts) — and fillDomainEnv always replaces it in the same plan.
+// (A plain string, no NUL byte: a NUL makes git treat the source file as binary
+// and its diff unreviewable — same reasoning as DERIVED_UNRESOLVED.)
+export const DOMAIN_UNRESOLVED = "cast:unresolved-domain-ref";
+
 // `secret` is true for both a ${SECRET} and a resolved ${resource:…} — both are
 // values that must never be printed. `derived` is set (and stays set after
 // resolution) so the diff can say "derived from database X" rather than mistaking
@@ -29,19 +53,27 @@ export const DERIVED_UNRESOLVED = "cast:unresolved-derived-resource-url";
 export type ResolvedEnv = {
   vars: Record<
     string,
-    { value: string; secret: boolean; derived?: ResourceRef }
+    {
+      value: string;
+      secret: boolean;
+      derived?: ResourceRef;
+      domain?: DomainRef;
+    }
   >;
 };
 
 // A template line, parsed but not resolved: `ref` is set when the whole RHS is a
 // single ${NAME} placeholder (a store secret); `resourceRef` when it is a single
-// ${resource:<name>.attr} placeholder (a derived value). The two are mutually
-// exclusive — a secret name is UPPER_SNAKE, a resource ref starts `resource:`.
+// ${resource:<name>.attr} placeholder (a derived value); `domainRef` when it is
+// a single ${domain:<app>[.<service>]} placeholder (a declared public domain).
+// The three are mutually exclusive — a secret name is UPPER_SNAKE, a resource
+// ref starts `resource:`, a domain ref starts `domain:`.
 export type TemplateVar = {
   key: string;
   rhs: string;
   ref?: string;
   resourceRef?: ResourceRef;
+  domainRef?: DomainRef;
 };
 
 // ONE grammar, shared by both readers of a template — resolveTemplate (which
@@ -71,12 +103,29 @@ function parseTemplate(text: string): TemplateVar[] {
     const resource = rhs.match(
       /^\$\{resource:([a-z0-9][a-z0-9_-]*)\.([a-z_]+)\}$/,
     );
+    // A domain ref names a manifest application (lower-kebab/snake, as the
+    // manifest spells it) and, optionally, one of that app's compose services.
+    // Parsing stays dumb — an unknown app or service is not rejected HERE but at
+    // validation time (resolve.ts), where the message can name the applications
+    // and services the manifest actually declares, exactly as an undeclared
+    // resource ref is.
+    const domain = rhs.match(
+      /^\$\{domain:([a-z0-9][a-z0-9_-]*)(?:\.([a-z0-9][a-z0-9_-]*))?\}$/,
+    );
     vars.push({
       key,
       rhs,
       ...(placeholder ? { ref: placeholder[1] } : {}),
       ...(resource
         ? { resourceRef: { resource: resource[1], attr: resource[2] } }
+        : {}),
+      ...(domain
+        ? {
+            domainRef: {
+              app: domain[1],
+              ...(domain[2] ? { service: domain[2] } : {}),
+            },
+          }
         : {}),
     });
   }
@@ -88,7 +137,7 @@ export function resolveTemplate(
   secrets: Record<string, string>,
 ): ResolvedEnv {
   const vars: ResolvedEnv["vars"] = {};
-  for (const { key, rhs, ref, resourceRef } of parseTemplate(text)) {
+  for (const { key, rhs, ref, resourceRef, domainRef } of parseTemplate(text)) {
     // A derived value is resolved from the live resource, not the store, and not
     // here — the resource may not exist yet (a from-nothing apply creates it in
     // the same run). So it lands UNRESOLVED, carrying the ref; fillDerivedEnv
@@ -101,6 +150,22 @@ export function resolveTemplate(
         value: DERIVED_UNRESOLVED,
         secret: true,
         derived: resourceRef,
+      };
+      continue;
+    }
+    // A domain is manifest data, and resolveTemplate is deliberately
+    // manifest-unaware (it takes secrets, not a domains map — the map is built
+    // later, in resolve.ts). So the var lands carrying the transient sentinel and
+    // its ref; fillDomainEnv resolves it against the domain map, and
+    // assertDomainRefs throws before an unresolved one can escape the plan. Like
+    // resourceRef, this is BEFORE the ref/literal branch on purpose: a domain
+    // ref's RHS is not UPPER_SNAKE, so it would otherwise be written through as
+    // the literal text "${domain:…}". A domain is PUBLIC — secret: false.
+    if (domainRef) {
+      vars[key] = {
+        value: DOMAIN_UNRESOLVED,
+        secret: false,
+        domain: domainRef,
       };
       continue;
     }
@@ -146,6 +211,37 @@ export function fillDerivedEnv(
   return { vars };
 }
 
+// Resolve every domain var against a map of the domains the manifest declares,
+// keyed `<app>` or `<app>.<service>` (built in resolve.ts). Pure, and mirrors
+// fillDerivedEnv — but where a derived var may legitimately stay unresolved (a
+// from-nothing apply has no live database yet), a domain ALWAYS resolves here:
+// the map is manifest data, and assertDomainRefs has already thrown on any ref
+// that would miss it. So a hit becomes a plain `{ value, secret: false }` and
+// DROPS the `domain` marker — a resolved domain is indistinguishable from a
+// literal downstream, which is why the diff needs no domain-awareness at all. A
+// miss (only reachable if validation was skipped) is left untouched, sentinel
+// and marker intact, so nothing silently writes the sentinel as a value.
+export function fillDomainEnv(
+  env: ResolvedEnv,
+  domains: Record<string, string>,
+): ResolvedEnv {
+  const vars: ResolvedEnv["vars"] = {};
+  for (const [key, v] of Object.entries(env.vars)) {
+    const domain = v.domain
+      ? domains[
+          v.domain.service
+            ? `${v.domain.app}.${v.domain.service}`
+            : v.domain.app
+        ]
+      : undefined;
+    vars[key] =
+      domain !== undefined && domain !== ""
+        ? { value: domain, secret: false }
+        : v;
+  }
+  return { vars };
+}
+
 // The derived vars still holding the unresolved sentinel — what the executor
 // must resolve from the live box before it can write this env, and what it
 // refuses on if it cannot. Names the env key and the resource it derives from;
@@ -184,6 +280,27 @@ export function templateResourceRefs(
     resourceRef === undefined
       ? []
       : [{ key, resource: resourceRef.resource, attr: resourceRef.attr }],
+  );
+}
+
+// The ${domain:<app>[.<service>]} refs a template declares — the declared-domain
+// edges. NOT returned by templateRefs (a domain is not a secret to capture) and
+// NOT part of the required-secret set, exactly like templateResourceRefs.
+// resolve.ts reads these to validate each ref against the applications and
+// service_domains the manifest actually declares.
+export function templateDomainRefs(
+  text: string,
+): Array<{ key: string; app: string; service?: string }> {
+  return parseTemplate(text).flatMap(({ key, domainRef }) =>
+    domainRef === undefined
+      ? []
+      : [
+          {
+            key,
+            app: domainRef.app,
+            ...(domainRef.service ? { service: domainRef.service } : {}),
+          },
+        ],
   );
 }
 

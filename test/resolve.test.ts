@@ -553,3 +553,165 @@ ${dbBlock}`,
     );
   });
 });
+
+describe("derived domain refs (#66)", () => {
+  // Assemble a manifest from an applications block plus one env template. The
+  // env_template line is appended to whichever app comes last in `apps`.
+  const write = (apps: string, tmpl: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    mkdirSync(join(dir, ".infra", "env"), { recursive: true });
+    writeFileSync(
+      join(dir, ".infra", "manifest.yaml"),
+      `project: widget
+environments:
+  prod:
+    applications:
+${apps}`,
+    );
+    writeFileSync(join(dir, ".infra", "env", "refs.env.template"), tmpl);
+    return dir;
+  };
+
+  // A plain app (a `domains` list) and a compose app (`service_domains`); the
+  // env_template line appended after either makes that app carry the template.
+  const LANDING = `      landing:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: / }
+        domains: ["https://new.heavyduty.builders"]
+`;
+  const CORE = `      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: dockercompose, base_directory: /, compose_file: /docker-compose.yaml }
+        service_domains:
+          admin: ["https://admin.heavyduty.builders"]
+`;
+  const TMPL = "        env_template: refs.env.template\n";
+
+  it("resolves ${domain:<app>} and ${domain:<app>.<service>} to the manifest's domains, secret:false", () => {
+    const dir = write(
+      LANDING + CORE + TMPL,
+      "ADMIN_WEB_BASE_URL=${domain:core.admin}\nLANDING_BASE_URL=${domain:landing}\n",
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { desired, resolvedEnvs } = desiredFromManifest(dir, "prod", {});
+    warn.mockRestore();
+    const core = desired.find((d) => d.name === "core");
+    // The app.service ref and the app ref both resolve to the verbatim domain
+    // (scheme and all), public, and with no `domain` marker — a plain literal.
+    expect(core?.env?.vars.ADMIN_WEB_BASE_URL).toEqual({
+      value: "https://admin.heavyduty.builders",
+      secret: false,
+    });
+    expect(core?.env?.vars.LANDING_BASE_URL).toEqual({
+      value: "https://new.heavyduty.builders",
+      secret: false,
+    });
+    // resolvedEnvs is domain-filled too, and no sentinel escapes anywhere.
+    expect(resolvedEnvs.core.vars.LANDING_BASE_URL.value).toBe(
+      "https://new.heavyduty.builders",
+    );
+    expect(JSON.stringify(desired)).not.toContain("cast:unresolved-domain-ref");
+  });
+
+  it("does not list domain refs as required secrets (capture validates but never captures them)", () => {
+    const dir = write(
+      LANDING + CORE + TMPL,
+      "ADMIN_WEB_BASE_URL=${domain:core.admin}\nLANDING_BASE_URL=${domain:landing}\nMG=${MG}\n",
+    );
+    const req = requiredSecrets(dir, "prod");
+    // Only the real ${MG} secret is required — the two domain refs are not.
+    expect(req.required.map((r) => r.ref)).toEqual(["MG"]);
+  });
+
+  it("refuses a ref naming an application the manifest does not declare", () => {
+    const dir = write(LANDING + TMPL, "X=${domain:nope}\n");
+    expect(() => requiredSecrets(dir, "prod")).toThrow(
+      /no application named nope/,
+    );
+    // Every verb that opens a template refuses it, in the same voice.
+    expect(() => desiredFromManifest(dir, "prod", {})).toThrow(
+      /no application named nope/,
+    );
+  });
+
+  it("refuses ${domain:<app>} on a compose app whose domains live per service", () => {
+    const dir = write(CORE + TMPL, "X=${domain:core}\n");
+    expect(() => requiredSecrets(dir, "prod")).toThrow(
+      /domains live per service/,
+    );
+  });
+
+  it("refuses ${domain:<app>.<service>} on an app that declares a plain domains list", () => {
+    const dir = write(LANDING + TMPL, "X=${domain:landing.admin}\n");
+    expect(() => requiredSecrets(dir, "prod")).toThrow(/plain `domains` list/);
+  });
+
+  it("refuses a service the app's service_domains does not declare", () => {
+    const dir = write(CORE + TMPL, "X=${domain:core.nope}\n");
+    expect(() => requiredSecrets(dir, "prod")).toThrow(/no service named nope/);
+  });
+
+  it("refuses a ref whose selected domain list is declared but empty", () => {
+    const dir = write(
+      `      landing:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: / }
+        domains: []
+${TMPL}`,
+      "X=${domain:landing}\n",
+    );
+    expect(() => requiredSecrets(dir, "prod")).toThrow(/domain list is empty/);
+  });
+
+  it('refuses a ref whose selected list has a blank first entry (domains: [""]) — the sentinel must not escape', () => {
+    const dir = write(
+      `      landing:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: / }
+        domains: [""]
+${TMPL}`,
+      "X=${domain:landing}\n",
+    );
+    // Schema-valid (a non-empty array of strings), so it PASSES manifest load —
+    // the assert is the gate. buildDomainMap would store "" and fillDomainEnv
+    // would read "" as unresolved, leaving DOMAIN_UNRESOLVED in a returned env.
+    expect(() => requiredSecrets(dir, "prod")).toThrow(
+      /empty or its first entry is blank/,
+    );
+    // Every verb that opens a template refuses it — the sentinel never escapes
+    // into a returned desired set.
+    expect(() => desiredFromManifest(dir, "prod", {})).toThrow(
+      /empty or its first entry is blank/,
+    );
+  });
+
+  it('refuses a service ref whose selected list has a blank first entry (service_domains: {admin: [""]})', () => {
+    const dir = write(
+      `      core:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: dockercompose, base_directory: /, compose_file: /docker-compose.yaml }
+        service_domains:
+          admin: [""]
+${TMPL}`,
+      "X=${domain:core.admin}\n",
+    );
+    expect(() => requiredSecrets(dir, "prod")).toThrow(
+      /empty or its first entry is blank/,
+    );
+  });
+
+  it("gives the domains-app-shape message (not 'no service named') for a service ref against an empty-domains app", () => {
+    // An empty `domains: []` is still a domains app (shape is by key presence).
+    // A ${domain:app.svc} ref against it is a spurious-service error, not an
+    // unknown-service one.
+    const dir = write(
+      `      landing:
+        source: { repo: acme/widget, branch: main }
+        build: { pack: nixpacks, base_directory: / }
+        domains: []
+${TMPL}`,
+      "X=${domain:landing.admin}\n",
+    );
+    expect(() => requiredSecrets(dir, "prod")).toThrow(/plain `domains` list/);
+  });
+});

@@ -279,12 +279,22 @@ export function databaseVersionFromImage(image: unknown): string | undefined {
 
 // Coolify's GET application model exposes `docker_compose_domains` as a
 // nullable string (reference/coolify-openapi-4.1.2.json ~line 12689), not
-// the structured array the create/update request bodies accept (~line 353) —
-// the live value is the same array-of-{name,domain} shape, JSON-encoded.
-// Parses defensively: anything that isn't a JSON-encoded array of well-formed
-// {name, domain} entries collapses to `undefined` rather than throwing, so a
-// live instance that turns out not to expose this (unverified until Task 8
-// step 6) degrades to "field omitted", not a crash.
+// the structured array the create/update request bodies accept (~line 353).
+// The REAL read shape on a live Coolify 4.1.2 (cast#68) is NOT that array
+// JSON-encoded — it is a service-KEYED OBJECT, JSON-encoded:
+//   {"api":{"domain":"https://api…"},"admin":{"domain":"https://…,https://…"}}
+// i.e. { "<service>": { "domain": "<comma-joined string>" }, … }. The
+// original assumption (an array of {name,domain}) was wrong; a live probe
+// pinned this as one of the two idempotency breaks in #68 — cast diffed the
+// desired map against `undefined` forever because the object bailed out.
+// Parses BOTH shapes into cast's internal `Record<string,string[]>`:
+//   - object shape (real read):   map[service] = domain.split(",")
+//   - legacy array shape (what applicationApiFields still WRITES, and what
+//     the vendored OpenAPI implies): map[name] = domain.split(",")
+// Keeping the array branch keeps the write-side round-trip and its tests
+// working. Anything that is not one of these two well-formed shapes (a JSON
+// scalar, a parse error, an empty string) collapses to `undefined` rather
+// than throwing — "field omitted", not a crash.
 export function parseDockerComposeDomains(
   raw: unknown,
 ): Record<string, string[]> | undefined {
@@ -295,16 +305,31 @@ export function parseDockerComposeDomains(
   } catch {
     return undefined;
   }
-  if (!Array.isArray(parsed)) return undefined;
   const map: Record<string, string[]> = {};
-  for (const entry of parsed) {
-    const name = (entry as { name?: unknown } | null)?.name;
-    const domain = (entry as { domain?: unknown } | null)?.domain;
-    if (typeof name === "string" && typeof domain === "string") {
-      map[name] = domain.split(",").filter(Boolean);
+  if (Array.isArray(parsed)) {
+    // Legacy / write-side shape: [{ name, domain }].
+    for (const entry of parsed) {
+      const name = (entry as { name?: unknown } | null)?.name;
+      const domain = (entry as { domain?: unknown } | null)?.domain;
+      if (typeof name === "string" && typeof domain === "string") {
+        map[name] = domain.split(",").filter(Boolean);
+      }
     }
+    return map;
   }
-  return map;
+  if (parsed !== null && typeof parsed === "object") {
+    // Real read shape: { "<service>": { "domain": "<comma-joined>" } }.
+    for (const [service, value] of Object.entries(
+      parsed as Record<string, unknown>,
+    )) {
+      const domain = (value as { domain?: unknown } | null)?.domain;
+      if (typeof domain === "string") {
+        map[service] = domain.split(",").filter(Boolean);
+      }
+    }
+    return map;
+  }
+  return undefined;
 }
 
 export function projectLiveFields(
@@ -332,14 +357,33 @@ export function projectLiveFields(
         ? { docker_compose_location: raw.docker_compose_location }
         : {}),
       ...(composeDomains ? { docker_compose_domains: composeDomains } : {}),
-      // is_static is read on every application so it is there to compare WHEN a
-      // manifest declares `static:`. computeDiff compares only fields the DESIRED
-      // side declares, so an app whose manifest omits `static` never diffs on it
-      // (which is what keeps this from PATCHing is_static off an un-migrated
-      // static app), and the three commands are the same — live carrying them
-      // here is safe and never reads as spurious drift. Coolify's Application
-      // model casts is_static to boolean; tolerate a 1/0 defensively.
-      is_static: raw.is_static === true || raw.is_static === 1,
+      // is_static is read so it is there to compare WHEN a manifest declares
+      // `static:`. computeDiff compares only fields the DESIRED side declares,
+      // so an app whose manifest omits `static` never diffs on it (which is
+      // what keeps this from PATCHing is_static off an un-migrated static app),
+      // and the three commands are the same.
+      //
+      // ABSENT-BY-DESIGN (cast#68): `is_static` is NOT an `applications` column —
+      // it lives on the `ApplicationSetting` relation (`Application::settings()`
+      // hasOne). Coolify 4.1.2 never serializes that relation on any read: the
+      // Application model has no `$with`/`$appends`, neither `GET /applications`
+      // nor the by-uuid GET `->load('settings')`, and `@environment_details`
+      // eager-loads `applications` but not `applications.settings`
+      // (ProjectController v4.1.2). So the key is simply ABSENT — `raw.is_static`
+      // is undefined — verified against the coolify v4.1.2 source and a live
+      // probe. Projecting `false` from that made cast diff false→true and redeploy
+      // on every apply (#68's second idempotency break). So when the live value is
+      // UNREADABLE (null/undefined), omit is_static: fetchLive flags the app
+      // `staticNotCompared` and computeDiff skips the comparison (mirroring
+      // backup's not-compared path), degrading is_static to a CREATE-TIME-ONLY
+      // setting — the create path still sends it (applicationApiFields), so a
+      // later change to an EXISTING app's is_static is a UI act cast cannot
+      // reconcile. Preserves #63's intent as far as the read API allows. If a
+      // future Coolify DOES serialize a real boolean (true/false, or 1/0), project
+      // and diff it normally.
+      ...(raw.is_static == null
+        ? {}
+        : { is_static: raw.is_static === true || raw.is_static === 1 }),
       ...(raw.install_command ? { install_command: raw.install_command } : {}),
       ...(raw.build_command ? { build_command: raw.build_command } : {}),
       ...(raw.start_command ? { start_command: raw.start_command } : {}),
@@ -532,6 +576,16 @@ export async function fetchLive(
       // keyed by the name a ref actually uses.
       ...(kind === "database" && typeof i.internal_db_url === "string"
         ? { internalDbUrl: i.internal_db_url }
+        : {}),
+      // is_static lives on the ApplicationSetting relation, which Coolify 4.1.2
+      // never serializes on any read endpoint — so it is absent here (cast#68,
+      // source-verified). Flag the application so computeDiff skips the is_static
+      // comparison rather than reporting phantom false→true drift and redeploying
+      // every run. Only applications carry is_static, and only flag when the live
+      // value is truly absent — a real boolean (a future Coolify) is projected
+      // into `fields` above and diffed normally.
+      ...(kind === "application" && i.is_static == null
+        ? { staticNotCompared: true }
         : {}),
     }));
   const live = [

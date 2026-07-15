@@ -42,6 +42,16 @@ export type Live = {
   // ${resource:<this>.url} derives from (#60). Absent on applications/services,
   // and on a database whose URL the read could not see.
   internalDbUrl?: string;
+  // Coolify 4.1.2 returns `is_static: null` on the read path even for a
+  // genuinely-static application (cast#68), so the live value is UNREADABLE.
+  // Presence of this means: DO NOT COMPARE `is_static` for this application.
+  // Exactly like backupNotCompared, leaving is_static merely absent from
+  // `fields` is NOT equivalent — the desired side still declares it whenever
+  // the manifest sets `static:`, so computeDiff would diff true-against-
+  // undefined and report a phantom PATCH + redeploy every run. is_static stays
+  // a create-time setting; a real boolean from a future Coolify (staticNotCompared
+  // unset) is projected and diffed normally.
+  staticNotCompared?: boolean;
 };
 export type FieldDiff = {
   field: string;
@@ -245,6 +255,10 @@ export function computeDiff(
 ): DiffReport {
   const changes: Change[] = [];
   const backupsNotCompared: { name: string; reason: string }[] = [];
+  // is_static is unreadable on Coolify 4.1.2's read path (cast#68); warn once
+  // per run when the degradation actually bites (a manifest declares `static:`
+  // on an app whose live value cast could not read), not per application.
+  let staticWarned = false;
   for (const d of desired) {
     const l = live.find((x) => x.kind === d.kind && x.name === d.name);
     if (!l) {
@@ -282,6 +296,26 @@ export function computeDiff(
     const skipBackup = l.backupNotCompared !== undefined;
     const fieldDiffs: FieldDiff[] = Object.entries(d.fields)
       .filter(([field]) => !(skipBackup && field === "backup"))
+      .filter(([field]) => {
+        // The unreadable-is_static escape hatch (cast#68), sibling to the
+        // backup one above. is_static lives on the ApplicationSetting relation,
+        // which Coolify 4.1.2 never serializes on a read (source-verified), so
+        // the live projection omits it and Live carries staticNotCompared. Skip
+        // the comparison rather than diffing the desired value against
+        // `undefined` forever (a phantom redeploy every run); warn once so the
+        // degradation is on screen. A real boolean (staticNotCompared unset)
+        // falls through and diffs normally.
+        if (field === "is_static" && l.staticNotCompared) {
+          if (!staticWarned) {
+            console.warn(
+              "is_static is set at create time but cannot be read back — it lives on Coolify 4.1.2's ApplicationSetting relation, which no read endpoint serializes (cast#68). So it is not diffed, and changing an EXISTING app's static flag is a Coolify UI act cast cannot reconcile. Ensure it is correct at create time.",
+            );
+            staticWarned = true;
+          }
+          return false;
+        }
+        return true;
+      })
       .filter(([field, value]) => !eq(value, l.fields[field]))
       .map(([field, value]) => ({
         field,

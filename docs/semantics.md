@@ -116,18 +116,17 @@ fails at runtime rather than at apply time.
 Live-state projection (`projectLiveFields`) reads both fields back for a
 compose app: `docker_compose_location` (a plain string on the GET model) and
 `docker_compose_domains`, which the GET model documents as a nullable
-**string**, not the structured array the write side accepts — parsed
-defensively as JSON back into the internal map, degrading to "field omitted"
-(not a crash) on anything that doesn't parse as a well-formed array of
-`{name, domain}`. Projecting both is what keeps a matching re-apply a true
-no-op instead of a spurious PATCH + stack redeploy every run. **This parsing
-path is unverified against a real Coolify instance** — the read-back is only
-confirmed by an overlay apply followed by an overlay-edit re-apply against a
-live instance, which has not yet happened. If a live instance turns out not to expose
-`docker_compose_domains` on read, apply's idempotency guarantee for the
-domains half breaks and needs the same warn-and-drop treatment as service
-domains below — that also removes the cutover mechanism (domains no longer
-flip via re-apply), so it would need a runbook amendment, not a silent fix.
+**string**. A live Coolify 4.1.2 probe (cast#68) pinned the ACTUAL decoded
+shape of that string: it is a service-**keyed object**, `{ "<service>":
+{ "domain": "<comma-joined>" }, … }` — **not** the `[{name, domain}]` array
+the write side sends and the OpenAPI implies. `parseDockerComposeDomains`
+therefore decodes both shapes into the internal `{service: string[]}` map (the
+object shape from the read, the array shape from the write-side round-trip and
+legacy data), degrading to "field omitted" (not a crash) on anything that is
+neither. This was the first of #68's two idempotency breaks: the object bailed
+to `undefined`, so cast diffed the desired map against nothing and re-PATCHed +
+redeployed the stack on every apply. Projecting both fields — decoded
+correctly — is what keeps a matching re-apply a true no-op.
 
 **Hostname overlay, compose apps:** `--hostname-overlay <file>` accepts a
 per-service map value for a compose app's entry instead of the plain-app
@@ -268,8 +267,25 @@ false` to actively guard against a UI flip to `true`, or omit it to leave the
 field alone (Coolify keeps `pack` and `is_static` independent, which is why this
 is an explicit field, not inferred from `pack`). The three commands are likewise
 conditional (an unset command means "let the build pack decide"), diffed only
-when declared. `projectLiveFields` reads `is_static` back on every app so it is
-there to compare when a manifest does declare it. `draft` emits all four when the
+when declared. `projectLiveFields` reads `is_static` back so it is there to
+compare when a manifest does declare it — **but only when Coolify actually
+returns it, and 4.1.2 never does.** `is_static` is not an `applications` column;
+it lives on the `ApplicationSetting` relation (`Application::settings()`), which
+Coolify 4.1.2 serializes on **no** read endpoint — the model has no `$with`, and
+neither `GET /applications`, the by-uuid GET, nor `@environment_details`
+(`ProjectController`) load `settings`. So the field is simply absent from every
+read (source-verified + a live probe, cast#68); the UI reads it in-process off
+the model (Livewire), never via the API. Projecting `false` from that absence was
+#68's second idempotency break: cast diffed `false → true` and re-PATCHed +
+redeployed on every apply.
+So when the live value is unreadable (`null`/absent), `projectLiveFields` omits
+`is_static`, `fetchLive` flags the application `staticNotCompared`, and
+`computeDiff` skips the comparison (a once-per-run warn says so) — **`is_static`
+degrades to a create-time-only setting.** The create path still sends it
+(`applicationApiFields`), so a fresh static app is stood up correctly; what is
+lost is drift detection and in-place repair of a later UI flip, which the API
+does not permit reading back. If a future Coolify returns a real boolean, it is
+projected and diffed normally again. `draft` emits all four when the
 live box carries them (and `static` only alongside a `publish_directory`, so the
 draft always loads) — they used to sit in its `NO_HOME` list of settings a
 rebuild silently dropped, and `is_static` was not even there, which is exactly

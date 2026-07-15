@@ -5,6 +5,7 @@ import {
   databaseApiFields,
   databaseVersionFromImage,
   defaultDatabaseImage,
+  parseDockerComposeDomains,
   projectLiveFields,
   serviceApiFields,
 } from "../src/cli.js";
@@ -62,6 +63,46 @@ describe("serviceApiFields", () => {
     });
     expect(out).toEqual({ type: "plausible" });
     expect(out).not.toHaveProperty("domains");
+  });
+});
+
+describe("parseDockerComposeDomains", () => {
+  // cast#68: the REAL read shape on a live Coolify 4.1.2 — a service-keyed
+  // object, NOT the array the OpenAPI implies. This exact string came off the
+  // wire. It must decode into cast's internal { service: string[] } map.
+  it("parses the real service-keyed object shape", () => {
+    const raw =
+      '{"api":{"domain":"https://api.heavyduty.builders"},"admin":{"domain":"https://admin.heavyduty.builders"},"intake":{"domain":"https://apply.heavyduty.builders"}}';
+    expect(parseDockerComposeDomains(raw)).toEqual({
+      api: ["https://api.heavyduty.builders"],
+      admin: ["https://admin.heavyduty.builders"],
+      intake: ["https://apply.heavyduty.builders"],
+    });
+  });
+
+  it("splits a comma-joined domain string into the internal array", () => {
+    const raw =
+      '{"api":{"domain":"https://a.example.com,https://b.example.com"}}';
+    expect(parseDockerComposeDomains(raw)).toEqual({
+      api: ["https://a.example.com", "https://b.example.com"],
+    });
+  });
+
+  // The write side (applicationApiFields) still emits the array shape, and the
+  // vendored OpenAPI documents it — keep tolerating it so the round-trip holds.
+  it("still parses the legacy array-of-{name,domain} shape", () => {
+    const raw = '[{"name":"api","domain":"https://api.example.com"}]';
+    expect(parseDockerComposeDomains(raw)).toEqual({
+      api: ["https://api.example.com"],
+    });
+  });
+
+  it("collapses a malformed string to undefined rather than throwing", () => {
+    expect(parseDockerComposeDomains("not json{")).toBeUndefined();
+    // A JSON scalar is neither shape.
+    expect(parseDockerComposeDomains("42")).toBeUndefined();
+    expect(parseDockerComposeDomains("")).toBeUndefined();
+    expect(parseDockerComposeDomains(null)).toBeUndefined();
   });
 });
 
@@ -140,16 +181,31 @@ describe("projectLiveFields", () => {
     expect(out.start_command).toBe("node server.js");
   });
 
-  it("always reports is_static as a boolean, tolerating Coolify's 1/0", () => {
+  it("reports a readable is_static as a boolean, tolerating Coolify's 1/0", () => {
     expect(projectLiveFields("application", { is_static: 1 }).is_static).toBe(
       true,
     );
     expect(projectLiveFields("application", { is_static: 0 }).is_static).toBe(
       false,
     );
-    // Absent on the wire reads as false (its real default), never undefined —
-    // so it compares against the desired side, which always emits it.
-    expect(projectLiveFields("application", {}).is_static).toBe(false);
+    // A real `false` is readable and projected as false, so a UI flip off
+    // `static` still diffs against a manifest that declares `static: true`.
+    expect(
+      projectLiveFields("application", { is_static: false }).is_static,
+    ).toBe(false);
+  });
+
+  // cast#68: Coolify 4.1.2 returns is_static: null on the read path even for a
+  // genuinely-static app. An unreadable value must be OMITTED, not projected as
+  // `false` — projecting false diffed false→true and redeployed every run.
+  it("omits is_static when the live value is unreadable (null/absent)", () => {
+    expect(
+      projectLiveFields("application", { is_static: null }),
+    ).not.toHaveProperty("is_static");
+    // Absent on the wire is the same unreadable case, not a real `false`.
+    expect(projectLiveFields("application", {})).not.toHaveProperty(
+      "is_static",
+    );
   });
 });
 
@@ -191,6 +247,127 @@ describe("compose app idempotency (review finding #2)", () => {
     ];
     const report = computeDiff(desired, live, "structural");
     expect(report.clean).toBe(true);
+  });
+
+  // cast#68: the idempotency guarantee against the REAL live shape. When
+  // docker_compose_domains comes back as Coolify 4.1.2's service-keyed object
+  // string, a matching manifest must still produce ZERO field diff — before the
+  // fix the object bailed to undefined and cast diffed the map against nothing
+  // on every apply.
+  it("produces zero field diffs when live docker_compose_domains is the service-keyed object shape", () => {
+    const desired = [
+      {
+        kind: "application" as const,
+        name: "core",
+        fields: {
+          git_repository: "acme/widget",
+          git_branch: "main",
+          build_pack: "dockercompose",
+          base_directory: "/",
+          docker_compose_location: "docker-compose.yaml",
+          docker_compose_domains: {
+            api: ["https://api.heavyduty.builders"],
+            admin: ["https://admin.heavyduty.builders"],
+          },
+        },
+      },
+    ];
+    const liveRaw = {
+      git_repository: "acme/widget",
+      git_branch: "main",
+      build_pack: "dockercompose",
+      base_directory: "/",
+      docker_compose_location: "docker-compose.yaml",
+      docker_compose_domains:
+        '{"api":{"domain":"https://api.heavyduty.builders"},"admin":{"domain":"https://admin.heavyduty.builders"}}',
+    };
+    const live = [
+      {
+        kind: "application" as const,
+        name: "core",
+        uuid: "app-uuid",
+        fields: projectLiveFields("application", liveRaw),
+      },
+    ];
+    const report = computeDiff(desired, live, "structural");
+    expect(report.clean).toBe(true);
+  });
+});
+
+// cast#68: is_static is unreadable on Coolify 4.1.2's read path (returns null
+// even for a static app). A manifest that declares `static: true` must NOT diff
+// against that null forever — the comparison is skipped and a once-per-run warn
+// is emitted. A real live boolean still diffs normally.
+describe("is_static live-unreadable degradation (cast#68)", () => {
+  const baseFields = {
+    git_repository: "acme/site",
+    git_branch: "main",
+    build_pack: "static",
+    base_directory: "/",
+  };
+
+  it("does not diff is_static when the live value is unreadable, and warns once", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const desired = [
+      {
+        kind: "application" as const,
+        name: "landing",
+        fields: { ...baseFields, is_static: true },
+      },
+    ];
+    // projectLiveFields omits is_static from a null live read; fetchLive flags
+    // the resource staticNotCompared (mirrored here).
+    const liveFields = projectLiveFields("application", {
+      ...baseFields,
+      is_static: null,
+    });
+    expect(liveFields).not.toHaveProperty("is_static");
+    const live = [
+      {
+        kind: "application" as const,
+        name: "landing",
+        uuid: "app-uuid",
+        fields: liveFields,
+        staticNotCompared: true,
+      },
+    ];
+    const report = computeDiff(desired, live, "structural");
+    const change = report.changes.find((c) => c.name === "landing");
+    expect(change?.fieldDiffs.some((f) => f.field === "is_static")).toBeFalsy();
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it("still diffs is_static when the live value is a real boolean", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const desired = [
+      {
+        kind: "application" as const,
+        name: "landing",
+        fields: { ...baseFields, is_static: true },
+      },
+    ];
+    // A UI flip off static: the live value is a genuine `false`, readable and
+    // staticNotCompared unset — cast must catch the drift, not suppress it.
+    const live = [
+      {
+        kind: "application" as const,
+        name: "landing",
+        uuid: "app-uuid",
+        fields: projectLiveFields("application", {
+          ...baseFields,
+          is_static: false,
+        }),
+      },
+    ];
+    const report = computeDiff(desired, live, "structural");
+    const change = report.changes.find((c) => c.name === "landing");
+    const staticDiff = change?.fieldDiffs.find((f) => f.field === "is_static");
+    expect(staticDiff).toBeDefined();
+    expect(staticDiff?.desired).toBe(true);
+    expect(staticDiff?.live).toBe(false);
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 });
 

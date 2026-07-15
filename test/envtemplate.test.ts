@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   DERIVED_UNRESOLVED,
+  DOMAIN_UNRESOLVED,
   assertEnvVarPolicy,
   fillDerivedEnv,
+  fillDomainEnv,
   resolveTemplate,
+  templateDomainRefs,
   templateRefs,
   templateResourceRefs,
   unresolvedDerived,
@@ -111,6 +114,85 @@ describe("derived resource refs (#60)", () => {
     ]);
     expect(unresolvedDerived(fillDerivedEnv(env, { postgres: "" }))).toEqual([
       { key: "DATABASE_URL", resource: "postgres" },
+    ]);
+  });
+});
+
+describe("derived domain refs (#66)", () => {
+  const template =
+    "PORT=3000\nMAILGUN_KEY=${MAILGUN_KEY}\nDATABASE_URL=${resource:postgres.url}\nLANDING_BASE_URL=${domain:landing}\nADMIN_WEB_BASE_URL=${domain:core.admin}\n";
+
+  it("resolveTemplate marks a ${domain:…} var with its ref, secret:false, and the transient sentinel — never the literal", () => {
+    const r = resolveTemplate(template, { MAILGUN_KEY: "mk" });
+    // An app ref and an app.service ref, both carrying the sentinel and the ref,
+    // both public (secret:false) — and NOT written through as the literal text.
+    expect(r.vars.LANDING_BASE_URL).toEqual({
+      value: DOMAIN_UNRESOLVED,
+      secret: false,
+      domain: { app: "landing" },
+    });
+    expect(r.vars.ADMIN_WEB_BASE_URL).toEqual({
+      value: DOMAIN_UNRESOLVED,
+      secret: false,
+      domain: { app: "core", service: "admin" },
+    });
+    expect(r.vars.LANDING_BASE_URL.value).not.toContain("${domain:");
+    // The three ref kinds stay mutually exclusive, and the plain secret/literal
+    // are untouched by the new branch.
+    expect(r.vars.DATABASE_URL).toEqual({
+      value: DERIVED_UNRESOLVED,
+      secret: true,
+      derived: { resource: "postgres", attr: "url" },
+    });
+    expect(r.vars.MAILGUN_KEY).toEqual({ value: "mk", secret: true });
+    expect(r.vars.PORT).toEqual({ value: "3000", secret: false });
+  });
+
+  it("fillDomainEnv resolves app and app.service refs verbatim, secret:false, marker dropped", () => {
+    const env = resolveTemplate(template, { MAILGUN_KEY: "mk" });
+    const filled = fillDomainEnv(env, {
+      landing: "https://new.heavyduty.builders",
+      "core.admin": "https://admin.heavyduty.builders",
+    });
+    // Resolved to the verbatim domain (scheme and all), public, and with the
+    // `domain` marker DROPPED — indistinguishable from a literal downstream.
+    expect(filled.vars.LANDING_BASE_URL).toEqual({
+      value: "https://new.heavyduty.builders",
+      secret: false,
+    });
+    expect(filled.vars.ADMIN_WEB_BASE_URL).toEqual({
+      value: "https://admin.heavyduty.builders",
+      secret: false,
+    });
+    // The non-domain vars ride through untouched.
+    expect(filled.vars.MAILGUN_KEY).toEqual({ value: "mk", secret: true });
+    expect(filled.vars.DATABASE_URL.value).toBe(DERIVED_UNRESOLVED);
+  });
+
+  it("fillDomainEnv leaves an unknown key as-is (sentinel and marker intact)", () => {
+    const env = resolveTemplate("X=${domain:landing}\n", {});
+    // Absent from the map, and present-but-empty, are both non-resolutions.
+    expect(fillDomainEnv(env, {}).vars.X).toEqual({
+      value: DOMAIN_UNRESOLVED,
+      secret: false,
+      domain: { app: "landing" },
+    });
+    expect(fillDomainEnv(env, { landing: "" }).vars.X).toEqual({
+      value: DOMAIN_UNRESOLVED,
+      secret: false,
+      domain: { app: "landing" },
+    });
+  });
+
+  it("templateDomainRefs extracts the edges; templateRefs/templateResourceRefs exclude them", () => {
+    expect(templateDomainRefs(template)).toEqual([
+      { key: "LANDING_BASE_URL", app: "landing" },
+      { key: "ADMIN_WEB_BASE_URL", app: "core", service: "admin" },
+    ]);
+    // A domain is not a secret to capture, and not a resource edge either.
+    expect(templateRefs(template).map((r) => r.key)).toEqual(["MAILGUN_KEY"]);
+    expect(templateResourceRefs(template).map((r) => r.key)).toEqual([
+      "DATABASE_URL",
     ]);
   });
 });

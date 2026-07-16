@@ -875,13 +875,38 @@ export function aliasLive<T extends { name: string }>(
 // The diff picks between them per var (see LiveEnvVar, diffEnv); callers that
 // only need one flattened string use flattenEnv below.
 //
+// PREVIEW ROWS ARE DROPPED, and that is load-bearing rather than tidy.
+//
+// GET /applications/{uuid}/envs does NOT return one row per key. It MERGES two
+// parallel sets into one flat array — the production vars and the PREVIEW ones
+// (`environment_variables->merge(environment_variables_preview)`,
+// ApplicationsController@envs v4.1.2) — and the two relations are complements
+// split on `is_preview`, with a unique index per (key, resource, is_preview). So
+// the SAME KEY legitimately arrives TWICE, and keying by `key` alone kept
+// whichever row Coolify happened to serialize last.
+//
+// That is #85, and it is why #78 looked like a "stale read": both rows are born
+// equal (Coolify seeds a preview twin), and syncEnv below only ever PATCHes the
+// PRODUCTION row — so the two diverge for exactly the vars that were updated in
+// place. Five prod flags flipped false->true re-proposed as `change` on every
+// diff forever, while created-once vars (NODE_ENV, …) stayed clean because their
+// twins still agreed. Nothing was stale; cast was reading the other deployment's
+// value.
+//
+// cast declares PRODUCTION env, and already says so on every WRITE — syncEnv
+// sends `is_preview: false` on each bulk upsert. This is the read finally saying
+// the same thing. A preview var is another deployment's value for the same name:
+// not cast's to compare, and not cast's to write. Services and databases have no
+// preview relation at all (their controllers map a single set), so this is a
+// no-op for them.
+//
 // A 404 (a resource we just listed no longer having an envs endpoint — not
 // expected in practice, but consistent with treating "gone" as "no env vars")
 // collapses to {}; anything else (401, 5xx, network) must surface. Swallowing
 // it would make a live resource's env look EMPTY, which turns every one of its
 // vars into a spurious create in a diff, and into a spurious "missing" in a
 // capture.
-async function fetchEnv(
+export async function fetchEnv(
   client: CoolifyClient,
   l: Pick<Live, "kind" | "uuid">,
 ): Promise<Record<string, LiveEnvVar>> {
@@ -889,9 +914,16 @@ async function fetchEnv(
   const envs = (await client.get(`/${base}/${l.uuid}/envs`).catch((err) => {
     if (err instanceof HttpError && err.status === 404) return [];
     throw err;
-  })) as Array<{ key: string; real_value?: string; value: string }>;
+  })) as Array<{
+    key: string;
+    real_value?: string;
+    value: string;
+    is_preview?: boolean;
+  }>;
   return Object.fromEntries(
-    envs.map((e) => [e.key, { value: e.value, realValue: e.real_value }]),
+    envs
+      .filter((e) => e.is_preview !== true)
+      .map((e) => [e.key, { value: e.value, realValue: e.real_value }]),
   );
 }
 

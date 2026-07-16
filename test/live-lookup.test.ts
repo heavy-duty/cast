@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   attachBackup,
   attachServiceDomains,
+  fetchEnv,
   fetchLive,
   renderAbsentTarget,
 } from "../src/cli.js";
@@ -273,6 +274,80 @@ describe("attachBackup", () => {
     // would be a coin toss reported as a fact.
     expect(l.backupNotCompared).toMatch(/2 schedules/);
     expect("backup" in l.fields).toBe(false);
+  });
+});
+
+describe("fetchEnv — preview rows never shadow production (cast#85)", () => {
+  const app = { kind: "application" as const, uuid: "a1" };
+  const client = (body: unknown) =>
+    new CoolifyClient(
+      "https://coolify.test",
+      "tok",
+      vi.fn(
+        async () => new Response(JSON.stringify(body), { status: 200 }),
+      ) as unknown as typeof fetch,
+    );
+
+  // The exact shape prod returned (#85): GET /applications/{uuid}/envs merges
+  // environment_variables with environment_variables_preview, so a key arrives
+  // TWICE — production first, its preview twin second. Keying by `key` alone
+  // kept the LAST, which is how five flipped prod flags re-proposed forever.
+  it("takes the production row even though the preview twin is serialized last", async () => {
+    const env = await fetchEnv(
+      client([
+        {
+          key: "REPORTING_ENABLED",
+          value: "true",
+          real_value: "true",
+          is_preview: false,
+        },
+        {
+          key: "REPORTING_ENABLED",
+          value: "false",
+          real_value: "false",
+          is_preview: true,
+        },
+      ]),
+      app,
+    );
+    expect(env.REPORTING_ENABLED).toEqual({ value: "true", realValue: "true" });
+  });
+
+  // Order must not decide the answer: the fix is "drop preview", not "take the
+  // first" — a serialization order that put the twin first would otherwise just
+  // move the bug rather than remove it.
+  it("takes the production row even when the preview twin is serialized FIRST", async () => {
+    const env = await fetchEnv(
+      client([
+        { key: "BRAIN_ENABLED", value: "false", is_preview: true },
+        { key: "BRAIN_ENABLED", value: "true", is_preview: false },
+      ]),
+      app,
+    );
+    expect(env.BRAIN_ENABLED).toEqual({ value: "true", realValue: undefined });
+  });
+
+  // A preview-only var is not production state at all. It must not surface as an
+  // orphan/remove-candidate either — cast neither compares nor writes it.
+  it("drops a key that exists ONLY as a preview var", async () => {
+    const env = await fetchEnv(
+      client([
+        { key: "PORT", value: "3000", is_preview: false },
+        { key: "PREVIEW_ONLY", value: "x", is_preview: true },
+      ]),
+      app,
+    );
+    expect(Object.keys(env)).toEqual(["PORT"]);
+  });
+
+  // Services and databases map a single set and their rows may carry no
+  // is_preview at all — absent must mean "keep", never "drop".
+  it("keeps rows with no is_preview field (services/databases)", async () => {
+    const env = await fetchEnv(client([{ key: "APP_SECRET", value: "s" }]), {
+      kind: "service",
+      uuid: "s1",
+    });
+    expect(env.APP_SECRET).toEqual({ value: "s", realValue: undefined });
   });
 });
 

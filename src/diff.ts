@@ -3,6 +3,17 @@ import type { ResolvedEnv } from "./envtemplate.js";
 import { isReservedEnvName, reservedConsequence } from "./reserved.js";
 
 export type ResourceKind = "application" | "database" | "service";
+// One live env var as Coolify returns it, before the per-secret flattening that
+// used to happen the moment it was read. `value` is what a plain token sees:
+// fresh after every write, but MASKED for a secret. `realValue` is the decrypted
+// plaintext (a `read:sensitive` token); it is the only readable form of a secret,
+// but for a NON-secret var it is a stored column Coolify does NOT recompute on an
+// in-place PATCH — so it goes stale and reads back the pre-update value (#78).
+//
+// Carrying both to diffEnv (rather than collapsing to `realValue ?? value` at
+// fetch time) is what lets the comparison pick the fresh side per var: `value`
+// for non-secrets, `realValue ?? value` for secrets. See fetchEnv, diffEnv.
+export type LiveEnvVar = { value: string; realValue?: string };
 export type Desired = {
   kind: ResourceKind;
   name: string;
@@ -14,7 +25,7 @@ export type Live = {
   name: string;
   uuid: string;
   fields: Record<string, unknown>;
-  env?: Record<string, string>;
+  env?: Record<string, LiveEnvVar>;
   // The destination (Docker network) Coolify reports this resource on.
   //
   // NOT in `fields`, because `fields` is the desired-vs-live comparison
@@ -147,9 +158,22 @@ function eq(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+// The live value to compare a desired var against, chosen by whether the desired
+// side declares it secret (#78). For a NON-secret, `value` is authoritative and
+// always fresh; `realValue` is a stored column Coolify leaves stale after an
+// in-place PATCH, so trusting it re-proposes an already-correct var on every
+// diff. For a SECRET, `value` is masked to a plain token, so `realValue` (the
+// decrypted plaintext) is the only comparable form — kept as it always was, at
+// the cost of the same theoretical staleness, which a masked `value` cannot
+// stand in for. `realValue` is optional (a plain token omits it); fall back to
+// `value` so a secret still compares against SOMETHING rather than `undefined`.
+function liveValueFor(secret: boolean, live: LiveEnvVar): string {
+  return secret ? (live.realValue ?? live.value) : live.value;
+}
+
 function diffEnv(
   desired: ResolvedEnv,
-  live: Record<string, string>,
+  live: Record<string, LiveEnvVar>,
 ): EnvDiff[] {
   const diffs: EnvDiff[] = [];
   for (const [key, v] of Object.entries(desired.vars)) {
@@ -157,7 +181,7 @@ function diffEnv(
       v.derived !== undefined ? { derived: v.derived.resource } : {};
     if (!(key in live))
       diffs.push({ key, state: "add", secret: v.secret, ...derived });
-    else if (live[key] !== v.value) {
+    else if (liveValueFor(v.secret, live[key]) !== v.value) {
       // The second pass of the two-pass bootstrap, which for years only ever
       // ran once. The store's value for a provider-generated secret is the
       // literal `pending-coolify-generated` (capture.ts); the first apply sends

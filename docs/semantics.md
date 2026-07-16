@@ -1092,6 +1092,33 @@ The last two are not in the state repo — correctly, it holds no live credentia
 — and cannot be regenerated from it. A DR runbook that does not say so is not a
 runbook.
 
+**The GitHub App ❌ row is narrower than it reads — the manual part is the
+credential, not the registration (#84).** Three acts hide under "set up the
+GitHub App again", and only the first and last lack an API:
+
+- **Creating the App on GitHub** — manual. The GitHub-side App Manifest flow
+  (name, webhook URL, permissions, the initial private key) has no Coolify
+  route driving it; automating it is tracked in #7 (and #5), and #7's
+  manifest-flow idea remains the real fix.
+- **Registering an already-created App with Coolify** — **API-doable at
+  4.1.2**. `POST /security/keys` stores the private key and `POST
+  /github-apps` registers the App against it — you supply the `app_id`,
+  `installation_id` and the secrets (`routes/api.php:131-136`, v4.1.2). A DR
+  rebuild re-registers the App without a UI visit, provided a human holds the
+  values.
+- **The private key *value*** — inherently manual: a credential, not state,
+  which is exactly what the table's ❌ row says. That row stays correct.
+
+So the DR story reads *"re-mint the credentials by hand, feed them to the
+API"*, never *"recreate all of it in the UI"*. Two upstream bugs to know
+before cast ever drives these routes: `PATCH /github-apps/{id}` rejects a
+CUID2 `private_key_uuid` (coollabsio/coolify#10936 — a contributor has a
+draft PR), and the create can time out against an instance with many repos
+(coollabsio/coolify#5467). On `next` (v4.2 — tracked in #77) the shape
+shifts: `api_url` becomes optional (derived from `html_url`) and the secrets
+become readable with a `read:sensitive` token — the same token-abilities
+change #77 already tracks.
+
 **What the box cannot tell you, and cast therefore does not invent:** the
 `<org>/<repo>` slug comes from an application's git remote (the only place a live
 box knows it), so a project with **no application** — a lone service — has no repo

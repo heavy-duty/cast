@@ -1867,13 +1867,14 @@ async function main(): Promise<number> {
           otherEnvironments: others,
         });
       }
-      // Which GitHub App clones a repo is NOT a property of any resource — no
-      // field Coolify returns about an application says so. What the instance can
-      // answer is which Apps exist; with exactly one, there is no other it could
-      // be. Best-effort: an instance that will not list them still gets a draft,
-      // with a REVIEW marker where the binding goes.
+      // Which GitHub App clones a repo IS readable (cast#72): an application
+      // carries `source_id`/`source_type` (removeSensitiveData hides neither),
+      // and GET /github-apps returns each App's `id` and `name` (only the
+      // secrets are hidden) — so bindingsDoc resolves the binding by matching the
+      // two, instead of guessing the only App. The list is still best-effort: an
+      // instance that will not answer it leaves a REVIEW marker on every repo.
       const githubApps = (await client.get("/github-apps").catch(() => [])) as
-        | Array<{ name?: unknown }>
+        | Array<{ id?: unknown; name?: unknown }>
         | undefined;
       const draftCtx = {
         env: envName,
@@ -1882,8 +1883,11 @@ async function main(): Promise<number> {
         team,
         server: sweepBinding.server,
         githubApps: (Array.isArray(githubApps) ? githubApps : [])
-          .map((a) => a?.name)
-          .filter((n): n is string => typeof n === "string"),
+          .filter(
+            (a): a is { id: number; name: string } =>
+              typeof a?.id === "number" && typeof a?.name === "string",
+          )
+          .map((a) => ({ id: a.id, name: a.name })),
         recipient,
         generatedAt: new Date().toISOString(),
       };

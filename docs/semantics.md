@@ -1097,10 +1097,14 @@ registry's own parse-time refusal (*"a registry key has no meaning without its
 org"*) then stops the file being used until a human supplies it. That refusal is
 the design: the alternatives are inventing an org, or leaving the project out of
 the registry — and a project missing from the registry is one every fleet run
-skips **in silence**. Likewise `github_apps`: nothing Coolify returns about an
-application says which App cloned it, so cast binds every repo to the instance's
-only GitHub App when there is exactly one (there is no other it could be), and
-writes a `REVIEW-…` marker when there is not.
+skips **in silence**. `github_apps`, by contrast, IS readable (#72): an
+application carries the `source_id`/`source_type` of the App that clones it
+(`removeSensitiveData` hides neither), and `GET /github-apps` returns each App's
+`id` and `name` (only `client_secret`/`webhook_secret` are hidden) — so the draft
+resolves each repo's App by matching the two, a lookup rather than the only-App
+guess it used to make (which was silently wrong for any public repo even on a
+single-App instance). A repo whose application has no GithubApp source, or an
+instance that will not list its Apps, still gets a `REVIEW-…` marker.
 
 ## Teardown (`cast destroy`)
 

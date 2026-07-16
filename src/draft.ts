@@ -266,12 +266,13 @@ export type DraftContext = {
   baseUrl: string;
   team: { id: number; name: string };
   server?: string;
-  // The GitHub Apps configured on the instance, by name. NOT a property of any
-  // resource: nothing Coolify returns about an application says which App clones
-  // it. With exactly one on the instance there is no other it could be, and cast
-  // binds every repo to it; with none or several it writes a REVIEW marker
-  // instead of picking. See bindingsDoc.
-  githubApps?: string[];
+  // The GitHub Apps configured on the instance, each with the `id` an
+  // application's `source_id` points at (cast#72). bindingsDoc resolves a repo's
+  // App by that match — a READ, not the only-App guess this used to make — and
+  // falls back to a REVIEW marker only when a resource carries no resolvable
+  // source (a public repo, or an instance that would not list its Apps). See
+  // bindingsDoc.
+  githubApps?: Array<{ id: number; name: string }>;
   recipient?: string;
   generatedAt: string;
 };
@@ -812,7 +813,7 @@ const NO_API_COVERAGE: Array<[string, string]> = [
   ],
   [
     "which GitHub App clones a repo",
-    "nothing Coolify returns about an application says so. cast binds every repo to the instance's only App when there is exactly one, and writes a REVIEW marker when there is not.",
+    "resolved from the application's `source_id` against GET /github-apps (cast#72) — a lookup, not a guess. A repo whose application has no GithubApp source (a public repo) or an instance that will not list its Apps gets a REVIEW marker instead.",
   ],
   [
     "anything configured in the UI with no manifest field",
@@ -1084,11 +1085,11 @@ export function planDraft(
         "`projects:`, the registry: the list of what exists, which nothing before a",
         "whole-instance sweep was able to write down.",
         "",
-        "`github_apps` is NOT readable from a box: nothing Coolify returns about an",
-        `application says which App clones it. This instance has ${ctx.githubApps?.length ?? 0}, so cast`,
-        ctx.githubApps?.length === 1
-          ? `bound every repo to the only one there is (${ctx.githubApps[0]}) — there is no other it could be.`
-          : "left a REVIEW marker on every repo rather than pick. `apply` will refuse until you fix them.",
+        "`github_apps` IS readable (cast#72): an application carries the `source_id`",
+        `of the App that clones it, and this instance lists ${ctx.githubApps?.length ?? 0}, so cast`,
+        "resolved each repo's App by that match. A repo whose application resolves to",
+        "none (a public repo, or an unlistable instance) gets a `REVIEW-…` marker;",
+        "`apply` refuses on those until you fix them.",
         "",
         "Do not copy it over a state file you already have. Merge the registry into",
         "yours, by hand, having decided which of these projects are yours to declare.",
@@ -1134,6 +1135,28 @@ function registryKey(p: DraftProject): string {
   return slug(p.name);
 }
 
+// The GitHub App a project's repo is cloned by, resolved from an APPLICATION's
+// `source_id` against the instance's Apps (cast#72). Coolify hides neither
+// `source_id` nor `source_type` on an application, and GET /github-apps returns
+// each App's `id` — so this is a lookup, not a guess. Only a GithubApp source
+// counts: a public-repo application has a different `source_type` and no App to
+// bind, and a numeric `source_id` that happens to collide with an App id must
+// not be mistaken for one. The first application that resolves wins; a project
+// whose apps resolve to none gets a REVIEW marker (see bindingsDoc).
+function githubAppNameForProject(
+  p: DraftProject,
+  appById: Map<number, string>,
+): string | undefined {
+  for (const r of p.resources) {
+    if (r.kind !== "application") continue;
+    if (!/github.?app/i.test(String(r.raw.source_type ?? ""))) continue;
+    const id = r.raw.source_id;
+    const name = typeof id === "number" ? appById.get(id) : undefined;
+    if (name) return name;
+  }
+  return undefined;
+}
+
 // The bindings the box implies — plus `projects:`, THE REGISTRY (#25): the list
 // of what exists, which nothing before a whole-instance sweep was in a position
 // to write down. A rebuild cannot even be attempted without it, because you
@@ -1141,20 +1164,23 @@ function registryKey(p: DraftProject): string {
 function bindingsDoc(projects: DraftProject[], ctx: DraftContext) {
   const registry: Record<string, { environments: string[] }> = {};
   const githubApps: Record<string, string> = {};
-  // With exactly one GitHub App on the instance there is no other one an
-  // application could have been cloned by, so binding every repo to it is a fact,
-  // not a guess. With none or several it IS a guess, and cast does not make it:
-  // a wrong App resolves to a real uuid and clones the wrong repo, silently
-  // (githubAppNameFor, #12). A REVIEW marker resolves to nothing, and `apply`
-  // says so.
-  const onlyApp = ctx.githubApps?.length === 1 ? ctx.githubApps[0] : undefined;
+  // Resolve each repo's App by the read, not a guess (cast#72): an application
+  // carries the `source_id` of the App that clones it, and ctx.githubApps carries
+  // each App's `id` and `name`. A guess is what this used to be — binding every
+  // repo to the only App there was — and it was silently wrong for any public
+  // repo (source_type is not a GithubApp) even on a single-App instance, and
+  // unmakeable on a multi-App one. A REVIEW marker resolves to nothing and
+  // `apply` says so; a wrong App resolves to a real uuid and clones the wrong
+  // repo, silently (githubAppNameFor, #12).
+  const appById = new Map((ctx.githubApps ?? []).map((a) => [a.id, a.name]));
   for (const p of projects) {
     // Only what the draft actually carries a manifest for. See planDraft.
     if (p.resources.length === 0) continue;
     const repo = registryKey(p);
     registry[repo] = { environments: [ctx.env] };
     githubApps[repo] =
-      onlyApp ?? "REVIEW-which-github-app-in-coolify-clones-this-repo";
+      githubAppNameForProject(p, appById) ??
+      "REVIEW-which-github-app-in-coolify-clones-this-repo";
   }
   return {
     environments: {

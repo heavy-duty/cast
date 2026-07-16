@@ -57,6 +57,88 @@ const project = (over: Partial<DraftProject> = {}): DraftProject => ({
   ...over,
 });
 
+describe("github_apps binding — resolved by source_id, not guessed (cast#72)", () => {
+  const appProject = (
+    name: string,
+    repo: string,
+    source?: { source_id: number; source_type: string },
+  ): DraftProject => ({
+    name,
+    coolifyEnv: "staging",
+    resources: [
+      {
+        kind: "application",
+        name,
+        uuid: `u-${name}`,
+        raw: {
+          git_repository: `https://github.com/${repo}`,
+          git_branch: "main",
+          build_pack: "nixpacks",
+          base_directory: "/",
+          fqdn: "https://x.example.com",
+          ...source,
+        },
+        env: {},
+      },
+    ],
+    unreadable: [],
+    otherEnvironments: [],
+  });
+  const bindings = (plan: ReturnType<typeof planDraft>) =>
+    plan.files.find((f) => f.path === "environments.yaml")?.content ?? "";
+
+  // The payoff the old only-App heuristic could not deliver: with MORE THAN ONE
+  // App it used to write a REVIEW marker on every repo. source_id resolves each.
+  it("binds each repo to the App its source_id names, even with several Apps", () => {
+    const ghApp = "App\\Models\\GithubApp";
+    const plan = planDraft(
+      [
+        appProject("acme-api", "acme/api", {
+          source_id: 7,
+          source_type: ghApp,
+        }),
+        appProject("beta-web", "beta/web", {
+          source_id: 9,
+          source_type: ghApp,
+        }),
+      ],
+      {
+        ...ctx,
+        githubApps: [
+          { id: 7, name: "acme-app" },
+          { id: 9, name: "beta-app" },
+        ],
+      },
+    );
+    const yaml = bindings(plan);
+    expect(yaml).toContain("acme/api: acme-app");
+    expect(yaml).toContain("beta/web: beta-app");
+  });
+
+  it("leaves a REVIEW marker for a public repo (no GithubApp source)", () => {
+    const plan = planDraft([appProject("pub", "acme/public")], {
+      ...ctx,
+      githubApps: [{ id: 7, name: "acme-app" }],
+    });
+    expect(bindings(plan)).toMatch(/acme\/public: REVIEW-/);
+  });
+
+  it("does not mistake a non-GithubApp source whose id collides with an App id", () => {
+    const plan = planDraft(
+      [
+        appProject("gitlab", "acme/gl", {
+          source_id: 7,
+          source_type: "App\\Models\\GitlabApp",
+        }),
+      ],
+      { ...ctx, githubApps: [{ id: 7, name: "acme-app" }] },
+    );
+    // id 7 exists as a GitHub App, but this app's source is a GitlabApp — the
+    // collision must not bind it to acme-app.
+    expect(bindings(plan)).toMatch(/acme\/gl: REVIEW-/);
+  });
+});
+
 describe("isProviderGenerated — the one judgment that must not be wrong", () => {
   it("recognizes the datastore families whose value points at the SOURCE box", () => {
     for (const key of [

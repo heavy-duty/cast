@@ -62,10 +62,12 @@ async function stubCoolify(opts: { ambiguous?: boolean } = {}): Promise<Stub> {
       res.end(JSON.stringify(body));
     };
     if (path === "/teams/current") return json({ id: 0, name: "Root Team" });
-    // Exactly one App: there is no other one an application could have been
-    // cloned by, so cast binds every repo to it rather than leave a marker.
+    // GET /github-apps returns each App's `id` and `name` (cast#72). The
+    // incubator app below carries `source_id: 7`, so the binding RESOLVES to
+    // this App by the read; the third-party public repo has no GithubApp source
+    // and gets a REVIEW marker instead of being wrongly bound to it.
     if (path === "/github-apps")
-      return json([{ uuid: "g1", name: "hdb-coolify" }]);
+      return json([{ id: 7, uuid: "g1", name: "hdb-coolify" }]);
     if (path === "/projects")
       return json([
         { uuid: "p1", name: "Incubator" },
@@ -95,6 +97,10 @@ async function stubCoolify(opts: { ambiguous?: boolean } = {}): Promise<Stub> {
             uuid: "a1",
             git_repository: "heavy-duty/incubator",
             git_branch: "main",
+            // Cloned by the GitHub App id 7 (hdb-coolify) — source_id/source_type
+            // survive serialization, so the binding is resolvable (cast#72).
+            source_id: 7,
+            source_type: "App\\Models\\GithubApp",
             build_pack: "dockercompose",
             base_directory: "/",
             docker_compose_location: "/docker-compose.yaml",
@@ -386,10 +392,15 @@ describe("cast inventory --emit-draft (#27)", () => {
     // The bindings the sweep could actually read.
     expect(yaml).toContain("server: box-b");
     expect(yaml).toContain("name: Root Team");
-    // Which GitHub App clones a repo is not on any resource — but this instance
-    // has exactly one, and there is no other it could be.
+    // Which GitHub App clones a repo is READ from the application's source_id,
+    // not guessed (cast#72): the incubator app's source_id: 7 resolves to
+    // hdb-coolify, while the third-party PUBLIC repo (no GithubApp source) gets a
+    // REVIEW marker rather than being wrongly bound to the only App there is.
     expect(yaml).toContain("github_apps:");
-    expect(yaml).toContain("third-party/la-familia: hdb-coolify");
+    expect(yaml).toContain("heavy-duty/incubator: hdb-coolify");
+    expect(yaml).toMatch(
+      /third-party\/la-familia: REVIEW-which-github-app-in-coolify-clones-this-repo/,
+    );
 
     // The barber shop has no application, so the box knows no repo for it. cast
     // writes the bare project name — and the registry's own parse-time refusal

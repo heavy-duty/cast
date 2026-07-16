@@ -585,13 +585,15 @@ function databaseSpec(
       `image "${image}" — no version could be read from its tag, so none was written and \`apply\` would create this database on Coolify's default image.`,
     );
   }
-  // Coolify exposes no backup schedule on a database's GET, so a `backup:` block
-  // cannot be recovered. It is create-time-only in cast (see README's known
-  // limitations), so a rebuild from this draft would come up with NO BACKUPS —
-  // the quietest possible loss, and the one you discover at the worst moment.
+  // Coolify DOES expose a database's backup schedule — GET /databases/{uuid}/backups
+  // answers, and `diff`/`apply` read and write it (#51). What the DRAFT path cannot
+  // yet do is CAPTURE it: `inventory --emit-draft` does not read that route, so a
+  // `backup:` block is not recovered here. Until it is taught to, a rebuild from
+  // this draft still comes up with NO BACKUPS — the quietest possible loss, and the
+  // one you discover at the worst moment — unless the block is declared by hand.
   flag(
     "backup",
-    "backup schedules are not exposed by Coolify's API and are NOT in this draft. If this database is backed up, a rebuild from here would not be. Check the Coolify UI (Backups tab) and declare `backup: { frequency, retention }` yourself.",
+    "backup schedules are NOT in this draft — `inventory --emit-draft` does not yet read `GET /databases/{uuid}/backups` (which `diff` and `apply` do, #51). If this database is backed up, a rebuild from here would not be until you declare it. Read the schedule from a `cast diff` or the Coolify UI (Backups tab) and set `backup: { frequency, retention }` yourself.",
   );
   return { type, ...(version ? { version } : {}) };
 }
@@ -798,7 +800,7 @@ const NO_API_COVERAGE: Array<[string, string]> = [
   ],
   [
     "backup schedules",
-    "a database's backup config is not exposed on its GET. A rebuild from this draft has NO backups until you declare them.",
+    "the API exposes them (`GET /databases/{uuid}/backups`, which `diff`/`apply` use — #51), but `inventory --emit-draft` does not yet read that route, so no `backup:` block is captured. A rebuild from this draft has NO backups until you declare them.",
   ],
   [
     "database kinds cast does not model",

@@ -352,7 +352,7 @@ describe("cast inventory --emit-draft (#27)", () => {
     expect(md).toContain("destination_id 3");
     expect(md).toContain("legacy-analytics"); // a MySQL cast cannot model
     expect(md).toContain("custom_labels"); // Basic Auth / Traefik labels
-    expect(md).toContain("backup"); // not exposed by the API
+    expect(md).toContain("backup"); // API exposes it, draft doesn't capture it yet (#51)
     expect(md).toContain("legacy.flag"); // not a name a template can hold
 
     // And the standing sections, emitted on every run whatever was found:

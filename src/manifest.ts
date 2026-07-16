@@ -147,7 +147,16 @@ const DatabaseSpecSchema = z
 const ServiceSpecSchema = z
   .object({
     type: z.string(),
-    domains: z.array(z.string()).optional(),
+    // Per-container hostnames, exactly the vocabulary a dockercompose app uses
+    // (a map of container name -> URLs). A Coolify service is a bundle of
+    // containers (`ServiceApplication`s), and a hostname is set on ONE of them —
+    // so a flat `domains: string[]` cannot say which, and cannot build the
+    // `urls: [{name, url}]` payload the API matches to a container by name
+    // (cast#72, verified against ServicesController@applyServiceUrls v4.1.2).
+    // The name is the container's, discoverable from a `cast diff` read-back or
+    // the Coolify UI. Written on create/PATCH, read back off
+    // `service.applications[].fqdn`, and diffed like any other field.
+    service_domains: z.record(z.array(z.string())).optional(),
     env_template: z.string().optional(),
   })
   .strict();

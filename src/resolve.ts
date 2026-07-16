@@ -509,6 +509,24 @@ export function manifestResources(
   return resources;
 }
 
+// Sort the keys and each URL array of a service's `service_domains` map, so the
+// same set of per-container hostnames compares equal whatever order the manifest
+// authored them in or Coolify returns them in. Both the desired side
+// (desiredFromManifest) and the live read-back (attachServiceDomains in cli.ts)
+// run this before computeDiff compares by JSON.stringify — without it, a service
+// whose containers Coolify lists in a different order than the manifest would
+// diff forever. Order is meaningless for hostnames (Coolify matches `urls[].name`
+// to a container and treats the URLs as a set), so canonicalizing loses nothing.
+export function canonicalizeServiceDomains(
+  map: Record<string, string[]>,
+): Record<string, string[]> {
+  return Object.fromEntries(
+    Object.keys(map)
+      .sort()
+      .map((k) => [k, [...map[k]].sort()]),
+  );
+}
+
 export function desiredFromManifest(
   checkoutDir: string,
   envName: string,
@@ -663,33 +681,30 @@ export function desiredFromManifest(
     });
   }
   for (const [name, svc] of Object.entries(envSpec.services ?? {})) {
-    if (svc.domains && svc.domains.length > 0) {
-      // Coolify 4.1.2's service executor has no flat `domains` concept —
-      // hostnames live per-container on `urls` (see serviceApiFields in
-      // cli.ts) — so a manifest-declared service `domains` list is silently
-      // unhonorable by apply. Warn at build time, once per run, while the
-      // service name is still in scope.
-      console.warn(
-        `service ${name} declares domains (${svc.domains.join(", ")}), but apply cannot set them on Coolify 4.1.2 services — configure hostnames manually in the Coolify UI`,
-      );
-    }
     desired.push({
       kind: "service",
       name,
-      // domains dropped from fields: the live side (projectLiveFields in
-      // cli.ts) can't read service domains and the write side
-      // (serviceApiFields) drops them, so keeping domains in fields makes
-      // every domain-bearing service diff as a perpetual update. Hostnames
-      // stay a manual Coolify UI act (warned above).
+      // service_domains is a DIFFED FIELD (cast#72). Coolify 4.1.2 sets a
+      // service's per-container hostnames via `urls` on create/PATCH and returns
+      // them on `service.applications[].fqdn` — so a declared hostname is now
+      // WRITTEN by apply and VERIFIED by diff, not a manual Coolify UI act.
       //
-      // This USED to cite database `backup` as its precedent. It no longer
-      // can: `backup` was dropped on the same reasoning and the reasoning
-      // turned out to be false there (a read route existed, unlooked-for —
-      // see the databases loop above). The difference is that this one was
-      // re-checked: Coolify 4.1.2 genuinely exposes no flat `domains` on a
-      // service, on any route. If that is ever disproved the same way, this
-      // belongs in `fields` too.
-      fields: { type: svc.type },
+      // Canonicalized (see canonicalizeServiceDomains) so container order in the
+      // manifest never diffs against Coolify's own ordering on read-back. The
+      // live side (attachServiceDomains in cli.ts) canonicalizes identically.
+      //
+      // This block USED to warn that a service's domains were unhonorable and
+      // drop them, citing a re-checked "no flat `domains` on a 4.1.2 service, on
+      // any route". That was true of the FLAT shape and false of the capability:
+      // the per-container `urls` route was there at 4.1.2 all along — the same
+      // arc as `backup` (#51), which was dropped on the same "can't read it back"
+      // reasoning that also turned out false.
+      fields: {
+        type: svc.type,
+        ...(svc.service_domains
+          ? { service_domains: canonicalizeServiceDomains(svc.service_domains) }
+          : {}),
+      },
       env: resolveEnvFile(name, svc.env_template),
     });
   }

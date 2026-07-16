@@ -330,6 +330,17 @@ export class CoolifyClient {
     return this.get(`/databases/${encodeURIComponent(uuid)}/backups`);
   }
 
+  // A service's per-container hostnames live on `service.applications[].fqdn`,
+  // and only GET /services/{uuid} loads that relation ($service->load(['appli-
+  // cations','databases']), v4.1.2) — the environment-list GET that fetchLive
+  // reads does NOT. So reading a service's domains back to diff them (cast#72)
+  // costs this one extra GET per service. Returns the raw body; attachService-
+  // Domains projects `applications[].fqdn` into the manifest's service_domains
+  // shape and fails closed on any unrecognized answer.
+  async serviceByUuid(uuid: string): Promise<unknown> {
+    return this.get(`/services/${encodeURIComponent(uuid)}`);
+  }
+
   // What a Coolify DELETE removes, made explicit rather than inherited.
   //
   // All four are query parameters on DELETE /applications|databases|services/{uuid},

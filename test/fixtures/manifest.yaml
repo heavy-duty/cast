@@ -19,7 +19,8 @@ environments:
     services:
       metabase:
         type: metabase
-        domains: ["https://metabase.example.com"]
+        service_domains:
+          metabase: ["https://metabase.example.com"]
   staging:
     applications:
       core-api:

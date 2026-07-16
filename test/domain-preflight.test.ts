@@ -82,9 +82,10 @@ describe("reading the domains of a plan and of an instance", () => {
     ]);
   });
 
-  // Databases have none, and cast's service creates drop `domains` on the wire
-  // (serviceApiFields) — an application create is the only way an apply claims one.
-  it("claims nothing for a database or service create, or for an update", () => {
+  // Databases have no domains, and an update never claims (apply diffs the field
+  // and PATCHes it, it does not create). A SERVICE create does now claim — see
+  // the next test.
+  it("claims nothing for a database create or an update", () => {
     const db: Change = {
       kind: "database",
       name: "postgres",
@@ -99,6 +100,29 @@ describe("reading the domains of a plan and of an instance", () => {
     };
     expect(desiredDomainsOfCreate(db)).toEqual([]);
     expect(desiredDomainsOfCreate(update)).toEqual([]);
+  });
+
+  // cast#72: a service create sends `urls`, so its per-container service_domains
+  // must be pre-flighted — the more so because a service create whose domain
+  // conflicts is DELETED server-side before the 409 (applyServiceUrls rollback).
+  it("claims a service create's per-container service_domains", () => {
+    const svc: Change = {
+      kind: "service",
+      name: "umami",
+      op: "create",
+      fieldDiffs: [
+        { field: "type", desired: "umami", updatable: false },
+        {
+          field: "service_domains",
+          desired: { umami: ["https://analytics.example.com"] },
+          updatable: true,
+        },
+      ],
+      envDiffs: [],
+    };
+    expect(desiredDomainsOfCreate(svc)).toEqual([
+      { domain: "https://analytics.example.com", service: "umami" },
+    ]);
   });
 
   it("reads both live shapes: fqdn, and per-service compose domains", () => {

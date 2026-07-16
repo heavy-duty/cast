@@ -56,13 +56,33 @@ describe("databaseApiFields", () => {
 });
 
 describe("serviceApiFields", () => {
-  it("drops domains (services have no flat-domains create/update field)", () => {
+  // cast#72: a service's per-container hostnames go on the wire as `urls`
+  // ({name, url}[], url comma-joined) — matched to a ServiceApplication by name
+  // on create/PATCH. `service_domains` is the internal map that becomes it.
+  it("builds `urls` from service_domains", () => {
     const out = serviceApiFields({
       type: "plausible",
-      domains: ["https://stats.example.com"],
+      service_domains: {
+        web: ["https://stats.example.com", "https://alt.example.com"],
+        collector: ["https://collect.example.com"],
+      },
     });
+    expect(out).toEqual({
+      type: "plausible",
+      urls: [
+        {
+          name: "web",
+          url: "https://stats.example.com,https://alt.example.com",
+        },
+        { name: "collector", url: "https://collect.example.com" },
+      ],
+    });
+    expect(out).not.toHaveProperty("service_domains");
+  });
+  it("sends no `urls` for a service with no service_domains", () => {
+    const out = serviceApiFields({ type: "plausible" });
     expect(out).toEqual({ type: "plausible" });
-    expect(out).not.toHaveProperty("domains");
+    expect(out).not.toHaveProperty("urls");
   });
 });
 

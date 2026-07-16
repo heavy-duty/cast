@@ -603,17 +603,21 @@ function serviceSpec(
   hasEnv: boolean,
   uncaptured: UncapturedItem[],
 ): Spec {
-  // Coolify 4.1.2's Service model carries no flat `domains` — hostnames live
-  // per-container on `service.applications[].fqdn`, which no endpoint cast uses
-  // returns (see projectLiveFields / serviceApiFields in cli.ts, and
-  // desiredFromManifest's warning). Not readable, not writable, not in the
-  // draft: a service that serves a hostname today would come back serving none.
+  // A service's per-container hostnames (`service.applications[].fqdn`) ARE
+  // settable and readable via the API — `urls` on create/PATCH, and
+  // GET /services/{uuid} on read — so `diff`/`apply` now carry them as
+  // `service_domains` (cast#72). What the DRAFT path cannot yet do is CAPTURE
+  // them: the inventory sweep reads the environment list, which does not
+  // eager-load `service.applications`, and does not make the supplementary
+  // per-service GET. So a service that serves a hostname today comes back with
+  // none in this draft — until it is declared by hand. Same shape as the backup
+  // schedule (#51): the API answers, the draft path has not been taught to ask.
   uncaptured.push({
     project,
     resource: r.name,
-    setting: "domains (hostnames)",
+    setting: "service_domains (hostnames)",
     detail:
-      "Coolify 4.1.2 exposes no flat `domains` on a service — hostnames live per-container on service.applications[].fqdn, which cast can neither read nor write. Whatever hostnames this service answers on are NOT in this draft. Read them off the Coolify UI and set them there after a rebuild.",
+      "a service's per-container hostnames ARE settable/readable via the API (`urls` on create/PATCH, `service.applications[].fqdn` on GET /services/{uuid}) — `diff`/`apply` carry them as `service_domains` (cast#72) — but `inventory --emit-draft` does not yet make that per-service GET, so they are NOT captured here. Read them off a `cast diff` or the Coolify UI and declare `service_domains: { <container>: [url] }` yourself.",
   });
   return {
     type: String(r.raw.service_type ?? r.raw.type ?? ""),
@@ -786,7 +790,7 @@ const NO_API_COVERAGE: Array<[string, string]> = [
   ],
   [
     "service hostnames",
-    "no flat `domains` on a service — they live per-container on `service.applications[].fqdn`, which cast can neither read nor write (Coolify 4.1.2).",
+    "settable/readable via the API (`urls` on create/PATCH, `service.applications[].fqdn` on GET /services/{uuid}) — `diff`/`apply` carry them as `service_domains` (cast#72) — but `inventory --emit-draft` does not yet make the per-service GET, so a drafted service has none until you declare them.",
   ],
   [
     "Basic Auth / custom Traefik labels",

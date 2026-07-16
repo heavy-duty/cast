@@ -333,6 +333,125 @@ describe("planDraft — the emitted shape", () => {
     expect(build).not.toHaveProperty("static");
   });
 
+  // #70: Coolify 4.1.2 never returns is_static on any read (it lives on the
+  // ApplicationSetting relation, cast#68), so on that Coolify the key is ABSENT
+  // from the raw payload and the draft cannot know whether the box is a static
+  // site. UNCAPTURED.md is the draft's honesty contract (#27): when the app
+  // even looks static, the unreadable flag must be NAMED there — otherwise a
+  // reviewer has no cue the field exists to lose, and the #63 crash (static
+  // site rebuilt as a plain app) re-enters through the draft door.
+  it("names is_static in UNCAPTURED.md when the live read cannot see it and the app looks static", () => {
+    const p = project({
+      resources: [
+        {
+          kind: "application",
+          name: "Landing",
+          uuid: "a1",
+          raw: {
+            git_repository: "https://github.com/heavy-duty/incubator",
+            git_branch: "main",
+            build_pack: "nixpacks",
+            base_directory: "/",
+            publish_directory: "/apps/landing-site/dist",
+            fqdn: "https://landing.example.com",
+            // no is_static at all — Coolify 4.1.2's read path
+          },
+          env: {},
+        },
+      ],
+    });
+    const plan = planDraft([p], ctx);
+    const item = plan.uncaptured.find((u) => u.setting === "is_static");
+    expect(item).toBeDefined();
+    expect(item?.resource).toBe("Landing");
+    // The entry tells the reviewer where the truth lives: the Coolify UI.
+    expect(item?.detail).toContain("Coolify UI");
+    expect(item?.detail).toContain("static: true");
+    // And it reaches the page a reviewer actually reads.
+    const uncap = plan.files.find((f) => f.path.endsWith("UNCAPTURED.md"));
+    expect(uncap?.content).toContain("is_static");
+    // The manifest itself stays silent — absent is not `true`, and a guessed
+    // `static: true` would be exactly the fabrication UNCAPTURED.md exists to
+    // prevent.
+    const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
+    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const path = join(dir, "manifest.yaml");
+    writeFileSync(path, manifest?.content ?? "");
+    const build =
+      loadManifest(path).environments.prod.applications.Landing.build;
+    expect(build).not.toHaveProperty("static");
+  });
+
+  // The flag is only worth a reviewer's attention when the app is PLAUSIBLY
+  // static — nixpacks/static pack serving a publish_directory (the same
+  // heuristic as #70). An app with nothing to serve statically gets no entry;
+  // flagging every application would bury the page in noise.
+  it("does not flag is_static for an app that does not look static", () => {
+    const p = project({
+      resources: [
+        {
+          kind: "application",
+          name: "Api",
+          uuid: "a1",
+          raw: {
+            git_repository: "https://github.com/heavy-duty/incubator",
+            git_branch: "main",
+            build_pack: "nixpacks",
+            base_directory: "/",
+            fqdn: "https://api.example.com",
+            // no publish_directory, no is_static
+          },
+          env: {},
+        },
+        {
+          kind: "application",
+          name: "Built",
+          uuid: "a2",
+          raw: {
+            git_repository: "https://github.com/heavy-duty/incubator",
+            git_branch: "main",
+            build_pack: "dockerfile",
+            base_directory: "/",
+            publish_directory: "/dist",
+            fqdn: "https://built.example.com",
+            // dockerfile pack — Coolify's static toggle is a buildpack concept
+          },
+          env: {},
+        },
+      ],
+    });
+    const plan = planDraft([p], ctx);
+    expect(plan.uncaptured.some((u) => u.setting === "is_static")).toBe(false);
+  });
+
+  // A future Coolify that DOES serialize is_static gets the old behavior
+  // untouched: a real boolean is expressed in the manifest, not flagged.
+  // (`static: true` emission for is_static: true is covered above; here the
+  // read said `false`, which is an answer, not an absence.)
+  it("does not flag is_static when the live read answered false", () => {
+    const p = project({
+      resources: [
+        {
+          kind: "application",
+          name: "Plain",
+          uuid: "a1",
+          raw: {
+            git_repository: "https://github.com/heavy-duty/incubator",
+            git_branch: "main",
+            build_pack: "nixpacks",
+            base_directory: "/",
+            publish_directory: "/dist",
+            fqdn: "https://plain.example.com",
+            is_static: false,
+          },
+          env: {},
+        },
+      ],
+    });
+    const plan = planDraft([p], ctx);
+    expect(plan.uncaptured.some((u) => u.setting === "is_static")).toBe(false);
+  });
+
   it("emits an env template every cast reader can parse", () => {
     const plan = planDraft([project()], ctx);
     const tpl = plan.files.find((f) => f.path.endsWith(".env.template"));

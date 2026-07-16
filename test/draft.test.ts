@@ -450,6 +450,108 @@ describe("planDraft — the emitted shape", () => {
   });
 });
 
+describe("backup schedules — read and drafted, not hand-waved (#75)", () => {
+  type Backups = DraftProject["resources"][number]["backups"];
+  const withDb = (backups: Backups): DraftProject =>
+    project({
+      resources: [
+        ...project().resources,
+        {
+          kind: "database",
+          name: "Incubator Database v2",
+          uuid: "d1",
+          raw: {
+            database_type: "standalone-postgresql",
+            image: "postgres:16-alpine",
+          },
+          env: {},
+          backups,
+        },
+      ],
+    });
+  const schedule = (over: Partial<NonNullable<Backups>[number]> = {}) => ({
+    uuid: "sched-1",
+    frequency: "0 3 * * *",
+    retention: 7,
+    enabled: true,
+    saveS3: false,
+    ...over,
+  });
+  const loadedDb = (plan: ReturnType<typeof planDraft>) => {
+    const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
+    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const path = join(dir, "manifest.yaml");
+    writeFileSync(path, manifest?.content ?? "");
+    return loadManifest(path).environments.prod.databases?.[
+      "Incubator Database v2"
+    ];
+  };
+  const backupItems = (plan: ReturnType<typeof planDraft>) =>
+    plan.uncaptured.filter((u) => u.setting.startsWith("backup"));
+
+  it("emits a real backup block for a single enabled schedule — and nothing uncaptured", () => {
+    const plan = planDraft([withDb([schedule()])], ctx);
+    expect(loadedDb(plan)?.backup).toEqual({
+      frequency: "0 3 * * *",
+      retention: 7,
+    });
+    expect(backupItems(plan)).toEqual([]);
+    // The stale pre-#51 claim is gone from every artifact.
+    expect(JSON.stringify(plan.files)).not.toContain("does not yet read");
+  });
+
+  it("reports the S3 target it cannot map when the schedule saves to S3", () => {
+    const plan = planDraft([withDb([schedule({ saveS3: true })])], ctx);
+    // The block is still drafted — frequency/retention ARE readable.
+    expect(loadedDb(plan)?.backup).toEqual({
+      frequency: "0 3 * * *",
+      retention: 7,
+    });
+    const items = backupItems(plan);
+    expect(items).toHaveLength(1);
+    expect(items[0].setting).toBe("backup S3 target");
+    expect(items[0].detail).toContain("s3_storage_id");
+  });
+
+  it("emits nothing for a clean 'no schedule' read — absence IS the answer", () => {
+    const plan = planDraft([withDb([])], ctx);
+    expect(loadedDb(plan)?.backup).toBeUndefined();
+    expect(backupItems(plan)).toEqual([]);
+  });
+
+  it("does NOT draft a disabled schedule — apply would re-enable it", () => {
+    const plan = planDraft(
+      [withDb([schedule({ enabled: false, saveS3: true })])],
+      ctx,
+    );
+    expect(loadedDb(plan)?.backup).toBeUndefined();
+    const items = backupItems(plan);
+    expect(items).toHaveLength(1);
+    expect(items[0].detail).toContain("DISABLED");
+    expect(items[0].detail).toContain('"0 3 * * *"');
+  });
+
+  it("will not pick between several schedules", () => {
+    const plan = planDraft(
+      [withDb([schedule(), schedule({ uuid: "sched-2", frequency: "daily" })])],
+      ctx,
+    );
+    expect(loadedDb(plan)?.backup).toBeUndefined();
+    const items = backupItems(plan);
+    expect(items).toHaveLength(1);
+    expect(items[0].detail).toContain("2 backup schedules");
+  });
+
+  it("reports an unreadable route rather than aborting or claiming 'no backups'", () => {
+    const plan = planDraft([withDb(undefined)], ctx);
+    expect(loadedDb(plan)?.backup).toBeUndefined();
+    const items = backupItems(plan);
+    expect(items).toHaveLength(1);
+    expect(items[0].detail).toContain("unreachable");
+    expect(items[0].resource).toBe("Incubator Database v2");
+  });
+});
+
 describe("the emit refusals — adoption is one-way", () => {
   it("refuses a target directory that is not empty", () => {
     const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));

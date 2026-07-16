@@ -31,6 +31,13 @@ export type LiveBackup = {
   frequency: string;
   retention: number;
   enabled: boolean;
+  // Whether the schedule saves to S3 (`save_s3`). Carried for the DRAFT's
+  // UNCAPTURED report (#75): the schedule itself is now capturable, but its
+  // TARGET reads back only as `s3_storage_id` — an int no endpoint maps to a
+  // storage UUID — so "saves to S3" is readable and "saves to WHICH S3" is not,
+  // and a draft has to say so. diff/apply ignore it (apply asserts save_s3 +
+  // the environment's s3_destination on every write).
+  saveS3: boolean;
 };
 
 // The result of trying to read a database's schedules. The two absences are
@@ -54,6 +61,15 @@ function readEnabled(raw: Record<string, unknown>): boolean {
   const v = raw.enabled;
   if (v === undefined || v === null) return true;
   return !(v === false || v === 0 || v === "0");
+}
+
+// `save_s3` is a tinyint with no cast, exactly like `enabled`, so accept 1/0
+// too. Unlike `enabled`, an ABSENT value reads as FALSE: the only consumer is
+// the draft's "this backup lands in S3" report, and that claim must never be
+// made off a field the row did not carry.
+function readSaveS3(raw: Record<string, unknown>): boolean {
+  const v = raw.save_s3;
+  return v === true || v === 1 || v === "1";
 }
 
 // Strict on purpose: a value cast cannot read EXACTLY is not coerced into a
@@ -114,6 +130,7 @@ export function parseBackupSchedules(raw: unknown): BackupRead {
       frequency,
       retention,
       enabled: readEnabled(row),
+      saveS3: readSaveS3(row),
     });
   }
   return schedules;

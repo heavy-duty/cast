@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { stringify } from "yaml";
 import { GENERATED_PLACEHOLDER } from "./capture.js";
+import type { BackupRead } from "./coolify.js";
 import {
   isProviderGeneratedEnvName,
   isReservedEnvName,
@@ -149,6 +150,14 @@ export type DraftResource = {
   // Live env vars. Empty for databases (their URL is what the apps reference,
   // and that name is generated, not captured).
   env: Record<string, string>;
+  // Databases only: the backup schedules read off GET /databases/{uuid}/backups
+  // — the same supplementary per-database GET diff/apply have made on every run
+  // since #51, made here by the CLI's draft loop for every DRAFTED database.
+  // BackupRead's two absences stay distinct (see coolify.ts): `[]` is a clean
+  // "no schedule" (nothing to draft, nothing to report), `undefined` is "could
+  // not read" — which the draft REPORTS in UNCAPTURED.md rather than aborting a
+  // whole-instance sweep the way diff/apply refuse a single-project plan.
+  backups?: BackupRead;
 };
 
 export type DraftProject = {
@@ -557,17 +566,80 @@ function databaseSpec(
       `image "${image}" — no version could be read from its tag, so none was written and \`apply\` would create this database on Coolify's default image.`,
     );
   }
-  // Coolify DOES expose a database's backup schedule — GET /databases/{uuid}/backups
-  // answers, and `diff`/`apply` read and write it (#51). What the DRAFT path cannot
-  // yet do is CAPTURE it: `inventory --emit-draft` does not read that route, so a
-  // `backup:` block is not recovered here. Until it is taught to, a rebuild from
-  // this draft still comes up with NO BACKUPS — the quietest possible loss, and the
-  // one you discover at the worst moment — unless the block is declared by hand.
-  flag(
-    "backup",
-    "backup schedules are NOT in this draft — `inventory --emit-draft` does not yet read `GET /databases/{uuid}/backups` (which `diff` and `apply` do, #51). If this database is backed up, a rebuild from here would not be until you declare it. Read the schedule from a `cast diff` or the Coolify UI (Backups tab) and set `backup: { frequency, retention }` yourself.",
-  );
-  return { type, ...(version ? { version } : {}) };
+  // The backup schedule IS captured (#75): the CLI's draft loop reads
+  // GET /databases/{uuid}/backups — the route diff/apply have read on every run
+  // since #51 — and the one shape the manifest can express (a single, enabled
+  // schedule) becomes a real `backup:` block. Everything the route genuinely
+  // cannot answer stays a per-resource UNCAPTURED entry: reported, never
+  // guessed, and never silently dropped.
+  const backup = draftBackup(r, flag);
+  return {
+    type,
+    ...(version ? { version } : {}),
+    ...(backup ? { backup } : {}),
+  };
+}
+
+// The drafted `backup:` block, or the reason there isn't one. The same four
+// answers attachBackup (cli.ts) reads for a diff — but where diff refuses or
+// skips a comparison, a draft REPORTS: its reader is a human adopting a box,
+// not an `apply` about to write one, and a sweep that aborted on one database
+// would trade a whole blueprint for one row.
+//
+//   unreadable   -> UNCAPTURED, no block. If this database is backed up, the
+//                   draft cannot say so — and a rebuild from it would not be.
+//   no schedule  -> nothing at all. Read cleanly, absence IS the answer, and a
+//                   manifest with no `backup:` block expresses it exactly.
+//   one enabled  -> a real block, `{ frequency, retention }` — the same
+//                   projection the desired side builds (resolve.ts), so the
+//                   drafted manifest diffs clean the moment it is applied. Plus
+//                   an UNCAPTURED entry for the S3 TARGET when the schedule
+//                   saves to S3: the route returns it only as `s3_storage_id`,
+//                   an int no endpoint maps to a storage UUID (#72), so the
+//                   block cannot carry WHICH bucket.
+//   one disabled -> UNCAPTURED, no block. The manifest cannot express a
+//                   disabled schedule (`backup:` asks for backups, and every
+//                   cast write asserts enabled: true), so emitting the block
+//                   would make the first `apply` re-enable a schedule someone
+//                   turned off on purpose.
+//   several      -> UNCAPTURED, no block. A manifest declares ONE schedule;
+//                   picking one to write down would be a coin toss dressed up
+//                   as a blueprint.
+function draftBackup(
+  r: DraftResource,
+  flag: (setting: string, detail: string) => void,
+): { frequency: string; retention: number } | undefined {
+  const read = r.backups;
+  if (read === undefined) {
+    flag(
+      "backup",
+      "`GET /databases/{uuid}/backups` was unreachable or returned a shape cast does not recognize, so the schedule is NOT in this draft. If this database is backed up, a rebuild from here would not be until you declare it — read the schedule off a `cast diff` or the Coolify UI (Backups tab) and set `backup: { frequency, retention }` yourself.",
+    );
+    return undefined;
+  }
+  if (read.length === 0) return undefined;
+  if (read.length > 1) {
+    flag(
+      "backup",
+      `Coolify holds ${read.length} backup schedules for this database and a manifest declares ONE, so none was drafted. Decide which schedule the manifest should carry and declare its \`backup: { frequency, retention }\` yourself.`,
+    );
+    return undefined;
+  }
+  const schedule = read[0];
+  if (!schedule.enabled) {
+    flag(
+      "backup",
+      `a backup schedule exists (frequency "${schedule.frequency}", retention ${schedule.retention}) but it is DISABLED — it backs nothing up, and the manifest cannot say "disabled": declaring \`backup:\` asks for backups, and the first \`apply\` would re-enable it. It is NOT in this draft; decide whether it was turned off on purpose before you declare it.`,
+    );
+    return undefined;
+  }
+  if (schedule.saveS3) {
+    flag(
+      "backup S3 target",
+      "this schedule saves to S3, and the draft cannot say WHERE: Coolify returns the target only as `s3_storage_id`, an int no endpoint maps to a storage UUID (the destination_id problem again, #21/#72). The drafted `backup:` block carries frequency and retention; `apply` points the schedule at the environment's own `s3_destination` — verify that is the bucket you meant.",
+    );
+  }
+  return { frequency: schedule.frequency, retention: schedule.retention };
 }
 
 function serviceSpec(
@@ -775,8 +847,8 @@ const NO_API_COVERAGE: Array<[string, string]> = [
     "and its neighbours on a resource's Settings tab: no API coverage in 4.1.2, and not returned by the endpoints cast reads.",
   ],
   [
-    "backup schedules",
-    "the API exposes them (`GET /databases/{uuid}/backups`, which `diff`/`apply` use — #51), but `inventory --emit-draft` does not yet read that route, so no `backup:` block is captured. A rebuild from this draft has NO backups until you declare them.",
+    "a backup schedule's S3 target",
+    "the schedule itself IS captured (`GET /databases/{uuid}/backups`, the route `diff`/`apply` have used since #51 — a single enabled schedule becomes a real `backup:` block above), but its target reads back only as `s3_storage_id`, an int no endpoint maps to a storage UUID. `apply` points every schedule it writes at the environment's own `s3_destination`; whether that is the bucket the source box used must be verified by hand.",
   ],
   [
     "database kinds cast does not model",

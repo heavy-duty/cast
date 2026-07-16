@@ -1952,7 +1952,19 @@ async function main(): Promise<number> {
         for (const r of resources) {
           // Databases hold no manifest-templated env of their own — their URL is
           // what the APPS reference, and that name is generated, not captured.
-          if (r.kind === "database") continue;
+          // What a database DOES hold is a backup schedule, on its own route
+          // (#51) — and a blueprint that omits backups is the quietest possible
+          // loss, so the draft pays the one supplementary GET per DRAFTED
+          // database that diff/apply pay per compared one. Ungated on purpose:
+          // fetchLive's `opts.backups` gate exists because the read-side sweeps
+          // never look at the answer, and the draft is the sweep that does. A
+          // failed read lands on `undefined` and becomes an UNCAPTURED entry
+          // (see draftBackup) — reported, never aborting the whole-instance
+          // sweep the way diff/apply refuse a single-project plan.
+          if (r.kind === "database") {
+            r.backups = await client.databaseBackupSchedules(r.uuid);
+            continue;
+          }
           r.env = flattenEnv(
             await fetchEnv(client, { kind: r.kind, uuid: r.uuid }),
           );

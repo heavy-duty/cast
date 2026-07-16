@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { loadBindings } from "../src/bindings.js";
 import { GENERATED_PLACEHOLDER } from "../src/capture.js";
+import { loadManifest } from "../src/manifest.js";
 import { decryptSecrets } from "../src/secrets.js";
 
 // `cast inventory --emit-draft` against a stub shaped like the box that made it
@@ -156,6 +157,22 @@ async function stubCoolify(opts: { ambiguous?: boolean } = {}): Promise<Stub> {
           { name: "barber-site", uuid: "s9", service_type: "wordpress" },
         ],
       });
+
+    // The draft's supplementary per-database GET (#75) — the same route
+    // diff/apply read (#51). One enabled schedule, saving to S3: the block is
+    // draftable, the S3 TARGET (s3_storage_id, an unmappable int) is not.
+    if (path === "/databases/d1/backups")
+      return json([
+        {
+          uuid: "sched-1",
+          enabled: true,
+          save_s3: true,
+          frequency: "0 3 * * *",
+          database_backup_retention_amount_locally: 7,
+          s3_storage_id: 2,
+          executions: [],
+        },
+      ]);
 
     const envs = path.match(/^\/[a-z]+\/([a-z0-9]+)\/envs$/);
     if (envs) return json(ENVS[envs[1]] ?? []);
@@ -358,7 +375,10 @@ describe("cast inventory --emit-draft (#27)", () => {
     expect(md).toContain("destination_id 3");
     expect(md).toContain("legacy-analytics"); // a MySQL cast cannot model
     expect(md).toContain("custom_labels"); // Basic Auth / Traefik labels
-    expect(md).toContain("backup"); // API exposes it, draft doesn't capture it yet (#51)
+    // The schedule itself is CAPTURED now (#75); what stays uncaptured is the
+    // S3 target, which reads back only as an unmappable s3_storage_id int.
+    expect(md).toContain("backup S3 target");
+    expect(md).not.toContain("does not yet read"); // the stale pre-#51 claim
     expect(md).toContain("legacy.flag"); // not a name a template can hold
 
     // And the standing sections, emitted on every run whatever was found:
@@ -370,6 +390,29 @@ describe("cast inventory --emit-draft (#27)", () => {
 
     // The run points at it rather than leaving it to be found.
     expect(r.output).toContain("UNCAPTURED.md");
+  });
+
+  it("reads the backup schedule and emits a real backup block (#75)", async () => {
+    const f = fixture((await stubCoolify()).url);
+    const r = await run([
+      "--env",
+      "prod",
+      "--state",
+      f.state,
+      "--emit-draft",
+      f.out,
+      "--recipient",
+      RECIPIENT,
+    ]);
+    expect(r.code).toBe(0);
+    // The drafted manifest carries the live schedule, in the exact shape the
+    // desired side declares — so it diffs clean the moment it is applied.
+    const manifest = loadManifest(
+      join(f.out, "incubator", ".infra", "manifest.yaml"),
+    );
+    expect(
+      manifest.environments.prod.databases?.["Incubator Database v2"]?.backup,
+    ).toEqual({ frequency: "0 3 * * *", retention: 7 });
   });
 
   it("writes the projects: registry — the list of what exists", async () => {

@@ -147,6 +147,11 @@ describe("isProviderGenerated — the one judgment that must not be wrong", () =
       "UMAMI_DATABASE_URL",
       "REDIS_URL",
       "POSTGRES_PASSWORD",
+      // The db NAME is a connection coordinate too — [POSTGRES, DB] is datastore
+      // + datastore, so the pair-rule missed it until `DB` joined the connection
+      // words. It is exactly what a one-click service mints for its bundled
+      // Postgres (#87).
+      "POSTGRES_DB",
       "DB_HOST",
       "MONGO_URI",
     ]) {

@@ -57,6 +57,128 @@ export function isReservedEnvName(key: string): boolean {
   return RESERVED_EXACT.includes(key) || RESERVED_PREFIX.test(key);
 }
 
+// --- Generated: the names Coolify MINTS ---------------------------------------
+//
+// The second family of platform-owned names, and the distinction from the
+// reserved ones above is why this is a separate export rather than more entries
+// in them:
+//
+//   RESERVED   declaring one SUPPRESSES the platform's value, so cast refuses
+//              the manifest outright (assertNoReservedEnvNames). The danger runs
+//              manifest -> box.
+//   GENERATED  Coolify MINTS these per instance — a compose app's per-container
+//              domains (SERVICE_FQDN_API), a one-click service's bundled
+//              datastore credentials (SERVICE_PASSWORD_POSTGRES). The danger runs
+//              the other way, box -> report: a LIVE one is not an orphan var cast
+//              should offer to remove, it is the platform's own. Calling it a
+//              `remove-candidate` is a category error, and sixteen such lines on
+//              a correct box is how an operator learns to stop reading the diff
+//              (#87 — the argument #78's own Impact section already made:
+//              "an operator who learns these always show change stops trusting
+//              the diff").
+//
+// TWO WIDTHS, ON PURPOSE. The asymmetry is load-bearing, and a future reader who
+// "unifies" these will silently blind the diff:
+//
+//   isCoolifyGeneratedEnvName   NARROW — a prefix rule, nothing heuristic.
+//   isProviderGeneratedEnvName  WIDE   — the prefix, OR a name carrying both a
+//                               datastore word and a connection word
+//                               (DATABASE_URL, DB_HOST, POSTGRES_PASSWORD).
+//
+// Over-matching is SAFE in a draft and UNSAFE in a diff:
+//
+//   - draft (WIDE): over-matching withholds a VALUE and lists it for disposition
+//     — noisy, recoverable, loud. Under-matching copies the source box's
+//     DATABASE_URL into a new box that comes up working against the OLD box's
+//     database, and nobody finds out until the old box is deleted. Silent and
+//     unrecoverable, so it errs wide (see draft.ts).
+//   - diff (NARROW): over-matching HIDES a live-only var. A hand-left
+//     DATABASE_URL still pointing at a box nobody declares any more is the single
+//     orphan most worth printing — and it matches the wide rule. Not theoretical:
+//     probed against prod, the wide bucket on a real application held exactly
+//     DATABASE_URL and REDIS_URL, both of them cast's OWN declared vars (#87).
+export const COOLIFY_GENERATED =
+  /^SERVICE_(FQDN|URL|USER|PASSWORD|BASE64|REALBASE64)(_|$)/;
+
+// A name that carries both a datastore word and a connection word is a
+// connection coordinate for a datastore the PROVIDER creates. Kept here rather
+// than in draft.ts so the two callers share one vocabulary and differ only in
+// the width they ask for.
+const DATASTORE_WORDS = new Set([
+  "DATABASE",
+  "DB",
+  "POSTGRES",
+  "POSTGRESQL",
+  "PG",
+  "MYSQL",
+  "MARIADB",
+  "MONGO",
+  "MONGODB",
+  "REDIS",
+  "VALKEY",
+  "KEYDB",
+  "DRAGONFLY",
+  "CLICKHOUSE",
+]);
+
+// The db NAME is a connection coordinate like any other — you cannot connect
+// without it — so `DB` sits in BOTH sets, and that is not a mistake: it is a
+// datastore word in `DB_HOST` and a connection word in `POSTGRES_DB`. Without it
+// the pair-rule missed `POSTGRES_DB` outright ([POSTGRES, DB] is datastore +
+// datastore, no connection word), which is exactly the var a one-click service
+// mints for its bundled Postgres. Found by the #87 tests, on the real umami.
+const CONNECTION_WORDS = new Set([
+  "URL",
+  "URI",
+  "DSN",
+  "HOST",
+  "HOSTNAME",
+  "PORT",
+  "PASSWORD",
+  "PASS",
+  "USER",
+  "USERNAME",
+  "DB",
+]);
+
+export function isCoolifyGeneratedEnvName(key: string): boolean {
+  return COOLIFY_GENERATED.test(key);
+}
+
+export function isProviderGeneratedEnvName(key: string): boolean {
+  if (isCoolifyGeneratedEnvName(key)) return true;
+  const words = key.split("_");
+  return (
+    words.some((w) => DATASTORE_WORDS.has(w)) &&
+    words.some((w) => CONNECTION_WORDS.has(w))
+  );
+}
+
+// The live-only names a DIFF must not offer to remove (#87), and the one place
+// the width is chosen.
+//
+// NARROW for an application: cast models an application's env completely — every
+// var it should carry is in an env template — so an undeclared datastore var
+// there is a hand-left one, and printing it is the whole point.
+//
+// WIDE for a service: a Coolify service is a VENDORED BUNDLE whose internals cast
+// does not model at all. Its manifest entry is `type` + `service_domains` + an
+// env_template; everything else on it (POSTGRES_USER, POSTGRES_DB, the one-click
+// template's own wiring) belongs to the bundle. cast cannot meaningfully call
+// those orphans — it did not put them there, it will not remove them, and it has
+// no vocabulary to declare them in.
+//
+// `kind` is spelled structurally rather than imported as ResourceKind: diff.ts
+// imports this module, so importing its type back would be a cycle.
+export function isPlatformOwnedEnvName(
+  key: string,
+  kind: "application" | "database" | "service",
+): boolean {
+  return kind === "service"
+    ? isProviderGeneratedEnvName(key)
+    : isCoolifyGeneratedEnvName(key);
+}
+
 // One sentence, wherever a reserved name has to be reported rather than refused
 // (`diff` on a live box, `inventory --emit-draft`'s UNCAPTURED.md). Whatever the
 // verb, the consequence is the same sentence — a reader who has met it once in a

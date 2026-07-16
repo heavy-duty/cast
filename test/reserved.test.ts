@@ -347,6 +347,103 @@ describe("diff — a reserved name on a live box is a finding", () => {
   });
 });
 
+// --- diff: a name Coolify MINTED is not an orphan either (#87) -----------------
+//
+// The other half of the same rule. A reserved name is not a remove-candidate
+// because it is consequential; a generated one is not a remove-candidate because
+// it is not cast's at all. The width differs by kind, and that is the part worth
+// pinning: an application that swallowed a live-only DATABASE_URL would hide the
+// single orphan most worth printing.
+
+const liveService = (env: Record<string, string>) => ({
+  kind: "service" as const,
+  name: "umami",
+  uuid: "s1",
+  fields: { type: "umami" },
+  env: liveEnv(env),
+});
+const desiredService = {
+  kind: "service" as const,
+  name: "umami",
+  fields: { type: "umami" },
+  env: { vars: {} },
+};
+
+describe("diff — Coolify's own generated vars are not orphans", () => {
+  // The exact prod box: six magic vars minted for core's per-container domains,
+  // and nothing else live-only. It held the report in `change` forever.
+  it("reads CLEAN on an application carrying only SERVICE_* magic vars", () => {
+    const r = computeDiff(
+      [desiredApp],
+      [
+        liveApp({
+          PORT: "3000",
+          SERVICE_URL_API: "https://api.example.com",
+          SERVICE_FQDN_API: "https://api.example.com",
+          SERVICE_URL_ADMIN: "https://admin.example.com",
+          SERVICE_FQDN_ADMIN: "https://admin.example.com",
+          SERVICE_URL_INTAKE: "https://apply.example.com",
+          SERVICE_FQDN_INTAKE: "https://apply.example.com",
+        }),
+      ],
+      "full",
+    );
+    expect(r.changes).toHaveLength(0);
+    expect(r.clean).toBe(true);
+  });
+
+  // The hazard the NARROW rule exists to preserve. A hand-left DATABASE_URL is a
+  // connection string still pointing at a box nobody declares any more — the
+  // exact poison draft.ts refuses to copy. The wide rule matches it; an
+  // application must NOT use the wide rule.
+  it("still reports a hand-left DATABASE_URL on an application", () => {
+    const r = computeDiff(
+      [desiredApp],
+      [liveApp({ PORT: "3000", DATABASE_URL: "postgres://old-box/app" })],
+      "full",
+    );
+    expect(r.changes[0].envDiffs).toEqual([
+      { key: "DATABASE_URL", state: "remove-candidate", secret: false },
+    ]);
+    expect(r.clean).toBe(false);
+  });
+
+  // A service is a vendored bundle cast does not model: the one-click template's
+  // own POSTGRES_* wiring is the bundle's, not an orphan. Only the WIDE rule
+  // catches these — they carry no SERVICE_ prefix.
+  it("reads CLEAN on a service carrying the one-click template's own wiring", () => {
+    const r = computeDiff(
+      [desiredService],
+      [
+        liveService({
+          SERVICE_FQDN_UMAMI_3000: "https://analytics.example.com:3000",
+          SERVICE_PASSWORD_POSTGRES: "generated",
+          SERVICE_PASSWORD_64_UMAMI: "generated",
+          POSTGRES_USER: "umami",
+          POSTGRES_PASSWORD: "generated",
+          POSTGRES_DB: "umami",
+        }),
+      ],
+      "full",
+    );
+    expect(r.changes).toHaveLength(0);
+    expect(r.clean).toBe(true);
+  });
+
+  // …but the width must not become "a service reports nothing". A name that is
+  // neither Coolify-minted nor a datastore coordinate is still somebody's doing.
+  it("still reports a non-generated live-only var on a service", () => {
+    const r = computeDiff(
+      [desiredService],
+      [liveService({ POSTGRES_DB: "umami", LEGACY_FLAG: "on" })],
+      "full",
+    );
+    expect(r.changes[0].envDiffs).toEqual([
+      { key: "LEGACY_FLAG", state: "remove-candidate", secret: false },
+    ]);
+  });
+});
+
 // --- smoke: it writes an env var too -------------------------------------------
 
 describe("smoke — the probe it writes can never be a reserved name", () => {

@@ -552,6 +552,72 @@ describe("backup schedules — read and drafted, not hand-waved (#75)", () => {
   });
 });
 
+describe("service hostnames — read and drafted via the per-service GET (#83)", () => {
+  const withService = (
+    serviceDomains?: Record<string, string[]>,
+  ): DraftProject =>
+    project({
+      resources: [
+        ...project().resources,
+        {
+          kind: "service",
+          name: "Incubator Umami",
+          uuid: "s1",
+          raw: { service_type: "umami" },
+          env: {},
+          serviceDomains,
+        },
+      ],
+    });
+  const loadedSvc = (plan: ReturnType<typeof planDraft>) => {
+    const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
+    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const path = join(dir, "manifest.yaml");
+    writeFileSync(path, manifest?.content ?? "");
+    return loadManifest(path).environments.prod.services?.["Incubator Umami"];
+  };
+  const hostnameItems = (plan: ReturnType<typeof planDraft>) =>
+    plan.uncaptured.filter((u) => u.setting === "service_domains (hostnames)");
+
+  it("emits service_domains as the diff's own projection reads them — and nothing uncaptured", () => {
+    const plan = planDraft(
+      [
+        withService({
+          umami: ["https://umami.example.com"],
+          web: ["https://a.example.com", "https://b.example.com"],
+        }),
+      ],
+      ctx,
+    );
+    expect(loadedSvc(plan)?.service_domains).toEqual({
+      umami: ["https://umami.example.com"],
+      web: ["https://a.example.com", "https://b.example.com"],
+    });
+    expect(hostnameItems(plan)).toEqual([]);
+    // The stale "does not yet make the per-service GET" claim is gone from
+    // every artifact — UNCAPTURED's standing table included.
+    expect(JSON.stringify(plan.files)).not.toContain("does not yet make");
+  });
+
+  it("emits nothing for a clean 'no hostnames' read — an answer, not a failure", () => {
+    const plan = planDraft([withService({})], ctx);
+    expect(loadedSvc(plan)).not.toHaveProperty("service_domains");
+    expect(hostnameItems(plan)).toEqual([]);
+  });
+
+  it("reports an unreadable per-service GET rather than drafting a blank", () => {
+    const plan = planDraft([withService(undefined)], ctx);
+    expect(loadedSvc(plan)).not.toHaveProperty("service_domains");
+    const items = hostnameItems(plan);
+    expect(items).toHaveLength(1);
+    expect(items[0].resource).toBe("Incubator Umami");
+    expect(items[0].detail).toContain("unreachable");
+    // The rest of the draft survives: a whole-instance sweep reports one
+    // unreadable service, it does not abort on it.
+    expect(loadedSvc(plan)?.type).toBe("umami");
+  });
+});
+
 describe("the emit refusals — adoption is one-way", () => {
   it("refuses a target directory that is not empty", () => {
     const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));

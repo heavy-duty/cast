@@ -43,8 +43,8 @@ import { encryptSecrets } from "./secrets.js";
 //    wrong in four entries out of seventeen is worse than one that is obviously
 //    incomplete.
 //
-// 2. SILENT LOSSES. cast cannot express everything a Coolify holds — service
-//    hostnames, destinations (#21), Basic Auth, build toggles, whole database
+// 2. SILENT LOSSES. cast cannot express everything a Coolify holds —
+//    destinations (#21), Basic Auth, build toggles, whole database
 //    kinds. A blueprint that omits them WITHOUT SAYING SO is worse than no
 //    blueprint, because in a disaster you would trust it and rebuild a
 //    *different box*. Hence UNCAPTURED.md, which is emitted on every run, even
@@ -158,6 +158,16 @@ export type DraftResource = {
   // not read" — which the draft REPORTS in UNCAPTURED.md rather than aborting a
   // whole-instance sweep the way diff/apply refuse a single-project plan.
   backups?: BackupRead;
+  // Services only: the per-container hostnames read off GET /services/{uuid} —
+  // the same supplementary per-service GET diff/apply have made since #72/#81,
+  // made here by the CLI's draft loop for every DRAFTED service and projected
+  // through the SAME projection (projectServiceDomains in cli.ts), so a drafted
+  // manifest and a diff read-back agree on the shape to the byte. `{}` is an
+  // ANSWER (this service serves no hostnames — nothing to draft, nothing to
+  // report); `undefined` means the GET was unreadable, which the draft REPORTS
+  // in UNCAPTURED.md rather than aborting the sweep the way
+  // attachServiceDomains fails a one-project diff closed.
+  serviceDomains?: Record<string, string[]>;
 };
 
 export type DraftProject = {
@@ -649,24 +659,35 @@ function serviceSpec(
   hasEnv: boolean,
   uncaptured: UncapturedItem[],
 ): Spec {
-  // A service's per-container hostnames (`service.applications[].fqdn`) ARE
-  // settable and readable via the API — `urls` on create/PATCH, and
-  // GET /services/{uuid} on read — so `diff`/`apply` now carry them as
-  // `service_domains` (cast#72). What the DRAFT path cannot yet do is CAPTURE
-  // them: the inventory sweep reads the environment list, which does not
-  // eager-load `service.applications`, and does not make the supplementary
-  // per-service GET. So a service that serves a hostname today comes back with
-  // none in this draft — until it is declared by hand. Same shape as the backup
-  // schedule (#51): the API answers, the draft path has not been taught to ask.
-  uncaptured.push({
-    project,
-    resource: r.name,
-    setting: "service_domains (hostnames)",
-    detail:
-      "a service's per-container hostnames ARE settable/readable via the API (`urls` on create/PATCH, `service.applications[].fqdn` on GET /services/{uuid}) — `diff`/`apply` carry them as `service_domains` (cast#72) — but `inventory --emit-draft` does not yet make that per-service GET, so they are NOT captured here. Read them off a `cast diff` or the Coolify UI and declare `service_domains: { <container>: [url] }` yourself.",
-  });
+  // A service's per-container hostnames ARE captured (#83): the CLI's draft
+  // loop makes the per-service GET diff/apply have made since #72/#81, and
+  // hands the map in already projected through THE projection the diff's
+  // read-back uses (projectServiceDomains + canonicalizeServiceDomains in
+  // cli.ts) — so what is drafted here diffs clean the moment it is applied.
+  //
+  // Only the read that FAILED stays a report. attachServiceDomains fails a
+  // one-project diff closed on the same answer, because its output feeds an
+  // apply; a draft's reader is a human adopting a box, and trading a
+  // whole-instance blueprint for one unreadable service would be the worse
+  // artifact — so the loss is named, per resource, and the sweep keeps going.
+  const domains = r.serviceDomains;
+  if (domains === undefined) {
+    uncaptured.push({
+      project,
+      resource: r.name,
+      setting: "service_domains (hostnames)",
+      detail:
+        "`GET /services/{uuid}` was unreachable or returned no applications array, so this service's per-container hostnames are NOT in this draft — if it serves one today, a rebuild from here would serve nothing until you declare it. Read them off a `cast diff` or the Coolify UI and set `service_domains: { <container>: [url] }` yourself.",
+    });
+  }
   return {
     type: String(r.raw.service_type ?? r.raw.type ?? ""),
+    // `{}` (read cleanly, no hostnames) emits NOTHING, exactly as the live side
+    // leaves `service_domains` absent for a domainless service — a manifest
+    // declaring none stays clean, and one declaring some drifts.
+    ...(domains && Object.keys(domains).length > 0
+      ? { service_domains: domains }
+      : {}),
     ...(hasEnv
       ? { env_template: `env/${slug(r.name)}.${ctx.env}.env.template` }
       : {}),
@@ -833,10 +854,6 @@ const NO_API_COVERAGE: Array<[string, string]> = [
   [
     "destinations",
     "Coolify 4.1.2 serves no destinations endpoint. A resource's `destination_id` comes back; the UUID that names it never does. Placement must be read from the UI (#21).",
-  ],
-  [
-    "service hostnames",
-    "settable/readable via the API (`urls` on create/PATCH, `service.applications[].fqdn` on GET /services/{uuid}) — `diff`/`apply` carry them as `service_domains` (cast#72) — but `inventory --emit-draft` does not yet make the per-service GET, so a drafted service has none until you declare them.",
   ],
   [
     "Basic Auth / custom Traefik labels",

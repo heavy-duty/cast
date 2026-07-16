@@ -1056,11 +1056,14 @@ express everything a Coolify holds, and a blueprint that omits those things
 without saying so is worse than no blueprint — in a disaster you would trust it
 and rebuild a *different box*. Per resource, it names what was seen and could not
 be written: `destination_id` (which Docker network — no destinations API in 4.1.2
-to resolve it to the UUID `destination_uuid:` wants, #21), service hostnames
-(settable/readable via the API and carried by `diff`/`apply` as `service_domains`
-since #72, but `inventory --emit-draft` does not yet
-make the per-service `GET /services/{uuid}`, so a drafted service has none until
-you declare them), Basic Auth / custom Traefik labels,
+to resolve it to the UUID `destination_uuid:` wants, #21), a service whose
+hostnames could not be read (they **are captured** since #83 — the draft makes
+the per-service `GET /services/{uuid}` that `diff`/`apply` have made since
+#72/#81 and emits `service_domains` from `applications[].fqdn`, through the same
+projection the diff's read-back uses, so a drafted service diffs clean once
+applied; a service whose GET is unreachable or unrecognized is reported per
+resource instead — where a one-project diff fails closed, a whole-instance sweep
+reports and keeps going), Basic Auth / custom Traefik labels,
 build and deploy command overrides, what a backup schedule cannot fully say
 (the schedule itself **is captured** since #75 — the draft reads
 `GET /databases/{uuid}/backups`, the route `diff`/`apply` have used since #51,

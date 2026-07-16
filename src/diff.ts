@@ -1,18 +1,34 @@
 import { GENERATED_PLACEHOLDER } from "./capture.js";
 import type { ResolvedEnv } from "./envtemplate.js";
-import { isReservedEnvName, reservedConsequence } from "./reserved.js";
+import {
+  isPlatformOwnedEnvName,
+  isReservedEnvName,
+  reservedConsequence,
+} from "./reserved.js";
 
 export type ResourceKind = "application" | "database" | "service";
 // One live env var as Coolify returns it, before the per-secret flattening that
-// used to happen the moment it was read. `value` is what a plain token sees:
-// fresh after every write, but MASKED for a secret. `realValue` is the decrypted
-// plaintext (a `read:sensitive` token); it is the only readable form of a secret,
-// but for a NON-secret var it is a stored column Coolify does NOT recompute on an
-// in-place PATCH — so it goes stale and reads back the pre-update value (#78).
+// used to happen the moment it was read.
+//
+// `value` is the raw stored value — `trim(decrypt(...))` — and is MASKED for a
+// secret to a token without read:sensitive. `realValue` is an APPENDED ACCESSOR:
+// recomputed from `value` on every read and then shell-escaped — single-quoted
+// when the var is `is_literal`/`is_multiline`, otherwise run through
+// escapeEnvVariables (EnvironmentVariable.php:81,171-207 @ v4.1.2). For a secret
+// it is the only readable plaintext; for a NON-secret it is a RENDERING of the
+// value, not the value — so comparing a manifest literal against it is wrong on
+// its face (`'true'` is not `true`).
 //
 // Carrying both to diffEnv (rather than collapsing to `realValue ?? value` at
-// fetch time) is what lets the comparison pick the fresh side per var: `value`
+// fetch time) is what lets the comparison pick the right side per var: `value`
 // for non-secrets, `realValue ?? value` for secrets. See fetchEnv, diffEnv.
+//
+// #79 landed this split citing a "stale `real_value`, a stored column Coolify
+// does not refresh on an in-place PATCH". That was false — an accessor cannot go
+// stale, and `real_value` tracks `value` on every row of a real box. The drift it
+// was chasing came from a duplicate PREVIEW row shadowing the production one
+// (#85, fixed in #86). The split is still correct, for the escaping reason above;
+// only its stated motivation was wrong.
 export type LiveEnvVar = { value: string; realValue?: string };
 export type Desired = {
   kind: ResourceKind;
@@ -174,6 +190,10 @@ function liveValueFor(secret: boolean, live: LiveEnvVar): string {
 function diffEnv(
   desired: ResolvedEnv,
   live: Record<string, LiveEnvVar>,
+  // Only the live-only pass reads it, and only to choose how wide "the platform
+  // owns this name" runs — narrow for an application cast models completely,
+  // wide for a service, which is a vendored bundle it does not (#87).
+  kind: ResourceKind,
 ): EnvDiff[] {
   const diffs: EnvDiff[] = [];
   for (const [key, v] of Object.entries(desired.vars)) {
@@ -221,13 +241,25 @@ function diffEnv(
     }
   }
   for (const key of Object.keys(live)) {
+    if (key in desired.vars) continue;
     // A reserved name is deliberately NOT a remove-candidate: it is collected
     // separately, as a finding (see ReservedVar). Leaving it here as well would
     // report the same var twice under two headings, one of which says it is
     // harmless. It also cannot be an `add`/`change`: the manifest side can never
     // declare one — resolve.ts refuses the run first.
-    if (!(key in desired.vars) && !isReservedEnvName(key))
-      diffs.push({ key, state: "remove-candidate", secret: false });
+    if (isReservedEnvName(key)) continue;
+    // Nor is a name Coolify MINTED (#87). `remove-candidate` means "a live-only
+    // var the manifest does not declare; apply never removes it; read it by eye"
+    // — and for SERVICE_FQDN_API or a one-click service's POSTGRES_PASSWORD that
+    // is a category error twice over: cast did not put it there, and there is no
+    // vocabulary it could ever be declared in, so it is not a candidate for
+    // anything. Sixteen such lines on a correct box held prod permanently in
+    // `change` and left no way to see that it was in fact clean — the state in
+    // which a real orphan arrives unread. See isPlatformOwnedEnvName for why the
+    // width differs by kind, and why widening it for applications would hide the
+    // one orphan most worth printing.
+    if (isPlatformOwnedEnvName(key, kind)) continue;
+    diffs.push({ key, state: "remove-candidate", secret: false });
   }
   return diffs;
 }
@@ -348,7 +380,7 @@ export function computeDiff(
         updatable: !NON_UPDATABLE[d.kind].includes(field),
       }));
     const envDiffs =
-      mode === "full" && d.env ? diffEnv(d.env, l.env ?? {}) : [];
+      mode === "full" && d.env ? diffEnv(d.env, l.env ?? {}, d.kind) : [];
     if (fieldDiffs.length > 0 || envDiffs.length > 0) {
       changes.push({
         kind: d.kind,

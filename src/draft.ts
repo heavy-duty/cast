@@ -2,7 +2,11 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { stringify } from "yaml";
 import { GENERATED_PLACEHOLDER } from "./capture.js";
-import { isReservedEnvName, reservedConsequence } from "./reserved.js";
+import {
+  isProviderGeneratedEnvName,
+  isReservedEnvName,
+  reservedConsequence,
+} from "./reserved.js";
 import { encryptSecrets } from "./secrets.js";
 
 // `inventory` can already SEE a whole instance (#22). This is it writing down
@@ -78,47 +82,14 @@ import { encryptSecrets } from "./secrets.js";
 // A name-pattern rule is not a promise, and the docs say so: a var that points
 // at the source box under a name cast does not recognize WILL be copied. That is
 // what the disposition table printed at the end of a run is for — read it.
-const COOLIFY_MAGIC =
-  /^SERVICE_(FQDN|URL|USER|PASSWORD|BASE64|REALBASE64)(_|$)/;
-
-const DATASTORE_WORDS = new Set([
-  "DATABASE",
-  "DB",
-  "POSTGRES",
-  "POSTGRESQL",
-  "PG",
-  "MYSQL",
-  "MARIADB",
-  "MONGO",
-  "MONGODB",
-  "REDIS",
-  "VALKEY",
-  "KEYDB",
-  "DRAGONFLY",
-  "CLICKHOUSE",
-]);
-
-const CONNECTION_WORDS = new Set([
-  "URL",
-  "URI",
-  "DSN",
-  "HOST",
-  "HOSTNAME",
-  "PORT",
-  "PASSWORD",
-  "PASS",
-  "USER",
-  "USERNAME",
-]);
-
-export function isProviderGenerated(key: string): boolean {
-  if (COOLIFY_MAGIC.test(key)) return true;
-  const words = key.split("_");
-  return (
-    words.some((w) => DATASTORE_WORDS.has(w)) &&
-    words.some((w) => CONNECTION_WORDS.has(w))
-  );
-}
+//
+// The rule itself lives in reserved.ts (#87) — one home for the names the
+// PLATFORM owns, shared with the diff, which asks the same vocabulary for a
+// NARROWER width. The width is the whole difference between the two callers and
+// reserved.ts explains why: here, over-matching withholds a value for review
+// (loud, recoverable); in a diff it would hide a live-only var (silent). This is
+// the wide one, deliberately.
+export { isProviderGeneratedEnvName as isProviderGenerated };
 
 // --- Names -------------------------------------------------------------------
 
@@ -689,7 +660,7 @@ function planSecrets(
   for (const [key, sites] of byKey) {
     const provenance: Provenance = isReservedEnvName(key)
       ? "suppressed"
-      : isProviderGenerated(key)
+      : isProviderGeneratedEnvName(key)
         ? "generated"
         : "captured";
     if (provenance === "suppressed") {

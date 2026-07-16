@@ -9,12 +9,30 @@ import { join } from "node:path";
 // holding the fd — this one. A freshly spawned age has no such fd and fails
 // with ENOENT. Not `-i /dev/stdin` either: node closes the pipe before age
 // re-opens it by path (ENXIO); `-` makes age read the inherited fd directly.
+//
+// And it is read exactly ONCE per process: a process substitution is a
+// read-once pipe, but `diff --all` / `apply --all` call decryptSecrets once
+// per project. The first read drains the pipe; a re-read would hand age an
+// empty identity and the second project's decrypt would fail. Caching by key
+// path changes nothing about exposure — the key already transits this
+// process's memory on every call.
+const identities = new Map<string, Buffer>();
+
+function readIdentity(keyFile: string): Buffer {
+  let identity = identities.get(keyFile);
+  if (identity === undefined) {
+    identity = readFileSync(keyFile);
+    identities.set(keyFile, identity);
+  }
+  return identity;
+}
+
 export function decryptSecrets(
   file: string,
   keyFile: string,
 ): Record<string, string> {
   const out = execFileSync("age", ["-d", "-i", "-", file], {
-    input: readFileSync(keyFile),
+    input: readIdentity(keyFile),
     encoding: "utf8",
   });
   const secrets: Record<string, string> = {};

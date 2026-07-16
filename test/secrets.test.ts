@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   closeSync,
   mkdirSync,
@@ -59,6 +59,38 @@ describe("secretsFileFor", () => {
     expect(secretsFileFor("/srv/state", "widget", "prod")).toBe(
       "/srv/state/secrets/widget.prod.env.age",
     );
+  });
+});
+
+// Pins the read-once shape of `<(pm read …)` that the fd-path test above
+// cannot: a regular file behind /proc/self/fd re-opens at offset 0 on every
+// read, but a pipe drains. `diff --all` / `apply --all` decrypt once per
+// project, so the identity must be read once per process and reused.
+describe("decryptSecrets identity caching", () => {
+  it("a read-once pipe key survives two decrypts — the --all loop shape", () => {
+    const { keyFile, enc } = ageFixture();
+    const dir = mkdtempSync(join(tmpdir(), "infra-fifo-"));
+    const fifo = join(dir, "key.fifo");
+    execFileSync("mkfifo", [fifo]);
+    // One writer, one serving of the key: exactly what a process substitution
+    // delivers. It pairs with the first decrypt's open and exits.
+    const once = spawn("sh", ["-c", `cat "${keyFile}" > "${fifo}"`], {
+      stdio: "ignore",
+    });
+    const expected = { MAILGUN_KEY: "mk-123", OPENROUTER_KEY: "or-456" };
+    expect(decryptSecrets(enc, fifo)).toEqual(expected);
+    // The pipe is now drained. A second writer serves nothing, so if the
+    // per-process cache ever regresses, the re-read hands age an empty
+    // identity and fails loudly instead of blocking the suite on a
+    // writerless FIFO open. With the cache, nobody opens the FIFO again and
+    // the writer is still blocked in open() when we kill it.
+    const drained = spawn("sh", ["-c", `: > "${fifo}"`], { stdio: "ignore" });
+    try {
+      expect(decryptSecrets(enc, fifo)).toEqual(expected);
+    } finally {
+      once.kill("SIGKILL");
+      drained.kill("SIGKILL");
+    }
   });
 });
 

@@ -8,6 +8,13 @@ import {
 import { GENERATED_PLACEHOLDER } from "../src/capture.js";
 import { type Desired, type Live, computeDiff } from "../src/diff.js";
 
+// Wrap plain live values as Coolify's {value, realValue} pairs (here the two
+// agree); computeDiff reads them per LiveEnvVar. See diffEnv / #78.
+const liveEnv = (
+  m: Record<string, string>,
+): Record<string, { value: string }> =>
+  Object.fromEntries(Object.entries(m).map(([k, v]) => [k, { value: v }]));
+
 const desired: Desired[] = [
   {
     kind: "application",
@@ -63,7 +70,7 @@ describe("applyPlan", () => {
         name: "core-api",
         uuid: "u1",
         fields: { build_pack: "static", domains: ["https://api.example.com"] },
-        env: { PORT: "3000" },
+        env: liveEnv({ PORT: "3000" }),
       },
     ];
     await expect(
@@ -98,7 +105,7 @@ describe("applyPlan", () => {
         name: "core-api",
         uuid: "u1",
         fields: { build_pack: "nixpacks" },
-        env,
+        env: liveEnv(env),
       },
     ];
 
@@ -201,7 +208,7 @@ describe("applyPlan", () => {
           name: "web",
           uuid: "u0",
           fields: { build_pack: "static" },
-          env: { PORT: "3000" },
+          env: liveEnv({ PORT: "3000" }),
         },
         ...liveApp({ DATABASE_URL: REAL_URL, REDIS_URL: REAL_REDIS }),
       ];
@@ -291,7 +298,7 @@ describe("applyPlan", () => {
           build_pack: "nixpacks",
           domains: ["https://api.example.com"],
         },
-        env: { PORT: "3000" },
+        env: liveEnv({ PORT: "3000" }),
       },
     ];
     const r = await applyPlan(
@@ -313,7 +320,7 @@ describe("applyPlan", () => {
           build_pack: "nixpacks",
           domains: ["https://api.example.com"],
         },
-        env: { PORT: "3000", LEGACY_VAR: "keep-me" },
+        env: liveEnv({ PORT: "3000", LEGACY_VAR: "keep-me" }),
       },
     ];
     const report = computeDiff(desired, live, "full");
@@ -429,7 +436,7 @@ describe("applyPlan ordering (#45)", () => {
         name: "core",
         uuid: "u-core",
         fields: { build_pack: "nixpacks" }, // NON_UPDATABLE drift
-        env: { DATABASE_URL: "postgres://x" },
+        env: liveEnv({ DATABASE_URL: "postgres://x" }),
       },
     ];
     await expect(

@@ -51,6 +51,7 @@ import {
 import {
   type Change,
   type Live,
+  type LiveEnvVar,
   type ResourceKind,
   computeDiff,
   renderDiff,
@@ -822,8 +823,11 @@ export function aliasLive<T extends { name: string }>(
   });
 }
 
-// A live resource's env vars, by key. `real_value` is the decrypted one and
-// needs a token with read:sensitive; `value` is what a lesser token sees.
+// A live resource's env vars, by key, each carrying both forms Coolify returns:
+// `value` (fresh after every write, but masked for a secret to a plain token)
+// and `realValue` (the decrypted plaintext, needs a token with read:sensitive).
+// The diff picks between them per var (see LiveEnvVar, diffEnv); callers that
+// only need one flattened string use flattenEnv below.
 //
 // A 404 (a resource we just listed no longer having an envs endpoint — not
 // expected in practice, but consistent with treating "gone" as "no env vars")
@@ -834,13 +838,25 @@ export function aliasLive<T extends { name: string }>(
 async function fetchEnv(
   client: CoolifyClient,
   l: Pick<Live, "kind" | "uuid">,
-): Promise<Record<string, string>> {
+): Promise<Record<string, LiveEnvVar>> {
   const base = l.kind === "database" ? "databases" : `${l.kind}s`;
   const envs = (await client.get(`/${base}/${l.uuid}/envs`).catch((err) => {
     if (err instanceof HttpError && err.status === 404) return [];
     throw err;
   })) as Array<{ key: string; real_value?: string; value: string }>;
-  return Object.fromEntries(envs.map((e) => [e.key, e.real_value ?? e.value]));
+  return Object.fromEntries(
+    envs.map((e) => [e.key, { value: e.value, realValue: e.real_value }]),
+  );
+}
+
+// Collapse a live env map to one string per key, preferring the decrypted
+// `realValue` — what capture writes into a store and what draft scaffolds from,
+// where the plaintext of a secret is the point and the diff's stale-`realValue`
+// hazard (#78) does not apply (nothing is compared against a manifest literal).
+function flattenEnv(env: Record<string, LiveEnvVar>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).map(([k, e]) => [k, e.realValue ?? e.value]),
+  );
 }
 
 // The databases inside ONE project+environment, each carrying the value it
@@ -1643,7 +1659,7 @@ async function main(): Promise<number> {
     }
     const liveEnvs: LiveEnvs = {};
     for (const l of envBearing) {
-      liveEnvs[l.name] = await fetchEnv(client, l);
+      liveEnvs[l.name] = flattenEnv(await fetchEnv(client, l));
     }
     const classification = classify(
       required,
@@ -1857,7 +1873,9 @@ async function main(): Promise<number> {
           // Databases hold no manifest-templated env of their own — their URL is
           // what the APPS reference, and that name is generated, not captured.
           if (r.kind === "database") continue;
-          r.env = await fetchEnv(client, { kind: r.kind, uuid: r.uuid });
+          r.env = flattenEnv(
+            await fetchEnv(client, { kind: r.kind, uuid: r.uuid }),
+          );
         }
         draftProjects.push({
           name: p.name,

@@ -2,6 +2,15 @@ import { describe, expect, it } from "vitest";
 import { GENERATED_PLACEHOLDER } from "../src/capture.js";
 import { computeDiff, placeholderConflicts, renderDiff } from "../src/diff.js";
 
+// Wrap plain live values as Coolify's {value, realValue} pairs. Here the two
+// agree — the ordinary case, where nothing was updated in place — so only
+// `value` is set; diffEnv reads it per LiveEnvVar. The stale-`realValue` case
+// (#78) is exercised with explicit pairs in its own test below.
+const liveEnv = (
+  m: Record<string, string>,
+): Record<string, { value: string }> =>
+  Object.fromEntries(Object.entries(m).map(([k, v]) => [k, { value: v }]));
+
 const desiredApp = {
   kind: "application" as const,
   name: "core-api",
@@ -30,7 +39,7 @@ describe("computeDiff", () => {
           name: "core-api",
           uuid: "u1",
           fields: { ...desiredApp.fields },
-          env: { PORT: "3000", MAILGUN_KEY: "mk-123" },
+          env: liveEnv({ PORT: "3000", MAILGUN_KEY: "mk-123" }),
         },
       ],
       "full",
@@ -46,7 +55,7 @@ describe("computeDiff", () => {
           name: "core-api",
           uuid: "u1",
           fields: { build_pack: "static", domains: desiredApp.fields.domains },
-          env: { PORT: "3000", MAILGUN_KEY: "mk-123" },
+          env: liveEnv({ PORT: "3000", MAILGUN_KEY: "mk-123" }),
         },
       ],
       "full",
@@ -67,7 +76,7 @@ describe("computeDiff", () => {
         name: "core-api",
         uuid: "u1",
         fields: { ...desiredApp.fields },
-        env: { PORT: "3000", MAILGUN_KEY: "OLD", EXTRA: "x" },
+        env: liveEnv({ PORT: "3000", MAILGUN_KEY: "OLD", EXTRA: "x" }),
       },
     ];
     const full = computeDiff([desiredApp], live, "full");
@@ -88,6 +97,81 @@ describe("computeDiff", () => {
       { kind: "service", name: "old-thing", uuid: "u9" },
     ]);
     expect(r.clean).toBe(false);
+  });
+  // #78. Coolify leaves a non-secret var's `realValue` at the pre-update value
+  // after an in-place PATCH, while `value` is fresh. A flip that landed and
+  // redeployed must read clean, not re-propose forever — compare non-secrets
+  // against `value`.
+  it("does not re-propose a non-secret var flipped in place (stale realValue)", () => {
+    const r = computeDiff(
+      [desiredApp],
+      [
+        {
+          kind: "application",
+          name: "core-api",
+          uuid: "u1",
+          fields: { ...desiredApp.fields },
+          env: {
+            PORT: { value: "3000", realValue: "3000" },
+            // Manifest wants MAILGUN_KEY = mk-123 (a secret); realValue carries
+            // the plaintext and agrees, so the secret stays clean too.
+            MAILGUN_KEY: { value: "mk-123", realValue: "mk-123" },
+          },
+        },
+      ],
+      "full",
+    );
+    expect(r.changes).toHaveLength(0);
+    expect(r.clean).toBe(true);
+  });
+  // The same reproduction with the flip the incubator prod cutover hit: manifest
+  // "true", live value already "true", but realValue still the stale "false".
+  it("reads a flipped-in-place flag clean even when realValue is stale", () => {
+    const flag = {
+      kind: "application" as const,
+      name: "core-api",
+      fields: {},
+      env: { vars: { REPORTING_ENABLED: { value: "true", secret: false } } },
+    };
+    const r = computeDiff(
+      [flag],
+      [
+        {
+          kind: "application",
+          name: "core-api",
+          uuid: "u1",
+          fields: {},
+          env: { REPORTING_ENABLED: { value: "true", realValue: "false" } },
+        },
+      ],
+      "full",
+    );
+    expect(r.changes).toHaveLength(0);
+    expect(r.clean).toBe(true);
+  });
+  // The regression guard the fix must not trip: a SECRET whose `value` is masked
+  // to a plain token still compares via `realValue`, so a genuine rotation is
+  // still caught (and a masked value is never mistaken for the desired plaintext).
+  it("still diffs a secret via realValue when value is masked", () => {
+    const r = computeDiff(
+      [desiredApp],
+      [
+        {
+          kind: "application",
+          name: "core-api",
+          uuid: "u1",
+          fields: { ...desiredApp.fields },
+          env: {
+            PORT: { value: "3000" },
+            MAILGUN_KEY: { value: "**********", realValue: "mk-OLD" },
+          },
+        },
+      ],
+      "full",
+    );
+    expect(r.changes[0].envDiffs).toEqual([
+      { key: "MAILGUN_KEY", state: "change", secret: true },
+    ]);
   });
 });
 
@@ -115,7 +199,7 @@ const liveGenerated = (env: Record<string, string>) => [
     name: "core-api",
     uuid: "u1",
     fields: {},
-    env,
+    env: liveEnv(env),
   },
 ];
 
@@ -173,7 +257,7 @@ describe("computeDiff generated-secret placeholder", () => {
           name: "core-api",
           uuid: "u1",
           fields: { ...desiredApp.fields },
-          env: { PORT: "3000", MAILGUN_KEY: "mk-OLD" },
+          env: liveEnv({ PORT: "3000", MAILGUN_KEY: "mk-OLD" }),
         },
       ],
       "full",
@@ -239,7 +323,7 @@ describe("derived resource refs (#60)", () => {
       name: "core-api",
       uuid: "u1",
       fields: { ...derivedApp.fields },
-      env,
+      env: liveEnv(env),
     },
   ];
 
@@ -460,7 +544,7 @@ describe("renderDiff", () => {
         name: "core-api",
         uuid: "u1",
         fields: { ...desiredApp.fields },
-        env: { PORT: "3000", MAILGUN_KEY: "OLD-SECRET" },
+        env: liveEnv({ PORT: "3000", MAILGUN_KEY: "OLD-SECRET" }),
       },
     ];
     const out = renderDiff(computeDiff([desiredApp], live, "full"));

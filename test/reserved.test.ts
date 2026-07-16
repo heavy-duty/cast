@@ -259,12 +259,18 @@ const desiredApp = {
   fields: { build_pack: "nixpacks" },
   env: { vars: { PORT: { value: "3000", secret: false } } },
 };
+// Wrap plain live values as Coolify's {value, realValue} pairs (here the two
+// agree); computeDiff reads them per LiveEnvVar. See diffEnv / #78.
+const liveEnv = (
+  m: Record<string, string>,
+): Record<string, { value: string }> =>
+  Object.fromEntries(Object.entries(m).map(([k, v]) => [k, { value: v }]));
 const liveApp = (env: Record<string, string>) => ({
   kind: "application" as const,
   name: "core",
   uuid: "u1",
   fields: { build_pack: "nixpacks" },
-  env,
+  env: liveEnv(env),
 });
 
 describe("diff — a reserved name on a live box is a finding", () => {

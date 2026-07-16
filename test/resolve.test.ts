@@ -270,30 +270,7 @@ environments:
     // alone, like every other thing apply never removes.
     expect("backup" in desired[0].fields).toBe(false);
   });
-  it("warns when a service declares domains (unhonorable by apply on Coolify 4.1.2)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
-    mkdirSync(join(dir, ".infra"), { recursive: true });
-    writeFileSync(
-      join(dir, ".infra", "manifest.yaml"),
-      `project: widget
-environments:
-  staging:
-    applications: {}
-    services:
-      plausible:
-        type: plausible
-        domains: ["https://stats.staging.example.com"]
-`,
-    );
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { desired } = desiredFromManifest(dir, "staging", {});
-    expect(desired[0]).toMatchObject({ kind: "service", name: "plausible" });
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0][0]).toMatch(/plausible/);
-    expect(warn.mock.calls[0][0]).toMatch(/domains/);
-    warn.mockRestore();
-  });
-  it("drops domains from a domain-bearing service's fields (mirrors database backup handling)", () => {
+  it("emits a service's service_domains into fields, canonicalized (cast#72)", () => {
     const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
@@ -305,15 +282,21 @@ environments:
     services:
       umami:
         type: umami
-        domains: ["https://analytics.example.com"]
+        service_domains:
+          umami: ["https://b.example.com", "https://a.example.com"]
 `,
     );
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { desired } = desiredFromManifest(dir, "prod", {});
-    expect(desired[0].fields).toEqual({ type: "umami" });
-    warn.mockRestore();
+    // Keys and each URL array are sorted so container order never false-drifts
+    // against Coolify's read-back ordering.
+    expect(desired[0].fields).toEqual({
+      type: "umami",
+      service_domains: {
+        umami: ["https://a.example.com", "https://b.example.com"],
+      },
+    });
   });
-  it("computeDiff is clean for a domain-bearing service against a matching live service (no perpetual update)", () => {
+  it("is clean for a service whose live per-container hostnames match (cast#72, no perpetual update)", () => {
     const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
@@ -325,12 +308,45 @@ environments:
     services:
       umami:
         type: umami
-        domains: ["https://analytics.example.com"]
+        service_domains:
+          umami: ["https://analytics.example.com"]
 `,
     );
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { desired } = desiredFromManifest(dir, "prod", {});
-    warn.mockRestore();
+    const report = computeDiff(
+      desired,
+      [
+        {
+          kind: "service",
+          name: "umami",
+          uuid: "svc-uuid",
+          fields: {
+            type: "umami",
+            service_domains: { umami: ["https://analytics.example.com"] },
+          },
+        },
+      ],
+      "full",
+    );
+    expect(report.clean).toBe(true);
+  });
+  it("diffs a service whose declared hostname is missing live (apply will set it)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    mkdirSync(join(dir, ".infra"), { recursive: true });
+    writeFileSync(
+      join(dir, ".infra", "manifest.yaml"),
+      `project: widget
+environments:
+  prod:
+    applications: {}
+    services:
+      umami:
+        type: umami
+        service_domains:
+          umami: ["https://analytics.example.com"]
+`,
+    );
+    const { desired } = desiredFromManifest(dir, "prod", {});
     const report = computeDiff(
       desired,
       [
@@ -341,11 +357,19 @@ environments:
           fields: { type: "umami" },
         },
       ],
-      "structural",
+      "full",
     );
-    expect(report.clean).toBe(true);
+    expect(report.clean).toBe(false);
+    expect(report.changes[0].fieldDiffs).toEqual([
+      {
+        field: "service_domains",
+        desired: { umami: ["https://analytics.example.com"] },
+        live: undefined,
+        updatable: true,
+      },
+    ]);
   });
-  it("does not warn for a service with no domains", () => {
+  it("a service with no service_domains carries only its type", () => {
     const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
@@ -359,10 +383,8 @@ environments:
         type: plausible
 `,
     );
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    desiredFromManifest(dir, "staging", {});
-    expect(warn).not.toHaveBeenCalled();
-    warn.mockRestore();
+    const { desired } = desiredFromManifest(dir, "staging", {});
+    expect(desired[0].fields).toEqual({ type: "plausible" });
   });
   it("resolves a dockercompose app to docker_compose_location/docker_compose_domains and no port/healthcheck/domains keys", () => {
     const dir = mkdtempSync(join(tmpdir(), "infra-co-"));

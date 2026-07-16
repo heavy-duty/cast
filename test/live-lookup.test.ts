@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { attachBackup, fetchLive, renderAbsentTarget } from "../src/cli.js";
+import {
+  attachBackup,
+  attachServiceDomains,
+  fetchLive,
+  renderAbsentTarget,
+} from "../src/cli.js";
 import { CoolifyClient } from "../src/coolify.js";
 
 // A Coolify that answers GET /projects with `projects`, and
@@ -268,5 +273,76 @@ describe("attachBackup", () => {
     // would be a coin toss reported as a fact.
     expect(l.backupNotCompared).toMatch(/2 schedules/);
     expect("backup" in l.fields).toBe(false);
+  });
+});
+
+describe("attachServiceDomains (cast#72)", () => {
+  const svc = () => ({
+    kind: "service" as const,
+    name: "umami",
+    uuid: "svc-1",
+    fields: { type: "umami" },
+  });
+  // A Coolify whose GET /services/svc-1 answers with `body`.
+  const client = (body: unknown, status = 200) =>
+    new CoolifyClient(
+      "https://coolify.test",
+      "tok",
+      vi.fn(
+        async () =>
+          new Response(status === 200 ? JSON.stringify(body) : "boom", {
+            status,
+          }),
+      ) as unknown as typeof fetch,
+    );
+
+  it("projects applications[].fqdn into canonicalized service_domains", async () => {
+    const l = svc();
+    await attachServiceDomains(
+      client({
+        applications: [
+          // Out of order, comma-joined, one container with two URLs — all
+          // canonicalized so the read matches the desired side regardless.
+          { name: "web", fqdn: "https://b.example.com,https://a.example.com" },
+          { name: "collector", fqdn: "https://collect.example.com" },
+        ],
+      }),
+      l,
+    );
+    expect(l.fields.service_domains).toEqual({
+      collector: ["https://collect.example.com"],
+      web: ["https://a.example.com", "https://b.example.com"],
+    });
+  });
+
+  it("leaves service_domains absent when no container has a hostname", async () => {
+    const l = svc();
+    await attachServiceDomains(
+      client({
+        applications: [
+          { name: "web", fqdn: "" },
+          { name: "collector", fqdn: null },
+        ],
+      }),
+      l,
+    );
+    // A service with no hostnames stays clean against a manifest that declares
+    // none, and drifts against one that declares some.
+    expect("service_domains" in l.fields).toBe(false);
+  });
+
+  it("FAILS CLOSED — throws rather than projecting empty — when the read is unreachable", async () => {
+    const l = svc();
+    // A blind empty projection would diff a declared hostname as "will set" and
+    // re-PATCH it forever; refusing is the safe answer (#12/#14/#17).
+    await expect(attachServiceDomains(client(null, 500), l)).rejects.toThrow();
+    expect("service_domains" in l.fields).toBe(false);
+  });
+
+  it("FAILS CLOSED when the answer has no applications array", async () => {
+    const l = svc();
+    await expect(
+      attachServiceDomains(client({ uuid: "svc-1" }), l),
+    ).rejects.toThrow(/applications array/);
   });
 });

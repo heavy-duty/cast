@@ -94,6 +94,7 @@ import {
 import { assertNoReservedEnvNames, reservedHits } from "./reserved.js";
 import {
   PATH_IN_PROD_REFUSAL,
+  canonicalizeServiceDomains,
   desiredFromManifest,
   fillDesiredDerived,
   manifestResources,
@@ -494,15 +495,55 @@ export async function attachBackup(
   };
 }
 
+// Read a service's per-container hostnames off GET /services/{uuid} and project
+// them into `service_domains` on the Live's fields, so a declared hostname diffs
+// like any other field (cast#72). The environment-list GET fetchLive reads does
+// not eager-load `service.applications`, so this is a supplementary per-service
+// read (see serviceByUuid).
+//
+// Unlike backup's not-compared escape, this FAILS CLOSED: a service whose domains
+// cannot be read is NOT projected empty — that would diff a declared hostname as
+// "will set" and let apply re-PATCH it every run — the read throws and aborts.
+// GET /services/{uuid} for a service the environment list just named is not
+// expected to fail; when it does, refusing beats a confident-but-blind plan
+// (#12/#14/#17). A service with genuinely NO hostnames leaves service_domains
+// absent, so a manifest declaring none stays clean and one declaring some drifts.
+export async function attachServiceDomains(
+  client: CoolifyClient,
+  svc: Live,
+): Promise<void> {
+  const raw = (await client.serviceByUuid(svc.uuid)) as {
+    applications?: Array<{ name?: unknown; fqdn?: unknown }>;
+  } | null;
+  if (!raw || !Array.isArray(raw.applications)) {
+    throw new Error(
+      `GET /services/${svc.uuid} returned no applications array — cannot read service ${svc.name}'s hostnames to diff them`,
+    );
+  }
+  const map: Record<string, string[]> = {};
+  for (const app of raw.applications) {
+    const name = typeof app.name === "string" ? app.name : undefined;
+    const fqdn = typeof app.fqdn === "string" ? app.fqdn : "";
+    const urls = fqdn
+      .split(",")
+      .map((u) => u.trim())
+      .filter(Boolean);
+    if (name && urls.length > 0) map[name] = urls;
+  }
+  if (Object.keys(map).length > 0) {
+    svc.fields.service_domains = canonicalizeServiceDomains(map);
+  }
+}
+
 export async function fetchLive(
   client: CoolifyClient,
   projectName: string,
   envName: string,
-  // Backups cost one extra GET per database, so only the callers that actually
-  // compare them ask for them: `diff` and `apply`. The read-side sweeps
-  // (inventory, capture, smoke) walk every project on a box and would pay it on
-  // every database for an answer they never look at.
-  opts: { backups?: boolean } = {},
+  // Backups and service hostnames each cost one extra GET per resource, so only
+  // the callers that actually compare them ask: `diff` and `apply`. The read-side
+  // sweeps (inventory, capture, smoke) walk every project on a box and would pay
+  // it on every resource for an answer they never look at.
+  opts: { backups?: boolean; serviceDomains?: boolean } = {},
 ): Promise<LiveLookup> {
   const projects = (await client.get("/projects")) as Array<{
     uuid: string;
@@ -598,6 +639,11 @@ export async function fetchLive(
   if (opts.backups) {
     for (const db of live.filter((l) => l.kind === "database")) {
       await attachBackup(client, db);
+    }
+  }
+  if (opts.serviceDomains) {
+    for (const svc of live.filter((l) => l.kind === "service")) {
+      await attachServiceDomains(client, svc);
     }
   }
   return { found: true, live };
@@ -1083,9 +1129,11 @@ async function runProject(
       parseYaml(readFileSync(ctx.hostnameOverlay, "utf8")),
     );
   }
-  // `backups: true` — this is the one path that compares them (see fetchLive).
+  // `backups`/`serviceDomains` — diff and apply are the one path that compares
+  // each, and each costs a supplementary GET per resource (see fetchLive).
   const lookup = await fetchLive(ctx.client, projectName, coolifyEnv, {
     backups: true,
+    serviceDomains: true,
   });
   // apply and diff take opposite (and both correct) positions on absence:
   // apply is *allowed* to be the thing that brings a project into existence,
@@ -2639,14 +2687,29 @@ export function databaseApiFields(
 export function serviceApiFields(
   fields: Record<string, unknown>,
 ): Record<string, unknown> {
-  // /services accepts `urls`, a structured per-container list
-  // ({name, url}[]), not the flat `domains` string list the manifest
-  // speaks. manifest.ts's ServiceSpecSchema has no notion of per-container
-  // name, so we can't build a correct `urls` payload from `domains` alone —
-  // dropped rather than sent malformed. Known limitation: service hostnames
-  // need manual Coolify UI configuration (see README, Task 10).
-  const { domains: _domains, ...rest } = fields;
-  return rest;
+  // /services accepts `urls`, a per-container list ({name, url}[]) — the create
+  // (POST /services) and update (PATCH /services/{uuid}) allowlists both carry
+  // it, and applyServiceUrls matches `urls[].name` to a ServiceApplication and
+  // sets its `fqdn`, `url` being that container's URLs comma-joined (verified
+  // against ServicesController v4.1.2, cast#72). `service_domains` speaks the
+  // internal map vocabulary (container -> string[]); this is the exact shape
+  // dockercompose apps' `docker_compose_domains` is written with, one route over.
+  //
+  // A `url` whose `name` matches no container is a 422 on update and, on CREATE,
+  // deletes the just-made service before answering 422 (applyServiceUrls's
+  // rollback) — so the name must be a real container. buildExecutor surfaces
+  // either as-is; the operator reads the right name off a `cast diff` read-back.
+  const { service_domains, ...rest } = fields;
+  return {
+    ...rest,
+    ...(service_domains !== undefined
+      ? {
+          urls: Object.entries(service_domains as Record<string, string[]>).map(
+            ([name, urls]) => ({ name, url: urls.join(",") }),
+          ),
+        }
+      : {}),
+  };
 }
 
 // --- Domain uniqueness: instance-wide, while cast plans project-scoped (#44) ---
@@ -2702,14 +2765,18 @@ function nakedDomain(raw: string): string {
   return d.endsWith("/") ? d.slice(0, -1) : d;
 }
 
-// The domains a planned CREATE would claim. Applications only, and that is not an
-// oversight: databases have no domains, and cast's service creates drop `domains`
-// on the wire entirely (serviceApiFields above), so an application create is the
-// only way an apply can claim one.
+// The domains a planned CREATE would claim: an application's flat `domains` or
+// compose `docker_compose_domains`, and now a service's `service_domains`
+// (cast#72 — service creates send `urls`; databases have no domains). Worth
+// pre-flighting for services in particular, because a service create whose
+// domain conflicts does not just 409 — applyServiceUrls DELETES the half-made
+// service first (v4.1.2 rollback), so catching it here costs nothing where the
+// server-side failure costs a resurrection.
 export function desiredDomainsOfCreate(
   change: Change,
 ): Array<{ domain: string; service?: string }> {
-  if (change.kind !== "application" || change.op !== "create") return [];
+  if (change.op !== "create") return [];
+  if (change.kind !== "application" && change.kind !== "service") return [];
   const fields = Object.fromEntries(
     change.fieldDiffs.map((f) => [f.field, f.desired]),
   );
@@ -2720,11 +2787,14 @@ export function desiredDomainsOfCreate(
       if (typeof d === "string" && d.length > 0)
         out.push({ domain: nakedDomain(d) });
   }
-  const compose = fields.docker_compose_domains as
-    | Record<string, string[]>
-    | undefined;
-  if (compose) {
-    for (const [service, urls] of Object.entries(compose))
+  // dockercompose apps and services share the per-container map shape
+  // (docker_compose_domains / service_domains); the two never coexist on one
+  // resource. A container's name rides out as `service` so a conflict can say
+  // which container wanted the domain.
+  const perContainer = (fields.docker_compose_domains ??
+    fields.service_domains) as Record<string, string[]> | undefined;
+  if (perContainer) {
+    for (const [service, urls] of Object.entries(perContainer))
       for (const d of urls ?? [])
         if (typeof d === "string" && d.length > 0)
           out.push({ domain: nakedDomain(d), service });

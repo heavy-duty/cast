@@ -1056,8 +1056,11 @@ express everything a Coolify holds, and a blueprint that omits those things
 without saying so is worse than no blueprint — in a disaster you would trust it
 and rebuild a *different box*. Per resource, it names what was seen and could not
 be written: `destination_id` (which Docker network — no destinations API in 4.1.2
-to resolve it to the UUID `destination_uuid:` wants, #21), service hostnames (no
-flat `domains` on a Coolify 4.1.2 service), Basic Auth / custom Traefik labels,
+to resolve it to the UUID `destination_uuid:` wants, #21), service hostnames
+(settable/readable via the API and carried by `diff`/`apply` as `service_domains`
+since #72, but the same as backups below — `inventory --emit-draft` does not yet
+make the per-service `GET /services/{uuid}`, so a drafted service has none until
+you declare them), Basic Auth / custom Traefik labels,
 build and deploy command overrides, backup schedules (**a rebuild has no backups
 until you declare them** — *not* because they cannot be read, which is what this
 line used to say and #51 disproved, but because `inventory --emit-draft` has not
@@ -1228,24 +1231,28 @@ one used — verified against a live private clone.
   target) and how each says so out loud. Kept here, struck through, because
   this entry is *why nobody looked*: a limitation filed as a defect gets fixed,
   and a defect filed as a limitation does not.
-- **A service's `domains` cannot be applied via the API in Coolify 4.1.2,
-  and is deliberately kept out of the diffed `fields` for idempotency.** (This
-  used to cite backup schedules as its precedent; it can't any more — that
-  reasoning was disproved above. This one was re-checked and holds: Coolify
-  4.1.2 exposes no flat `domains` on a service, on any route. If that is ever
-  disproved the same way, `domains` belongs in `fields` too.) The `/services`
-  create/update payload takes a structured per-container `urls` list, not
-  the manifest's flat `domains: string[]`, and the manifest has no
-  per-container name to build that list correctly from — so cast
-  drops it rather than send a malformed payload. Live Coolify service state
-  doesn't expose a flat `domains` back either, so if it stayed in `fields`
-  every domain-bearing service would diff as a perpetual update and every
-  `apply` would needlessly restart it — `desiredFromManifest` drops
-  `domains` from the service's `fields` and **warns**
-  (`service <name> declares domains (...), but apply cannot set them on
-  Coolify 4.1.2 services — configure hostnames manually in the Coolify UI`)
-  once per run for every service that declared any. Set service hostnames
-  in the Coolify UI by hand.
+- **~~A service's hostnames cannot be applied via the API in Coolify 4.1.2.~~**
+  **Corrected (#72).** This entry used to claim, re-checked, that "Coolify 4.1.2
+  exposes no flat `domains` on a service, on any route" — and drop a service's
+  domains from `fields`, warning that hostnames were a manual Coolify UI act. The
+  claim was true of the FLAT shape and false of the CAPABILITY, the same failure
+  mode #51 corrected for backups: the per-container route was there at 4.1.2 all
+  along. `POST /services` and `PATCH /services/{uuid}` both take a structured
+  `urls` list (`[{name, url}]`, `url` comma-joined) that `applyServiceUrls`
+  matches to a `ServiceApplication` by name and stores as its `fqdn`; `GET
+  /services/{uuid}` loads `applications` and returns each `fqdn`
+  (`ServicesController` v4.1.2). So services now speak the SAME per-container
+  vocabulary a dockercompose app does — a `service_domains: { <container>: [url] }`
+  map — carried in `fields`, written on create *and* update, and compared on
+  every run off the read-back (one supplementary `GET /services/{uuid}` per
+  service, gated to `diff`/`apply` like backups). A flat `domains: string[]` is
+  gone: it could never name which container a hostname belongs to, which is
+  exactly what `urls` requires. Two limits remain, stated out loud: the read is
+  **fail-closed** (an unreachable/unrecognized `GET /services/{uuid}` aborts
+  rather than projecting empty and re-PATCHing forever), and a service create
+  whose domain conflicts is **deleted server-side before the 409**
+  (`applyServiceUrls` rollback) — which is why `service_domains` on a create is
+  pre-flighted (`desiredDomainsOfCreate`) alongside application domains.
 - **"Include Source Commit in Build" cannot be enabled via the API in Coolify
   4.1.2 — `apply` warns instead.** A dockercompose application whose build
   consumes `SOURCE_COMMIT` as a **build arg** only receives it if the

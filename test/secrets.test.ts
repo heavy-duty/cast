@@ -63,7 +63,7 @@ describe("secretsFileFor", () => {
 });
 
 // Pins the read-once shape of `<(pm read …)` that the fd-path test above
-// cannot: a regular file behind /proc/self/fd re-opens at offset 0 on every
+// cannot: a regular file behind an fd path re-opens at offset 0 on every
 // read, but a pipe drains. `diff --all` / `apply --all` decrypt once per
 // project, so the identity must be read once per process and reused.
 describe("decryptSecrets identity caching", () => {

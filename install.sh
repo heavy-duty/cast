@@ -3,14 +3,23 @@ set -euo pipefail
 
 # cast installer — intended for: curl -fsSL .../install.sh | bash
 #
-# Downloads the cast repo tarball, installs the tree under $DEST, builds it,
-# and puts a `cast` symlink on PATH via $BINDIR. Re-run any time to upgrade.
+# Three channels from one script (cast#96, the flow shared with box#83):
 #
-# Unlike rig (pure bash, runs on bare boxes), cast runs on YOUR machine and
-# needs node — it is an API client, never something a server installs.
+#   CAST_REF unset      → the latest GitHub release's prebuilt asset
+#                         (cast-X.Y.Z.tgz). No npm ci, no tsc, no
+#                         devDependencies on this machine — the build
+#                         happened once, in CI, on the tag.
+#   CAST_REF=X.Y.Z      → that release's asset, when one exists — a pin.
+#   CAST_REF=<branch>   → build from source: the repo tarball for that
+#                         ref (tags tried before branches), npm ci + tsc
+#                         here. CAST_REF=main is the dev channel.
+#
+# Re-run any time to upgrade. Unlike rig (pure bash, runs on bare boxes),
+# cast runs on YOUR machine and needs node — it is an API client, never
+# something a server installs.
 
 REPO="${CAST_REPO:-heavy-duty/cast}"
-REF="${CAST_REF:-main}"
+REF="${CAST_REF:-}"
 DEST="${CAST_HOME:-$HOME/.local/share/cast}"
 if [ "$(id -u)" -eq 0 ]; then
   BINDIR="${CAST_BIN:-/usr/local/bin}"
@@ -26,7 +35,6 @@ die() { printf 'cast-install: ERROR: %s\n' "$*" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || die "curl is required but was not found."
 command -v tar  >/dev/null 2>&1 || die "tar is required but was not found."
 command -v node >/dev/null 2>&1 || die "node >=22.12 is required but was not found."
-command -v npm  >/dev/null 2>&1 || die "npm is required but was not found."
 
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$NODE_MAJOR" -ge 22 ] || die "node >=22.12 is required (found $(node -v))."
@@ -43,27 +51,90 @@ TMPDIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT
 
-URL="https://github.com/$REPO/archive/refs/heads/$REF.tar.gz"
+# Resolve the latest release tag by following the releases/latest redirect
+# and reading where it landed — no API, no token, no rate-limit pain
+# (box#83's trick). GitHub answers .../releases/tag/<TAG>; anything else
+# (a repo with no releases redirects nowhere useful) is a loud failure.
+resolve_latest_tag() {
+  local landed
+  landed="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")" || return 1
+  case "$landed" in
+    */releases/tag/*) printf '%s\n' "${landed##*/releases/tag/}" ;;
+    *) return 1 ;;
+  esac
+}
 
-log "installing cast ($REPO@$REF)"
-log "downloading $URL"
-curl -fsSL "$URL" -o "$TMPDIR/cast.tar.gz" \
-  || die "failed to download $URL"
+# fetch_ok <url> <outfile> — download, true/false. -f keeps a 404 an
+# error instead of saving GitHub's error page as a tarball.
+fetch_ok() {
+  curl -fsSL "$1" -o "$2" 2>/dev/null
+}
+
+# --- acquire the tree --------------------------------------------------------
+# PREBUILT=1 means the tarball is a CI-built runnable tree (bin/, dist/,
+# production node_modules/, package.json) — nothing to compile here.
+PREBUILT=0
+SRCDESC=""
+
+if [ -z "$REF" ]; then
+  TAG="$(resolve_latest_tag)" \
+    || die "could not resolve the latest release of $REPO — no releases yet, or no network. CAST_REF=main installs from source."
+  URL="https://github.com/$REPO/releases/download/$TAG/cast-$TAG.tgz"
+  log "installing cast $TAG (latest release of $REPO)"
+  log "downloading $URL"
+  fetch_ok "$URL" "$TMPDIR/cast.tar.gz" \
+    || die "failed to download the $TAG release asset: $URL"
+  PREBUILT=1
+  SRCDESC="$REPO@$TAG (release asset)"
+else
+  # A pinned tag that has a release asset gets the asset — same bits as the
+  # default channel, just older. Everything else (a branch, a tag from
+  # before releases carried assets) falls back to build-from-source.
+  ASSET_URL="https://github.com/$REPO/releases/download/$REF/cast-$REF.tgz"
+  if fetch_ok "$ASSET_URL" "$TMPDIR/cast.tar.gz"; then
+    log "installing cast $REF (pinned release asset)"
+    PREBUILT=1
+    SRCDESC="$REPO@$REF (release asset)"
+  else
+    log "no release asset for '$REF' — building from source"
+    for kind in tags heads; do
+      URL="https://github.com/$REPO/archive/refs/$kind/$REF.tar.gz"
+      if fetch_ok "$URL" "$TMPDIR/cast.tar.gz"; then
+        SRCDESC="$REPO@$REF (source, refs/$kind)"
+        break
+      fi
+      SRCDESC=""
+    done
+    [ -n "$SRCDESC" ] || die "no tag or branch named '$REF' in $REPO (tried the release asset, refs/tags and refs/heads)"
+    log "downloaded from refs — $SRCDESC"
+  fi
+fi
 
 log "extracting archive"
 tar -xzf "$TMPDIR/cast.tar.gz" -C "$TMPDIR" \
   || die "failed to extract archive"
 
-# GitHub archives extract to a single top-level dir like cast-<ref>/
-EXTRACTED="$(find "$TMPDIR" -maxdepth 1 -type d -name 'cast-*' | head -n1)"
-[ -n "$EXTRACTED" ] || die "could not find extracted cast-* directory in archive"
-[ -f "$EXTRACTED/bin/cast" ] || die "archive does not contain bin/cast — is $REPO@$REF correct?"
+# Both shapes carry exactly ONE top-level directory (GitHub names its
+# archives <repo>-<ref>; release.yml stages cast-<version>). Deriving that
+# name is guesswork — it broke for real at box's repo rename — so take the
+# single directory, whatever it is called, and judge the tree by its content.
+EXTRACTED="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+[ -n "$EXTRACTED" ] || die "could not find the cast tree in the archive"
+[ -f "$EXTRACTED/bin/cast" ] || die "archive does not contain bin/cast — is $SRCDESC correct?"
 
-# --- build (deps + tsc), then drop the dev deps -------------------------------
-log "building (npm ci && npm run build)"
-( cd "$EXTRACTED" && npm ci --silent && npm run build --silent ) \
-  || die "build failed"
-( cd "$EXTRACTED" && npm prune --omit=dev --silent ) || warn "could not prune dev dependencies"
+# --- build (source channel only) ---------------------------------------------
+if [ "$PREBUILT" -eq 1 ]; then
+  # Verify the shape before touching $DEST: a prebuilt tree that cannot run
+  # is better refused here than discovered at `cast apply` time.
+  [ -f "$EXTRACTED/dist/cli.js" ] && [ -d "$EXTRACTED/node_modules" ] \
+    || die "the release asset is not a runnable tree (missing dist/ or node_modules/) — broken release? CAST_REF=main installs from source"
+else
+  command -v npm >/dev/null 2>&1 || die "npm is required to build from source (CAST_REF=$REF) but was not found."
+  log "building (npm ci && npm run build)"
+  ( cd "$EXTRACTED" && npm ci --silent && npm run build --silent ) \
+    || die "build failed"
+  ( cd "$EXTRACTED" && npm prune --omit=dev --silent ) || warn "could not prune dev dependencies"
+fi
 
 # --- atomically replace $DEST --------------------------------------------------
 log "installing into $DEST"
@@ -71,7 +142,11 @@ rm -rf "$DEST"
 mkdir -p "$(dirname "$DEST")"
 mv "$EXTRACTED" "$DEST"
 
-chmod +x "$DEST/bin/cast" "$DEST"/scripts/*.sh
+chmod +x "$DEST/bin/cast"
+# Source installs carry scripts/; the release asset deliberately does not.
+if [ -d "$DEST/scripts" ]; then
+  find "$DEST/scripts" -name '*.sh' -exec chmod +x {} +
+fi
 
 # --- put cast on PATH ----------------------------------------------------------
 mkdir -p "$BINDIR"
@@ -133,4 +208,4 @@ else
   log "this shell does not have it yet — open a new one, or: source $PROFILE"
 fi
 
-log "done — try: cast --help"
+log "done ($SRCDESC) — try: cast --help"

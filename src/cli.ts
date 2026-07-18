@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { parse as parseYaml } from "yaml";
 import { type Executor, applyHostnameOverlay, applyPlan } from "./apply.js";
@@ -125,6 +126,7 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
        cast smoke     <org>/<repo> --env <env> [--project <name>] [--environment <name>]
        cast team [--env <env>]
+       cast --version                                     # version + install root
 
   --state <dir>   the state checkout holding environments.yaml, secrets/ and
                   .coolify.env  (default: $CAST_STATE, else the cwd)
@@ -1299,10 +1301,28 @@ async function runProject(
   return { status: "applied", mutated };
 }
 
+// The version lives in package.json — the tree's single source of truth
+// (cast#96, deliberately no separate VERSION file). dist/cli.js sits one
+// level below it in a source checkout and in an installed release asset
+// alike, so resolving from import.meta.url answers for both without
+// caring how this tree got here. The install root rides along in the
+// output (the family's shape — rig prints its ROOT too) because "which
+// cast is this" and "where does it run from" are the same question when
+// several trees exist on one machine.
+function formatVersion(): string {
+  const pkgPath = fileURLToPath(new URL("../package.json", import.meta.url));
+  const version: unknown = JSON.parse(readFileSync(pkgPath, "utf8")).version;
+  return `cast ${typeof version === "string" ? version : "unknown"} (${dirname(pkgPath)})`;
+}
+
 async function main(): Promise<number> {
   const [command, ...rest] = process.argv.slice(2);
   if (command === "-h" || command === "--help" || command === "help") {
     console.log(USAGE);
+    return 0;
+  }
+  if (command === "-V" || command === "--version") {
+    console.log(formatVersion());
     return 0;
   }
   if (command === "apply" || command === "diff") {

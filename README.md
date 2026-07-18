@@ -21,6 +21,17 @@ are decrypted by shelling out to it). Re-run any time to upgrade. Unlike rig —
 which is pure bash so it can run on a bare box — cast runs on **your** machine:
 it is an API client, and a server should never install it.
 
+By default that installs the **latest release**: a prebuilt `cast-X.Y.Z.tgz`
+asset built once in CI — nothing compiles on your machine, and
+`cast --version` names exactly what you got. `CAST_REF` selects the other
+channels:
+
+| | channel | what happens |
+|---|---|---|
+| unset | latest release | the newest tag's prebuilt asset |
+| `CAST_REF=0.1.0` | pinned | that release's prebuilt asset |
+| `CAST_REF=main` | dev | that ref's source tarball, built here (`npm ci` + `tsc` — needs `npm`) |
+
 The installer symlinks `cast` into `~/.local/bin` (or `/usr/local/bin` as root)
 and, if that directory is not already on your `PATH`, appends it to your shell
 profile — `.zshrc`, `.bashrc`/`.bash_profile`, or `config.fish`, whichever your

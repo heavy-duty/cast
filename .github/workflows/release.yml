@@ -45,16 +45,16 @@ jobs:
         run: bash scripts/changelog-section.sh "$GITHUB_REF_NAME" CHANGELOG.md > /tmp/release-notes.md
 
       - name: build the package, once
+        # Just the build — check and tests already gated the merge commit
+        # this tag points at (ci.yml, with its age dependency); the release
+        # job's whole job is packaging that green tree.
         run: |
           npm ci
-          npm run check
           npm run build
-          npm test
 
       - name: assemble cast-${{ github.ref_name }}.tgz
         # The runnable tree and nothing else: bin/, dist/, production
-        # node_modules/, package.json. Pruned AFTER the tests so what ships
-        # is the tree that passed. Top-level dir named like a GitHub
+        # node_modules/, package.json. Top-level dir named like a GitHub
         # archive's, so the installer handles both shapes identically.
         run: |
           npm prune --omit=dev

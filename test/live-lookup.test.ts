@@ -4,6 +4,7 @@ import {
   attachServiceDomains,
   fetchEnv,
   fetchLive,
+  projectServiceDomains,
   renderAbsentTarget,
 } from "../src/cli.js";
 import { CoolifyClient } from "../src/coolify.js";
@@ -419,5 +420,39 @@ describe("attachServiceDomains (cast#72)", () => {
     await expect(
       attachServiceDomains(client({ uuid: "svc-1" }), l),
     ).rejects.toThrow(/applications array/);
+  });
+});
+
+// The projection itself, shared by the diff read above and the draft (#83).
+// Its two absences mean opposite things, and each caller takes its own
+// position on `undefined`: attachServiceDomains throws, the draft reports.
+describe("projectServiceDomains — one projection, two readers (#83)", () => {
+  it("answers {} for a service with no hostnames — an ANSWER, not a failure", () => {
+    expect(
+      projectServiceDomains({
+        applications: [
+          { name: "web", fqdn: "" },
+          { name: "collector", fqdn: null },
+        ],
+      }),
+    ).toEqual({});
+  });
+  it("answers undefined — 'not read' — for a body with no applications array", () => {
+    expect(projectServiceDomains(null)).toBeUndefined();
+    expect(projectServiceDomains(undefined)).toBeUndefined();
+    expect(projectServiceDomains({ uuid: "svc-1" })).toBeUndefined();
+  });
+  it("canonicalizes, so the draft and the diff agree to the byte", () => {
+    expect(
+      projectServiceDomains({
+        applications: [
+          { name: "web", fqdn: "https://b.example.com,https://a.example.com" },
+          { name: "collector", fqdn: "https://collect.example.com" },
+        ],
+      }),
+    ).toEqual({
+      collector: ["https://collect.example.com"],
+      web: ["https://a.example.com", "https://b.example.com"],
+    });
   });
 });

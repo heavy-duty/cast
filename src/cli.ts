@@ -495,6 +495,40 @@ export async function attachBackup(
   };
 }
 
+// Project GET /services/{uuid}'s body into the manifest's `service_domains`
+// shape: `applications[].fqdn` → a canonicalized map of container name → URLs.
+// THE one projection, shared by the diff/apply read (attachServiceDomains,
+// below) and the draft (#83) — two projections of the same wire shape would
+// drift, and a drafted manifest that disagrees with the diff's read-back by so
+// much as URL order would diff dirty the moment it is applied.
+//
+// The two answers stay distinct, because they mean opposite things to every
+// caller (the BackupRead lesson, on a different route):
+//
+//   undefined -> NOT READ: no body, or no applications array. Says nothing.
+//   a map     -> read cleanly. `{}` is an ANSWER — this service serves no
+//                hostnames — not a failure; a caller must not flatten it into
+//                the unreadable case.
+export function projectServiceDomains(
+  raw: unknown,
+): Record<string, string[]> | undefined {
+  const body = raw as {
+    applications?: Array<{ name?: unknown; fqdn?: unknown }>;
+  } | null;
+  if (!body || !Array.isArray(body.applications)) return undefined;
+  const map: Record<string, string[]> = {};
+  for (const app of body.applications) {
+    const name = typeof app.name === "string" ? app.name : undefined;
+    const fqdn = typeof app.fqdn === "string" ? app.fqdn : "";
+    const urls = fqdn
+      .split(",")
+      .map((u) => u.trim())
+      .filter(Boolean);
+    if (name && urls.length > 0) map[name] = urls;
+  }
+  return canonicalizeServiceDomains(map);
+}
+
 // Read a service's per-container hostnames off GET /services/{uuid} and project
 // them into `service_domains` on the Live's fields, so a declared hostname diffs
 // like any other field (cast#72). The environment-list GET fetchLive reads does
@@ -508,30 +542,21 @@ export async function attachBackup(
 // expected to fail; when it does, refusing beats a confident-but-blind plan
 // (#12/#14/#17). A service with genuinely NO hostnames leaves service_domains
 // absent, so a manifest declaring none stays clean and one declaring some drifts.
+// (The draft takes the opposite position on the same unreadable answer — it
+// REPORTS in UNCAPTURED.md rather than aborting a whole-instance sweep — which
+// is exactly why the projection above is a separate function.)
 export async function attachServiceDomains(
   client: CoolifyClient,
   svc: Live,
 ): Promise<void> {
-  const raw = (await client.serviceByUuid(svc.uuid)) as {
-    applications?: Array<{ name?: unknown; fqdn?: unknown }>;
-  } | null;
-  if (!raw || !Array.isArray(raw.applications)) {
+  const map = projectServiceDomains(await client.serviceByUuid(svc.uuid));
+  if (map === undefined) {
     throw new Error(
       `GET /services/${svc.uuid} returned no applications array — cannot read service ${svc.name}'s hostnames to diff them`,
     );
   }
-  const map: Record<string, string[]> = {};
-  for (const app of raw.applications) {
-    const name = typeof app.name === "string" ? app.name : undefined;
-    const fqdn = typeof app.fqdn === "string" ? app.fqdn : "";
-    const urls = fqdn
-      .split(",")
-      .map((u) => u.trim())
-      .filter(Boolean);
-    if (name && urls.length > 0) map[name] = urls;
-  }
   if (Object.keys(map).length > 0) {
-    svc.fields.service_domains = canonicalizeServiceDomains(map);
+    svc.fields.service_domains = map;
   }
 }
 
@@ -1952,10 +1977,37 @@ async function main(): Promise<number> {
         for (const r of resources) {
           // Databases hold no manifest-templated env of their own — their URL is
           // what the APPS reference, and that name is generated, not captured.
-          if (r.kind === "database") continue;
+          // What a database DOES hold is a backup schedule, on its own route
+          // (#51) — and a blueprint that omits backups is the quietest possible
+          // loss, so the draft pays the one supplementary GET per DRAFTED
+          // database that diff/apply pay per compared one. Ungated on purpose:
+          // fetchLive's `opts.backups` gate exists because the read-side sweeps
+          // never look at the answer, and the draft is the sweep that does. A
+          // failed read lands on `undefined` and becomes an UNCAPTURED entry
+          // (see draftBackup) — reported, never aborting the whole-instance
+          // sweep the way diff/apply refuse a single-project plan.
+          if (r.kind === "database") {
+            r.backups = await client.databaseBackupSchedules(r.uuid);
+            continue;
+          }
           r.env = flattenEnv(
             await fetchEnv(client, { kind: r.kind, uuid: r.uuid }),
           );
+          // A service's hostnames live behind the same kind of supplementary
+          // GET as a database's backups (#83, sibling of #75 — one design, both
+          // reads): GET /services/{uuid} is the only route that eager-loads
+          // service.applications, so the draft pays it per DRAFTED service,
+          // ungated and sequential, and projects the answer through THE
+          // projection diff/apply use (projectServiceDomains) so the drafted
+          // manifest diffs clean the moment it is applied. A failed read lands
+          // on `undefined` and becomes an UNCAPTURED entry (see serviceSpec) —
+          // where attachServiceDomains fails a one-project diff closed, a
+          // whole-instance sweep reports and keeps going.
+          if (r.kind === "service") {
+            r.serviceDomains = projectServiceDomains(
+              await client.serviceByUuid(r.uuid).catch(() => undefined),
+            );
+          }
         }
         draftProjects.push({
           name: p.name,

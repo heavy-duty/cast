@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { loadBindings } from "../src/bindings.js";
 import { GENERATED_PLACEHOLDER } from "../src/capture.js";
+import { loadManifest } from "../src/manifest.js";
 import { decryptSecrets } from "../src/secrets.js";
 
 // `cast inventory --emit-draft` against a stub shaped like the box that made it
@@ -154,6 +155,36 @@ async function stubCoolify(opts: { ambiguous?: boolean } = {}): Promise<Stub> {
       return json({
         services: [
           { name: "barber-site", uuid: "s9", service_type: "wordpress" },
+        ],
+      });
+
+    // The draft's supplementary per-database GET (#75) — the same route
+    // diff/apply read (#51). One enabled schedule, saving to S3: the block is
+    // draftable, the S3 TARGET (s3_storage_id, an unmappable int) is not.
+    if (path === "/databases/d1/backups")
+      return json([
+        {
+          uuid: "sched-1",
+          enabled: true,
+          save_s3: true,
+          frequency: "0 3 * * *",
+          database_backup_retention_amount_locally: 7,
+          s3_storage_id: 2,
+          executions: [],
+        },
+      ]);
+
+    // The draft's supplementary per-service GET (#83) — the same route the
+    // diff's read-back uses. Only the umami answers; the barber shop's s9
+    // deliberately 404s below, so the draft's report-not-abort path is what a
+    // whole-instance run actually exercises.
+    if (path === "/services/s1")
+      return json({
+        uuid: "s1",
+        name: "Incubator Umami",
+        applications: [
+          { name: "umami", fqdn: "https://umami.box-b.example.com" },
+          { name: "db", fqdn: null },
         ],
       });
 
@@ -352,13 +383,20 @@ describe("cast inventory --emit-draft (#27)", () => {
     const md = readFileSync(join(f.out, "UNCAPTURED.md"), "utf8");
 
     // Seen on the box, and inexpressible:
-    expect(md).toContain("Incubator Umami"); // service hostnames (#21 / 4.1.2)
-    expect(md).toContain("domains (hostnames)");
+    // The umami's hostnames are CAPTURED now (#83) — it has nothing left to
+    // report. The service whose per-service GET failed (barber-site) is the
+    // one that must be listed, or a rebuild would silently serve nothing.
+    expect(md).not.toContain("Incubator Umami");
+    expect(md).toContain("barber-site");
+    expect(md).toContain("service_domains (hostnames)");
     expect(md).toContain("destination"); // which Docker network (#21)
     expect(md).toContain("destination_id 3");
     expect(md).toContain("legacy-analytics"); // a MySQL cast cannot model
     expect(md).toContain("custom_labels"); // Basic Auth / Traefik labels
-    expect(md).toContain("backup"); // API exposes it, draft doesn't capture it yet (#51)
+    // The schedule itself is CAPTURED now (#75); what stays uncaptured is the
+    // S3 target, which reads back only as an unmappable s3_storage_id int.
+    expect(md).toContain("backup S3 target");
+    expect(md).not.toContain("does not yet read"); // the stale pre-#51 claim
     expect(md).toContain("legacy.flag"); // not a name a template can hold
 
     // And the standing sections, emitted on every run whatever was found:
@@ -370,6 +408,68 @@ describe("cast inventory --emit-draft (#27)", () => {
 
     // The run points at it rather than leaving it to be found.
     expect(r.output).toContain("UNCAPTURED.md");
+  });
+
+  it("reads the backup schedule and emits a real backup block (#75)", async () => {
+    const f = fixture((await stubCoolify()).url);
+    const r = await run([
+      "--env",
+      "prod",
+      "--state",
+      f.state,
+      "--emit-draft",
+      f.out,
+      "--recipient",
+      RECIPIENT,
+    ]);
+    expect(r.code).toBe(0);
+    // The drafted manifest carries the live schedule, in the exact shape the
+    // desired side declares — so it diffs clean the moment it is applied.
+    const manifest = loadManifest(
+      join(f.out, "incubator", ".infra", "manifest.yaml"),
+    );
+    expect(
+      manifest.environments.prod.databases?.["Incubator Database v2"]?.backup,
+    ).toEqual({ frequency: "0 3 * * *", retention: 7 });
+  });
+
+  it("captures a service's hostnames via the per-service GET (#83)", async () => {
+    const f = fixture((await stubCoolify()).url);
+    const r = await run([
+      "--env",
+      "prod",
+      "--state",
+      f.state,
+      "--emit-draft",
+      f.out,
+      "--recipient",
+      RECIPIENT,
+    ]);
+    expect(r.code).toBe(0);
+    // Projected through the SAME projection the diff's read-back uses, so a
+    // drafted service diffs clean the moment it is applied. The container with
+    // no fqdn is simply absent, exactly as attachServiceDomains reads it.
+    const manifest = loadManifest(
+      join(f.out, "incubator", ".infra", "manifest.yaml"),
+    );
+    expect(
+      manifest.environments.prod.services?.["Incubator Umami"]?.service_domains,
+    ).toEqual({ umami: ["https://umami.box-b.example.com"] });
+
+    // The barber shop's GET /services/s9 404s. The sweep does not abort: its
+    // manifest is still drafted, carries no hostnames, and the loss is NAMED.
+    const barber = loadManifest(
+      join(f.out, "martin-reyes-barber-shop", ".infra", "manifest.yaml"),
+    );
+    expect(
+      barber.environments.prod.services?.["barber-site"],
+    ).not.toBeUndefined();
+    expect(
+      barber.environments.prod.services?.["barber-site"],
+    ).not.toHaveProperty("service_domains");
+    const md = readFileSync(join(f.out, "UNCAPTURED.md"), "utf8");
+    expect(md).toContain("barber-site");
+    expect(md).toContain("unreachable");
   });
 
   it("writes the projects: registry — the list of what exists", async () => {

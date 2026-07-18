@@ -85,7 +85,13 @@ describe("CoolifyClient", () => {
       mockFetch({ "GET /api/v1/databases/db-1/backups": [row()] }),
     );
     await expect(c.databaseBackupSchedules("db-1")).resolves.toEqual([
-      { uuid: "sched-1", frequency: "0 3 * * *", retention: 7, enabled: true },
+      {
+        uuid: "sched-1",
+        frequency: "0 3 * * *",
+        retention: 7,
+        enabled: true,
+        saveS3: true,
+      },
     ]);
   });
   // The dangerous 404. fetchLive reads a 404 as "no live environment" three
@@ -106,7 +112,13 @@ describe("CoolifyClient", () => {
 describe("parseBackupSchedules", () => {
   it("reads a well-formed collection", () => {
     expect(parseBackupSchedules([row()])).toEqual([
-      { uuid: "sched-1", frequency: "0 3 * * *", retention: 7, enabled: true },
+      {
+        uuid: "sched-1",
+        frequency: "0 3 * * *",
+        retention: 7,
+        enabled: true,
+        saveS3: true,
+      },
     ]);
   });
   it("reads an empty list as a trustworthy 'no schedule', not as unknown", () => {
@@ -159,6 +171,18 @@ describe("parseBackupSchedules", () => {
     expect(
       parseBackupSchedules([row({ enabled: undefined })])?.[0].enabled,
     ).toBe(true);
+  });
+  it("reads save_s3 however Coolify spells it — and absent as false", () => {
+    // Same tinyint-with-no-cast story as `enabled`, opposite default: "this
+    // backup lands in S3" must never be claimed off a field the row lacks.
+    expect(parseBackupSchedules([row({ save_s3: 1 })])?.[0].saveS3).toBe(true);
+    expect(parseBackupSchedules([row({ save_s3: 0 })])?.[0].saveS3).toBe(false);
+    expect(parseBackupSchedules([row({ save_s3: false })])?.[0].saveS3).toBe(
+      false,
+    );
+    expect(
+      parseBackupSchedules([row({ save_s3: undefined })])?.[0].saveS3,
+    ).toBe(false);
   });
   it("accepts an integer retention however it is serialized", () => {
     expect(

@@ -1056,17 +1056,23 @@ express everything a Coolify holds, and a blueprint that omits those things
 without saying so is worse than no blueprint — in a disaster you would trust it
 and rebuild a *different box*. Per resource, it names what was seen and could not
 be written: `destination_id` (which Docker network — no destinations API in 4.1.2
-to resolve it to the UUID `destination_uuid:` wants, #21), service hostnames
-(settable/readable via the API and carried by `diff`/`apply` as `service_domains`
-since #72, but the same as backups below — `inventory --emit-draft` does not yet
-make the per-service `GET /services/{uuid}`, so a drafted service has none until
-you declare them), Basic Auth / custom Traefik labels,
-build and deploy command overrides, backup schedules (**a rebuild has no backups
-until you declare them** — *not* because they cannot be read, which is what this
-line used to say and #51 disproved, but because `inventory --emit-draft` has not
-yet been taught to read them: `GET /databases/{uuid}/backups` answers, and `diff`
-and `apply` now use it. Until the draft path does too, a blueprint still omits
-them and still says so), database kinds cast
+to resolve it to the UUID `destination_uuid:` wants, #21), a service whose
+hostnames could not be read (they **are captured** since #83 — the draft makes
+the per-service `GET /services/{uuid}` that `diff`/`apply` have made since
+#72/#81 and emits `service_domains` from `applications[].fqdn`, through the same
+projection the diff's read-back uses, so a drafted service diffs clean once
+applied; a service whose GET is unreachable or unrecognized is reported per
+resource instead — where a one-project diff fails closed, a whole-instance sweep
+reports and keeps going), Basic Auth / custom Traefik labels,
+build and deploy command overrides, what a backup schedule cannot fully say
+(the schedule itself **is captured** since #75 — the draft reads
+`GET /databases/{uuid}/backups`, the route `diff`/`apply` have used since #51,
+and a single enabled schedule becomes a real `backup: { frequency, retention }`
+block; what stays uncaptured is reported per database instead of guessed: the S3
+*target*, which reads back only as an unmappable `s3_storage_id` int, a DISABLED
+schedule — the manifest cannot say "disabled", and declaring the block would make
+the first `apply` re-enable it — a database carrying *several* schedules where a
+manifest declares one, and a read that failed outright), database kinds cast
 does not model (MySQL, MariaDB, MongoDB, KeyDB, Dragonfly, ClickHouse — named,
 never silently dropped), env var names a cast template cannot express, names
 **reserved by the platform** (`SOURCE_COMMIT`, `COOLIFY_*` — suppressed, never

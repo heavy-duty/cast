@@ -22,3 +22,5 @@ jobs:
       - run: npm test
       - name: installer is valid bash
         run: bash -n install.sh bin/cast scripts/*.sh
+      - name: labels state-machine tests
+        run: bash test/labels-reconcile.sh

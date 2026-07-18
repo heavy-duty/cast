@@ -76,6 +76,9 @@ gh label create "scope:secrets"        --color C5DEF5 --description "secrets, ag
 gh label create "scope:fleet"          --color C5DEF5 --description "fleet/inventory/server — placement" --force
 gh label create "scope:manifest"       --color C5DEF5 --description "manifest/resolve/envtemplate — the manifest language" --force
 gh label create "scope:coolify-api"    --color C5DEF5 --description "coolify.ts + OpenAPI reference — the client" --force
-gh label delete duplicate --yes; gh label delete invalid --yes; gh label delete question --yes
-gh label delete wontfix --yes; gh label delete "help wanted" --yes; gh label delete "good first issue" --yes
+# delete is not an upsert: a label that is already gone exits non-zero. Swallow
+# that, so this block converges on re-run instead of erroring after first success.
+for L in duplicate invalid question wontfix "help wanted" "good first issue"; do
+  gh label delete "$L" --yes 2>/dev/null || true
+done
 ```

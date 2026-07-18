@@ -24,3 +24,37 @@ jobs:
         run: bash -n install.sh bin/cast scripts/*.sh
       - name: labels state-machine tests
         run: bash test/labels-reconcile.sh
+
+  # The installer, proven by RUNNING it — CAST_INSTALL_SOURCE points it at
+  # this checkout, so CI proves the installer under review (the versioned
+  # layout, the current symlink, the PATH chain, the uninstall's absence
+  # assert), not a hand-built imitation of it. Box's CI installs box the
+  # same way. This is the one place the real npm ci + tsc build path runs
+  # end to end; the vitest installer tests cover the layout semantics
+  # offline with a shimmed npm.
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: install via install.sh, from this checkout
+        run: |
+          CAST_NO_MODIFY_PATH=1 CAST_INSTALL_SOURCE="$GITHUB_WORKSPACE" bash install.sh
+          # assert what landed: the layout, the chain, and that it answers
+          readlink -f "$HOME/.local/bin/cast" | grep '/versions/'
+          "$HOME/.local/bin/cast" --version
+          "$HOME/.local/bin/cast" versions
+      - name: converging no-op — a re-run changes nothing and builds nothing
+        run: |
+          CAST_NO_MODIFY_PATH=1 CAST_INSTALL_SOURCE="$GITHUB_WORKSPACE" bash install.sh \
+            | tee /tmp/rerun.log
+          grep -q 'already installed' /tmp/rerun.log
+      - name: uninstall --all — ends with the absence assert
+        run: |
+          CAST_YES=1 "$HOME/.local/bin/cast" uninstall --all
+          test ! -e "$HOME/.local/share/cast"
+          test ! -e "$HOME/.local/bin/cast"
+          test ! -L "$HOME/.local/bin/cast"

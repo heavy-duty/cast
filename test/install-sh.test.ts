@@ -330,11 +330,29 @@ describe("the shared gates cannot drift", () => {
     return text.slice(start, end + 2);
   }
 
-  for (const fn of ["valid_version", "pkg_version"]) {
+  for (const fn of ["valid_version", "pkg_version", "flip_current"]) {
     it(`${fn}() is byte-identical between install.sh and bin/cast`, () => {
       expect(extractFunction(INSTALL_SH, fn)).toBe(
         extractFunction(REAL_BIN_CAST, fn),
       );
+    });
+  }
+});
+
+describe("portability — cast runs on the operator's own machine, macOS included", () => {
+  // box#79/rig#36 could assume GNU userland and bash 4+ because boxes run
+  // Linux; cast cannot. These greps pin the two spellings that bit (or
+  // nearly bit) for real: `mv -T` (GNU-only — BSD/macOS mv has no -T, the
+  // flip now rides rename(2) via node) and `mapfile` (bash 4 — macOS ships
+  // bash 3.2). A reintroduction fails HERE, not on the first operator Mac.
+  for (const file of [INSTALL_SH, REAL_BIN_CAST]) {
+    const name = file.split("/").pop();
+    it(`${name} carries no GNU mv -T and no bash-4 mapfile`, () => {
+      const text = readFileSync(file, "utf8");
+      // "mv -T" as an invocation — the comments explaining WHY it is absent
+      // spell it "mv says … with -T", which this must not match.
+      expect(text).not.toMatch(/\bmv\s+-[A-Za-z]*T/);
+      expect(text).not.toMatch(/^\s*mapfile\b/m);
     });
   }
 });

@@ -79,6 +79,13 @@ command -v npm  >/dev/null 2>&1 || die "npm is required but was not found."
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$NODE_MAJOR" -ge 22 ] || die "node >=22.12 is required (found $(node -v))."
 
+# readlink -f is load-bearing across the layout (the launcher and every verb
+# resolve the symlink chain with it). GNU always has it; Apple's readlink
+# grew -f in macOS 12.3 (March 2022). Probe once and refuse loudly on the
+# museum pieces, instead of failing weirdly mid-flip later.
+readlink -f / >/dev/null 2>&1 \
+  || die "this system's readlink does not support -f (macOS older than 12.3?) — upgrade, or 'brew install coreutils'."
+
 # age is what decrypts the state repo's secrets — apply/diff shell out to it.
 if ! command -v age >/dev/null 2>&1; then
   warn "age not found — 'cast apply' and 'cast diff' will fail until it is installed."
@@ -92,13 +99,18 @@ else
   SRCDESC="$REPO@$REF"
 fi
 
-# Flip $DEST/current to versions/<v> atomically: build the new link beside it,
-# rename over. Plain ln -sfn is unlink+create — a window where current names
-# nothing and a concurrent 'cast' invocation dies mid-chain. bin/cast's
-# cmd_use flips with the same pattern.
-flip_current() {
-  ln -sfn "versions/$1" "$DEST/current.new.$$"
-  mv -Tf "$DEST/current.new.$$" "$DEST/current"
+# Flip <root>/current to versions/<v> atomically: build the new link beside
+# it, rename(2) over. Plain ln -sfn is unlink+create — a window where current
+# names nothing and a concurrent 'cast' invocation dies mid-chain. The rename
+# rides node's fs.renameSync because the coreutils spelling is not portable —
+# GNU mv says "replace, don't descend" with -T, BSD/macOS says -h — while
+# rename(2) itself is POSIX and node is a cast prerequisite on every
+# platform. bin/cast carries a byte-identical copy; test/install-sh.test.ts
+# diffs the two so they cannot drift.
+flip_current() {   # $1 = install root, $2 = version
+  ln -sfn "versions/$2" "$1/current.new.$$"
+  CAST_FLIP_NEW="$1/current.new.$$" CAST_FLIP_CUR="$1/current" \
+    node -e 'const fs = require("node:fs"); fs.renameSync(process.env.CAST_FLIP_NEW, process.env.CAST_FLIP_CUR);'
 }
 
 # --- migrate a pre-versioning flat install -----------------------------------
@@ -119,7 +131,7 @@ if [ -e "$DEST/bin/cast" ] && [ ! -d "$DEST/versions" ]; then
   mv "$DEST" "$staging"
   mkdir -p "$DEST/versions"
   mv "$staging" "$DEST/versions/$flat_ver"
-  flip_current "$flat_ver"
+  flip_current "$DEST" "$flat_ver"
   mkdir -p "$BINDIR"
   ln -sfn "$DEST/current/bin/cast" "$BINDIR/cast"
   log "migrated: it now lives at $DEST/versions/$flat_ver (still current)"
@@ -244,7 +256,7 @@ fi
 cur="$(readlink -f "$DEST/current" 2>/dev/null || true)"
 want="$(readlink -f "$VDIR")"
 if [ -z "$cur" ] || [ ! -d "$cur" ]; then
-  flip_current "$new_ver"
+  flip_current "$DEST" "$new_ver"
   log "default version: $new_ver"
 elif [ "$cur" = "$want" ]; then
   : # already the default — nothing to flip
@@ -255,7 +267,7 @@ elif [ "$newly_installed" -eq 0 ]; then
   log "the default stays $(basename "$cur") — 'cast use $new_ver' switches."
 else
   old_ver="$(basename "$cur")"
-  flip_current "$new_ver"
+  flip_current "$DEST" "$new_ver"
   log "default version switched: $old_ver -> $new_ver ('cast use $old_ver' switches back)"
 fi
 

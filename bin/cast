@@ -48,6 +48,20 @@ pkg_version() {
   CAST_PKG_PATH="$1/package.json" node -p 'require(process.env.CAST_PKG_PATH).version' 2>/dev/null || true
 }
 
+# Flip <root>/current to versions/<v> atomically: build the new link beside
+# it, rename(2) over. Plain ln -sfn is unlink+create — a window where current
+# names nothing and a concurrent 'cast' invocation dies mid-chain. The rename
+# rides node's fs.renameSync because the coreutils spelling is not portable —
+# GNU mv says "replace, don't descend" with -T, BSD/macOS says -h — while
+# rename(2) itself is POSIX and node is a cast prerequisite on every
+# platform. install.sh carries a byte-identical copy; test/install-sh.test.ts
+# diffs the two so they cannot drift.
+flip_current() {   # $1 = install root, $2 = version
+  ln -sfn "versions/$2" "$1/current.new.$$"
+  CAST_FLIP_NEW="$1/current.new.$$" CAST_FLIP_CUR="$1/current" \
+    node -e 'const fs = require("node:fs"); fs.renameSync(process.env.CAST_FLIP_NEW, process.env.CAST_FLIP_CUR);'
+}
+
 # The PATH symlinks that could ride this install: the one this invocation came
 # in on, CAST_BIN's, and the tier default's. Candidates only — every consumer
 # checks where a link actually points before touching it, so a symlink that is
@@ -99,9 +113,7 @@ cmd_use() {
   ir="$(install_root)" || die "this cast runs from a working tree ($ROOT), not a versioned install — nothing to switch"
   valid_version "$v" || die "not a sane version name: '$v' (a version is a directory name under versions/ — see 'cast versions')"
   [ -d "$ir/versions/$v" ] || die "no such version: $v (see 'cast versions')"
-  # An atomic flip, not unlink+create: ln -sfn leaves a window where current
-  # is missing; a rename over it does not.
-  ln -sfn "versions/$v" "$ir/current.new.$$" && mv -Tf "$ir/current.new.$$" "$ir/current"
+  flip_current "$ir" "$v"
   converge_bin_links "$ir"
   # Assert the EFFECTIVE result, not the intent: current must resolve to the
   # version asked for, and the chain's own binary must answer that version —
@@ -139,7 +151,7 @@ uninstall_confirm() {   # $1 = question
 # 'cast uninstall' — trees and symlinks, and it ENDS by PROVING the absence —
 # the last word is a re-check, not a hope.
 cmd_uninstall() {
-  local ir a ver="" all=0 force=0 cur p t leftover=""
+  local ir a ver="" all=0 force=0 cur p t leftover="" deduped=""
   local targets=()
   for a in "$@"; do
     case "$a" in
@@ -202,7 +214,10 @@ cmd_uninstall() {
     [ -n "$t" ] || t="$(readlink "$p" 2>/dev/null || true)"
     case "$t" in "$ir"/*) targets+=("$p") ;; esac
   done < <(bin_links)
-  mapfile -t targets < <(printf '%s\n' "${targets[@]}" | awk '!seen[$0]++')
+  # De-dup, portably: macOS ships bash 3.2, which has no mapfile.
+  deduped="$(printf '%s\n' "${targets[@]}" | awk '!seen[$0]++')"
+  targets=()
+  while IFS= read -r p; do targets+=("$p"); done <<<"$deduped"
 
   # rm's exit code is not the verdict — the absence assert below is (a
   # half-removed tree must be reported as INCOMPLETE by name, not as a crash).

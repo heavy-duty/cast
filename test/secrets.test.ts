@@ -36,15 +36,16 @@ describe("decryptSecrets", () => {
   });
 
   it("accepts a key path only this process can resolve — what <(pm read …) injects", () => {
-    // Process substitution hands cast a path like /proc/self/fd/11 that is
+    // Process substitution hands cast a path like /dev/fd/11 that is
     // meaningful only inside the process holding the fd. A spawned age does
     // not hold it, so passing the path through as `-i <path>` can never work;
     // the identity must travel to age on stdin. Opening the key here and
-    // pointing at our own fd reproduces exactly that shape.
+    // pointing at our own fd reproduces exactly that shape. /dev/fd works on
+    // both Linux (symlink to /proc/self/fd) and macOS, where /proc is absent.
     const { keyFile, enc } = ageFixture();
     const fd = openSync(keyFile, "r");
     try {
-      expect(decryptSecrets(enc, `/proc/self/fd/${fd}`)).toEqual({
+      expect(decryptSecrets(enc, `/dev/fd/${fd}`)).toEqual({
         MAILGUN_KEY: "mk-123",
         OPENROUTER_KEY: "or-456",
       });

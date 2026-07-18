@@ -434,6 +434,27 @@ function applicationSpec(
     );
   }
 
+  // is_static lives on Coolify 4.1.2's ApplicationSetting relation, which no
+  // read endpoint serializes (cast#68) — so on that Coolify the key is simply
+  // ABSENT here, and the `static: true` emission below can never fire, however
+  // the box is actually configured. The same predicate `diff` uses for its
+  // staticNotCompared escape hatch (cli.ts: `is_static == null`), applied to
+  // the draft's contract: a drafted static site would silently come back as a
+  // plain app (the #63 crash), so when the app even LOOKS static — a
+  // nixpacks/static pack serving a publish_directory — UNCAPTURED.md must name
+  // the flag as unreadable, not let its absence pass for `false`. A real
+  // boolean (a future Coolify) is handled below and says nothing here.
+  if (
+    r.raw.is_static == null &&
+    (pack === "nixpacks" || pack === "static") &&
+    r.raw.publish_directory
+  ) {
+    flag(
+      "is_static",
+      `this Coolify cannot say whether the app serves as a static site — is_static lives on the ApplicationSetting relation, which 4.1.2's read API never returns (cast#68) — and this app is plausibly static (${pack} pack with publish_directory ${String(r.raw.publish_directory)}). The draft carries no \`static: true\`; if the box has "Is it a static site?" checked, a rebuild from this draft would build and RUN it as a plain app (the #63 crash). Check the box in the Coolify UI (Build settings) and, if set, add \`static: true\` under \`build:\` yourself.`,
+    );
+  }
+
   return {
     source: {
       repo: repo ?? String(r.raw.git_repository ?? ""),

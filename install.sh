@@ -3,9 +3,8 @@ set -euo pipefail
 
 # cast installer — intended for: curl -fsSL .../install.sh | bash
 #
-# Downloads the cast repo tarball, builds it, and installs it into the
-# VERSIONED layout under $DEST (box#79's layout, ported the way rig#36
-# ported it):
+# Fetches a cast tree and installs it into the VERSIONED layout under $DEST
+# (box#79's layout, ported the way rig#36 ported it):
 #
 #   $DEST/versions/<version>/    one full tree per installed version
 #   $DEST/current -> versions/<version>        the default version
@@ -24,6 +23,25 @@ set -euo pipefail
 # The version IS the tree's package.json version — cast's single source of
 # truth (deliberately no separate VERSION file).
 #
+# WHICH tree, and whether it is built here, is the channel's business — three
+# channels from this one script (#96; box#83's design, plus the piece unique
+# to cast: the PREBUILT release asset, because cast is the one repo where the
+# source tarball is not the package):
+#
+#   CAST_REF unset      the latest RELEASE — the tag is resolved from the
+#                       releases/latest redirect, the download is that
+#                       release's prebuilt cast-<tag>.tgz asset (bin/,
+#                       compiled dist/, production node_modules/): no npm,
+#                       no tsc, no devDependencies on this machine
+#   CAST_REF=<tag>      that release, pinned — its asset first, source as
+#                       the fallback for a ref that has none
+#   CAST_REF=<branch>   the development tree, built from source here —
+#                       CAST_REF=main is the dev channel, and (with local
+#                       source installs) the one place npm is required
+#
+# Whatever the channel fetched still lands the same way: in versions/<its
+# package.json version>, with the current symlink flipped atomically.
+#
 # CAST_INSTALL_SOURCE=<dir-or-tarball> installs from a local tree instead of
 # downloading — for CI and the test suite, so what lands is the code under
 # review.
@@ -32,7 +50,7 @@ set -euo pipefail
 # needs node — it is an API client, never something a server installs.
 
 REPO="${CAST_REPO:-heavy-duty/cast}"
-REF="${CAST_REF:-main}"
+REF="${CAST_REF:-}" # empty = the latest release, resolved below
 DEST="${CAST_HOME:-$HOME/.local/share/cast}"
 if [ "$(id -u)" -eq 0 ]; then
   BINDIR="${CAST_BIN:-/usr/local/bin}"
@@ -66,15 +84,34 @@ pkg_version() {
   CAST_PKG_PATH="$1/package.json" node -p 'require(process.env.CAST_PKG_PATH).version' 2>/dev/null || true
 }
 
+# --- the release channels (#96; box#83's design, near-verbatim) --------------
+# resolve_latest_tag <owner/repo> — print the latest RELEASE tag, resolved by
+# following the releases/latest redirect and reading the Location header
+# (curl's %{redirect_url} is that header, parsed): no API, no token, no
+# rate-limit pain. A repo with no releases redirects to /releases — not to
+# /releases/tag/<tag> — so this returns 1 there instead of inventing a ref,
+# and the CALLER owns the loud story. test/release.test.ts drives the whole
+# installer, this function included, against a stubbed curl.
+resolve_latest_tag() {
+  local loc
+  loc="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "https://github.com/$1/releases/latest")" || return 1
+  case "$loc" in
+    */releases/tag/?*) printf '%s\n' "${loc##*/releases/tag/}" ;;
+    *) return 1 ;;
+  esac
+}
+
 # --- prerequisites -----------------------------------------------------------
 # curl only when something must be downloaded — a local CAST_INSTALL_SOURCE
 # needs none, which is what lets the test suite drive REAL installs offline.
+# npm is deliberately NOT required here: the release-asset channel installs a
+# tree that was built once, in CI. build_tree checks for it, in the only
+# paths that build (local source, and source downloads).
 if [ -z "${CAST_INSTALL_SOURCE:-}" ]; then
   command -v curl >/dev/null 2>&1 || die "curl is required but was not found."
 fi
 command -v tar  >/dev/null 2>&1 || die "tar is required but was not found."
 command -v node >/dev/null 2>&1 || die "node >=22.12 is required but was not found."
-command -v npm  >/dev/null 2>&1 || die "npm is required but was not found."
 
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$NODE_MAJOR" -ge 22 ] || die "node >=22.12 is required (found $(node -v))."
@@ -93,9 +130,25 @@ if ! command -v age >/dev/null 2>&1; then
   warn "  Fedora: sudo dnf install age | macOS: brew install age"
 fi
 
+# --- pick the channel --------------------------------------------------------
+# No CAST_REF → the latest release. While no release exists (cast cuts its
+# first, 0.1.0, right after #96 lands), this channel must FAIL, loudly and
+# with the way out — never silently fall back to main: "I installed the
+# latest release" must not quietly mean "I installed whatever main was that
+# second". Resolved before anything on disk is touched (the flat-install
+# migration included), so a refusal here has zero side effects.
 if [ -n "${CAST_INSTALL_SOURCE:-}" ]; then
   SRCDESC="local source $CAST_INSTALL_SOURCE"
 else
+  if [ -z "$REF" ]; then
+    log "resolving the latest release of $REPO"
+    if ! REF="$(resolve_latest_tag "$REPO")"; then
+      warn "could not resolve the latest release of $REPO — either no release exists yet, or GitHub was unreachable."
+      warn "(cast has no release until 0.1.0 is cut — heavy-duty/cast#96. Until then, install the development tree explicitly.)"
+      die "set CAST_REF: e.g.  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | CAST_REF=main bash"
+    fi
+    log "latest release: $REF"
+  fi
   SRCDESC="$REPO@$REF"
 fi
 
@@ -143,6 +196,7 @@ cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT
 
 # --- acquire the tree --------------------------------------------------------
+PREBUILT="" # set when the tree came from a release asset (already built)
 if [ -n "${CAST_INSTALL_SOURCE:-}" ]; then
   SRC="$CAST_INSTALL_SOURCE"
   INSTALLED_FROM="local:$SRC"
@@ -163,22 +217,51 @@ if [ -n "${CAST_INSTALL_SOURCE:-}" ]; then
     die "CAST_INSTALL_SOURCE is set but is neither a directory nor a tarball: $SRC"
   fi
 else
-  INSTALLED_FROM="$REPO@$REF"
-  URL="https://github.com/$REPO/archive/refs/heads/$REF.tar.gz"
   log "installing cast ($REPO@$REF)"
-  log "downloading $URL"
-  curl -fsSL "$URL" -o "$TMPDIR/cast.tar.gz" \
-    || die "failed to download $URL"
 
-  log "extracting archive"
-  tar -xzf "$TMPDIR/cast.tar.gz" -C "$TMPDIR" \
-    || die "failed to extract archive"
+  # A release's package is its PREBUILT asset (#96) — bin/, compiled dist/,
+  # production node_modules/, package.json, built once by release.yml — so
+  # the asset is tried first for every ref. Only a ref the OPERATOR named may
+  # fall back to source: a resolved latest release without its asset is a
+  # broken release, not a reason to start compiling here.
+  ASSET_URL="https://github.com/$REPO/releases/download/$REF/cast-$REF.tgz"
+  log "downloading $ASSET_URL"
+  if curl -fsSL "$ASSET_URL" -o "$TMPDIR/cast.tgz"; then
+    PREBUILT=1
+    INSTALLED_FROM="$REPO@$REF (release asset)"
+    log "extracting release asset"
+    tar -xzf "$TMPDIR/cast.tgz" -C "$TMPDIR" \
+      || die "failed to extract $ASSET_URL"
+  else
+    [ -n "${CAST_REF:-}" ] \
+      || die "release $REF has no cast-$REF.tgz asset (or GitHub was unreachable) — refusing to build the release from source. Report the broken release, or pick a ref yourself: CAST_REF=<tag> pins one, CAST_REF=main builds the development tree."
 
-  # GitHub names the archive's top dir <repo>-<ref> — deriving that name is
-  # guesswork (it broke for real at box's repo rename). The tarball has
-  # exactly ONE top-level directory: take the directory, whatever it is
-  # called, and let the bin/cast check below judge whether it is the right
-  # tree.
+    # The source fallback, tag first (the pin must win over a branch that
+    # happens to share its name), branch second — which keeps CAST_REF=main
+    # the dev channel. Source needs a build (build_tree below, the only
+    # place npm is used).
+    INSTALLED_FROM="$REPO@$REF"
+    got=""
+    for URL in "https://github.com/$REPO/archive/refs/tags/$REF.tar.gz" \
+               "https://github.com/$REPO/archive/refs/heads/$REF.tar.gz"; do
+      log "no prebuilt asset for '$REF' — trying source: $URL"
+      if curl -fsSL "$URL" -o "$TMPDIR/cast.tar.gz"; then
+        got="$URL"
+        break
+      fi
+    done
+    [ -n "$got" ] || die "failed to download $REPO@$REF — no release asset, and '$REF' is neither a tag nor a branch."
+
+    log "extracting archive"
+    tar -xzf "$TMPDIR/cast.tar.gz" -C "$TMPDIR" \
+      || die "failed to extract archive"
+  fi
+
+  # GitHub names a source archive's top dir <repo>-<ref> and release.yml
+  # stages the asset's as cast-<tag> — deriving either name is guesswork (it
+  # broke for real at box's repo rename). Both tarball shapes have exactly
+  # ONE top-level directory: take the directory, whatever it is called, and
+  # let the bin/cast check below judge whether it is the right tree.
   EXTRACTED="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 fi
 [ -n "${EXTRACTED:-}" ] || die "could not find the source tree in $SRCDESC"
@@ -191,6 +274,14 @@ new_ver="$(pkg_version "$EXTRACTED")"
 [ -n "$new_ver" ] || die "source has no package.json version — cannot install it as a version"
 valid_version "$new_ver" || die "the source's package.json version is not a sane directory name: '$new_ver'"
 
+# Sanity-check a prebuilt asset BEFORE anything lands in $DEST: a runnable
+# tree carries the compiled dist/ and its production node_modules/. Refusing
+# here leaves whatever is already installed exactly as it was.
+if [ -n "$PREBUILT" ]; then
+  { [ -f "$EXTRACTED/dist/cli.js" ] && [ -d "$EXTRACTED/node_modules" ]; } \
+    || die "the release asset is not a runnable cast tree (missing dist/ or node_modules/) — refusing to install it. Report the broken release, or build from source: CAST_REF=main."
+fi
+
 set_exec() {   # $1 = a cast tree: the executable bits install.sh owns
   chmod +x "$1/bin/cast"
   if [ -d "$1/scripts" ]; then
@@ -200,8 +291,16 @@ set_exec() {   # $1 = a cast tree: the executable bits install.sh owns
 
 # Build the tree IN PLACE, in the temp workspace — deps + tsc, then drop the
 # dev deps. Landing in versions/ happens after, by rename: a half-built tree
-# never sits where the version chain can resolve to it.
+# never sits where the version chain can resolve to it. A PREBUILT release
+# asset skips this whole step — that build already happened, once, in CI —
+# which is also why npm is checked here and not with the prerequisites: the
+# source paths are the only ones that need it.
 build_tree() {   # $1 = the tree to build
+  if [ -n "$PREBUILT" ]; then
+    log "prebuilt release asset — nothing to build here"
+    return 0
+  fi
+  command -v npm >/dev/null 2>&1 || die "npm is required to build cast from source (only the release-asset channel installs without it)."
   log "building (npm ci && npm run build)"
   ( cd "$1" && npm ci --silent && npm run build --silent ) \
     || die "build failed"

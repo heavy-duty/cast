@@ -16,8 +16,34 @@ infrastructure. It reads what you point it at and stores nothing, ever.
 curl -fsSL https://raw.githubusercontent.com/heavy-duty/cast/main/install.sh | bash
 ```
 
+That installs the **latest release**, and a cast release is a **prebuilt
+asset**: the installer resolves the newest tag by following GitHub's
+`releases/latest` redirect (no API, no token) and downloads that release's
+`cast-<tag>.tgz` — `bin/`, compiled `dist/`, production `node_modules/`,
+`package.json`, built once in CI — so **no `npm ci`, no `tsc`, no
+devDependencies ever run on your machine**. Three channels from the same
+script; `CAST_REF` picks
+([#96](https://github.com/heavy-duty/cast/issues/96)):
+
+```sh
+curl -fsSL .../install.sh | bash                    # the latest release (prebuilt)
+curl -fsSL .../install.sh | CAST_REF=0.1.0 bash     # pinned to a release
+curl -fsSL .../install.sh | CAST_REF=main bash      # the development tree, built from source
+```
+
+A set ref tries its release asset first, then falls back to source —
+`refs/tags` before `refs/heads`, so a tag outranks a branch of the same name
+— and only the source path needs `npm`.
+
+> **Transitional, until 0.1.0 is cut** (right after cast#96 lands): cast has
+> no GitHub release yet, so the default channel has nothing to resolve — it
+> **fails loudly** naming `CAST_REF=main` as the way to install today, and
+> never silently falls back to main. Once 0.1.0 exists, the plain
+> `curl | bash` above is the normal path.
+
 Needs `node` >= 22.12 and [`age`](https://github.com/FiloSottile/age) (secrets
-are decrypted by shelling out to it). Re-run any time to upgrade. Unlike rig —
+are decrypted by shelling out to it); `npm` only if you install from source.
+Re-run any time to upgrade. Unlike rig —
 which is pure bash so it can run on a bare box — cast runs on **your** machine:
 it is an API client, and a server should never install it.
 
@@ -33,10 +59,13 @@ cast uninstall [<version>|--all]   # remove one non-current version, or everythi
 ```
 
 Re-running the installer with an already-installed version is a converging
-no-op (`CAST_REINSTALL=1` rebuilds and replaces that version's tree); a new
-version installs beside the old one and becomes the default — `cast use <old>`
+no-op (`CAST_REINSTALL=1` reinstalls that version's tree); a new version
+installs beside the old one and becomes the default — `cast use <old>`
 switches back. A pre-versioning flat install is migrated in place on the next
-run. `CAST_REF=<branch>` installs from another branch instead of `main`.
+run. The channel only decides **which** tree arrives and whether it is built
+here; every channel lands it the same way, in `versions/<its package.json
+version>` — a prebuilt `0.1.0` asset and a `CAST_REF=main` source build sit
+side by side like any two versions.
 
 The installer symlinks `cast` into `~/.local/bin` (or `/usr/local/bin` as root)
 and, if that directory is not already on your `PATH`, appends it to your shell

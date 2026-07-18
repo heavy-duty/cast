@@ -279,8 +279,11 @@ describe("install.sh — the versioned layout", () => {
 
   it("downloads refs/heads/<ref> when no local source is given", async () => {
     const sb = sandbox();
-    // A curl shim standing in for GitHub: serves the fixture tarball and
-    // logs the URL it was asked for.
+    // A curl shim standing in for GitHub: logs every URL asked for, and
+    // serves the fixture tarball ONLY for the refs/heads URL — a branch has
+    // no release asset and no tag, which is exactly the shape CAST_REF=main
+    // meets in the wild. (The channels themselves — assets, refusals, the
+    // latest-release resolution — are test/release.test.ts's.)
     sourceTree(sb, "0.5.0");
     await run("tar", [
       "-C",
@@ -302,15 +305,22 @@ for a in "$@"; do
   prev="$a"
 done
 printf '%s\\n' "$url" >> "${curlLog}"
-cp "${join(sb.root, "src.tgz")}" "$out"
+case "$url" in
+  */archive/refs/heads/*) cp "${join(sb.root, "src.tgz")}" "$out" ;;
+  *) exit 22 ;;
+esac
 `,
     );
     chmodSync(join(stubs, "curl"), 0o755);
 
     const { stdout } = await install(sb, { CAST_REF: "dev-branch" });
-    expect(readFileSync(curlLog, "utf8").trim()).toBe(
+    // The channel's try-order, in full: the release asset, then refs/tags,
+    // then refs/heads — where a branch finally answers.
+    expect(readFileSync(curlLog, "utf8").trim().split("\n")).toEqual([
+      "https://github.com/heavy-duty/cast/releases/download/dev-branch/cast-dev-branch.tgz",
+      "https://github.com/heavy-duty/cast/archive/refs/tags/dev-branch.tar.gz",
       "https://github.com/heavy-duty/cast/archive/refs/heads/dev-branch.tar.gz",
-    );
+    ]);
     expect(stdout).toContain("installing cast (heavy-duty/cast@dev-branch)");
     expect(
       readFileSync(join(sb.dest, "versions/0.5.0/INSTALLED_FROM"), "utf8"),

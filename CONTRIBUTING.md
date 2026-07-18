@@ -38,6 +38,37 @@ labels tell you where everything is without opening anything.
    agreement is the author's judgment, so the author makes the request.
 7. **Checks must be green**: `npm run check`, `npm run build`, and
    `npm test` locally mirror what CI runs.
+8. **Feature PRs land their changelog entry as part of the PR** (box's
+   convention): add it under `CHANGELOG.md`'s `## Unreleased` heading —
+   that section becomes the release notes verbatim when a release is cut.
+
+## Releasing
+
+A release is a PR, then a tag ([#96](https://github.com/heavy-duty/cast/issues/96);
+box#83's design):
+
+1. A small PR — `release: X.Y.Z`, labeled `release` — bumps `package.json`'s
+   `version` (and `package-lock.json`; `npm install --package-lock-only`
+   keeps them in step) and stamps `CHANGELOG.md`'s Unreleased section as
+   `## X.Y.Z — YYYY-MM-DD`. CI green on it, same loop as any PR.
+2. Merge, tag the merge commit bare `X.Y.Z` (no `v` prefix — box's tag
+   scheme), push the tag. [release.yml](.github/workflows/release.yml)
+   takes it from there: it asserts tag == `package.json` version (a
+   mismatch fails loudly and creates nothing), extracts that version's
+   changelog section as the release body
+   ([.github/scripts/release-notes.sh](.github/scripts/release-notes.sh) —
+   a missing or empty section refuses the release), builds the package once
+   (`npm ci && npm run build && npm prune --omit=dev`), and attaches the
+   runnable tree — `bin/`, `dist/`, production `node_modules/`,
+   `package.json` — as `cast-X.Y.Z.tgz`. That asset is what the installer's
+   release channels download: the build happens once, in CI, never on an
+   operator's machine.
+3. **Right after the release, a follow-up PR bumps `package.json` to
+   `X.Y.(Z+1)-dev`** (and `package-lock.json` with it) — box#90's step of
+   the family ritual. Installs are versioned by the tree's `package.json`
+   version, so a `CAST_REF=main` install between releases must land as
+   `versions/X.Y.(Z+1)-dev`, never as `versions/X.Y.Z` — main's tree must
+   not impersonate the release it merely descends from.
 
 ## Labels — who sets what
 

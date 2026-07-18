@@ -1,0 +1,68 @@
+name: release
+# The release publisher (#96; box#83's design), on a bare X.Y.Z tag push —
+# no 'v' prefix, box's and rig's tag scheme. Two facts, then one act: the
+# tag must name package.json's own version (a mismatch fails loudly and
+# creates NOTHING — a wrong release is worse than a missing one), and the
+# release body is that version's CHANGELOG.md section
+# (.github/scripts/release-notes.sh, shared with test/release.test.ts) —
+# the curated prose, not the generated PR list.
+#
+# Where cast differs from its siblings: the release carries a PREBUILT
+# asset. box and rig are pure bash, so GitHub's source tarball for the tag
+# IS their package; cast's source tarball is not runnable — it needs npm ci
+# and tsc first. So the build happens ONCE, here, and the asset is the
+# runnable tree: bin/, dist/, production node_modules/, package.json.
+on:
+  push:
+    # Every tag, not a shape filter (box's and rig's precedent): a tag that
+    # mismatches package.json — a habitual v0.1.0, a typo — must fail the
+    # assert LOUDLY below, not be silently skipped by a pattern that didn't
+    # match.
+    tags: ["**"]
+
+permissions:
+  contents: write # gh release create
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: the tag must name package.json's version
+        run: |
+          ver="$(node -p 'require("./package.json").version')"
+          if [ "$GITHUB_REF_NAME" != "$ver" ]; then
+            echo "tag '$GITHUB_REF_NAME' does not match package.json version '$ver' — creating nothing." >&2
+            echo "A release is a PR, then a tag (#96): the release PR bumps package.json (and package-lock.json) and stamps the changelog; the tag goes on its MERGE commit. Delete this tag and re-tag the right commit." >&2
+            exit 1
+          fi
+      - name: release notes — the version's own CHANGELOG.md section
+        # release-notes.sh fails loudly on a missing/empty section, which
+        # fails the release here — before anything is created.
+        run: |
+          bash .github/scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+      - name: build the prebuilt dist asset
+        # Build ONCE, in CI — the whole point of the asset (#96): the
+        # installer's release channels never run npm or tsc. Deliberately no
+        # check/tests here: ci.yml already gated the merge commit this tag
+        # names, and the test suite needs `age`, which this runner does not
+        # install. The staged tree is exactly what an install needs to run.
+        run: |
+          npm ci
+          npm run build
+          npm prune --omit=dev
+          mkdir -p "$RUNNER_TEMP/stage/cast-$GITHUB_REF_NAME"
+          cp -R bin dist node_modules package.json "$RUNNER_TEMP/stage/cast-$GITHUB_REF_NAME/"
+          tar -C "$RUNNER_TEMP/stage" -czf "$RUNNER_TEMP/cast-$GITHUB_REF_NAME.tgz" "cast-$GITHUB_REF_NAME"
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" \
+            "$RUNNER_TEMP/cast-$GITHUB_REF_NAME.tgz"

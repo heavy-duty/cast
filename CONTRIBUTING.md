@@ -38,21 +38,6 @@ labels tell you where everything is without opening anything.
    agreement is the author's judgment, so the author makes the request.
 7. **Checks must be green**: `npm run check`, `npm run build`, and
    `npm test` locally mirror what CI runs.
-8. **Feature PRs carry their changelog entry.** Add what changed to
-   `CHANGELOG.md`'s `## Unreleased` section as part of the PR — release
-   notes are written when the change lands, not reconstructed at release
-   time.
-
-## Releasing
-
-A release is a PR, then a tag (cast#96; the flow box#83 anchors for the
-family). A `release: X.Y.Z` PR bumps `package.json` and stamps the
-`## Unreleased` section with the version and date. Merge it, tag the merge
-commit bare `X.Y.Z` (no `v` prefix), push the tag —
-[release.yml](.github/workflows/release.yml) asserts the tag matches
-`package.json`, builds `cast-X.Y.Z.tgz` once in CI, and creates the GitHub
-release with that section as the body and the tarball attached. The
-installer's default channel serves that asset.
 
 ## Labels — who sets what
 

@@ -1,11 +1,246 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Thin launcher — the CLI itself is dist/cli.js (built from src/ by tsc).
-# Kept as a shim so `cast` lands on PATH the same way `rig` does, without
-# requiring a global npm install.
+# Launcher — the CLI itself is dist/cli.js (built from src/ by tsc), plus
+# the VERSIONED-INSTALL verbs (versions / use / uninstall), which live here
+# in bash because they manage the layout the node tree sits in: they must
+# work even when the default version's dist/ is broken — that is exactly
+# when you need them.
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+log() { printf 'cast: %s\n' "$*"; }
+warn() { printf 'cast: WARNING: %s\n' "$*" >&2; }
+die() { printf 'cast: ERROR: %s\n' "$*" >&2; exit 1; }
+
+# --- the versioned install (box#79's layout, ported the way rig#36 did) ------
+# install.sh lands each version at <install-root>/versions/<v>, with a
+# 'current' symlink naming the default and $BINDIR/cast pointing through it.
+# $ROOT (readlink -f, above) already resolved the whole chain, so a versioned
+# install always runs from .../versions/<v> — and a git checkout does not,
+# which is how these verbs know to refuse instead of uninstalling somebody's
+# working copy.
+install_root() {
+  local vdir; vdir="$(dirname "$ROOT")"
+  [ "$(basename "$vdir")" = versions ] || return 1
+  dirname "$vdir"
+}
+
+# A version is a DIRECTORY NAME under versions/ — nothing else. One strict
+# gate for every caller that builds a path from one (the installer's new_ver,
+# migration's flat_ver, and bin/cast's 'use'/single-version uninstall): only
+# [A-Za-z0-9._+-], no leading '.' or '-'. That forbids '/', '..'-escapes,
+# spaces and option-lookalikes by construction — a crafted version dies HERE,
+# never in an rm -rf or an ln. install.sh carries a byte-identical copy;
+# test/install-sh.test.ts diffs the two so the gates cannot drift.
+valid_version() {
+  case "$1" in
+    ''|.*|-*) return 1 ;;
+    *[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# The tree's package.json version, or empty — cast's version lives there
+# (deliberately no separate VERSION file), read via node, never by regexing
+# JSON. The path travels by env var so no filename can break the quoting.
+pkg_version() {
+  CAST_PKG_PATH="$1/package.json" node -p 'require(process.env.CAST_PKG_PATH).version' 2>/dev/null || true
+}
+
+# The PATH symlinks that could ride this install: the one this invocation came
+# in on, CAST_BIN's, and the tier default's. Candidates only — every consumer
+# checks where a link actually points before touching it, so a symlink that is
+# somebody else's (another install root, a hand-rolled wrapper) is never moved.
+bin_links() {
+  local c=()
+  [ -L "${BASH_SOURCE[0]}" ] && c+=("${BASH_SOURCE[0]}")
+  [ -n "${CAST_BIN:-}" ] && c+=("$CAST_BIN/cast")
+  if [ "$(id -u)" -eq 0 ]; then c+=(/usr/local/bin/cast); else c+=("$HOME/.local/bin/cast"); fi
+  printf '%s\n' "${c[@]}" | awk '!seen[$0]++'
+}
+
+converge_bin_links() {   # $1 = install root: point our PATH symlinks through current
+  local ir="$1" p t
+  while IFS= read -r p; do
+    [ -L "$p" ] || continue
+    t="$(readlink -f "$p" 2>/dev/null || true)"
+    [ -n "$t" ] || t="$(readlink "$p" 2>/dev/null || true)"
+    case "$t" in
+      "$ir"/*) ln -sfn "$ir/current/bin/cast" "$p" ;;
+    esac
+  done < <(bin_links)
+}
+
+cmd_versions() {
+  local ir cur d v mark
+  ir="$(install_root)" || die "this cast runs from a working tree ($ROOT), not a versioned install — nothing to list"
+  cur="$(readlink -f "$ir/current" 2>/dev/null || true)"
+  echo "VERSIONS  ($ir)"
+  for d in "$ir/versions"/*/; do
+    [ -d "$d" ] || continue
+    v="$(basename "$d")"
+    mark=""
+    [ "$(readlink -f "$d")" = "$cur" ] && mark=" (current)"
+    [ "$(readlink -f "$d")" = "$ROOT" ] && mark="$mark (running)"
+    printf '  %s%s\n' "$v" "$mark"
+  done
+  echo
+  echo "switch the default:  cast use <version>"
+  echo "install another:     re-run install.sh (versions land side by side)"
+}
+
+cmd_use() {
+  local v="${1:-}" ir eff expect out
+  if [ -z "$v" ]; then
+    printf 'cast: use needs a version (see: cast versions)\n' >&2
+    exit 2
+  fi
+  ir="$(install_root)" || die "this cast runs from a working tree ($ROOT), not a versioned install — nothing to switch"
+  valid_version "$v" || die "not a sane version name: '$v' (a version is a directory name under versions/ — see 'cast versions')"
+  [ -d "$ir/versions/$v" ] || die "no such version: $v (see 'cast versions')"
+  # An atomic flip, not unlink+create: ln -sfn leaves a window where current
+  # is missing; a rename over it does not.
+  ln -sfn "versions/$v" "$ir/current.new.$$" && mv -Tf "$ir/current.new.$$" "$ir/current"
+  converge_bin_links "$ir"
+  # Assert the EFFECTIVE result, not the intent: current must resolve to the
+  # version asked for, and the chain's own binary must answer that version —
+  # a flip that "worked" while the operator's cast still runs the old tree is
+  # exactly the flakiness this verb exists to end.
+  eff="$(basename "$(readlink -f "$ir/current" 2>/dev/null || true)")"
+  [ "$eff" = "$v" ] || die "the flip did not take — current resolves to '${eff:-nothing}', not $v"
+  expect="$(pkg_version "$ir/versions/$v")"
+  if [ -n "$expect" ]; then
+    out="$("$ir/current/bin/cast" --version 2>&1 || true)"
+    case "$out" in
+      *"$expect"*) : ;;
+      *) die "current/bin/cast answers '$out', not version $expect — the symlink chain is broken" ;;
+    esac
+  fi
+  log "switched to $v (current -> versions/$v)"
+}
+
+# The uninstall's own confirmation: --force, or CAST_YES=1, or a TTY. CAST_YES
+# is the installer-family consent contract — how automation says yes without
+# a terminal; without any of the three we refuse rather than assume consent.
+uninstall_confirm() {   # $1 = question
+  [ "$force" -eq 1 ] && return 0
+  [ -n "${CAST_YES:-}" ] && return 0
+  if [ ! -t 0 ]; then
+    printf 'cast: refusing to %s without --force (no terminal to confirm on; CAST_YES=1 also means yes)\n' "$1" >&2
+    exit 2
+  fi
+  local reply
+  printf 'cast: %s? [y/N] ' "$1"
+  read -r reply
+  case "$reply" in y|Y|yes|YES|Yes) return 0 ;; *) die "aborted." ;; esac
+}
+
+# 'cast uninstall' — trees and symlinks, and it ENDS by PROVING the absence —
+# the last word is a re-check, not a hope.
+cmd_uninstall() {
+  local ir a ver="" all=0 force=0 cur p t leftover=""
+  local targets=()
+  for a in "$@"; do
+    case "$a" in
+      --all) all=1 ;;
+      --force) force=1 ;;
+      -*)
+        printf 'cast: unknown option: %s\n' "$a" >&2
+        exit 2
+        ;;
+      *)
+        if [ -n "$ver" ]; then
+          printf 'cast: uninstall takes one version, or --all\n' >&2
+          exit 2
+        fi
+        ver="$a"
+        ;;
+    esac
+  done
+  ir="$(install_root)" || die "this cast runs from a working tree ($ROOT), not a versioned install — nothing to uninstall (a checkout is removed with plain rm)"
+  [ -w "$ir" ] || die "cannot write $ir — uninstall as the user that installed it (or root: sudo cast uninstall)"
+
+  # -- one version -----------------------------------------------------------
+  if [ -n "$ver" ] && [ "$all" -eq 0 ]; then
+    valid_version "$ver" || die "not a sane version name: '$ver' (a version is a directory name under versions/ — see 'cast versions')"
+    [ -d "$ir/versions/$ver" ] || die "no such version: $ver (see 'cast versions')"
+    cur="$(basename "$(readlink -f "$ir/current" 2>/dev/null || true)")"
+    # A broken current makes the CURRENT guard below unfireable (cur empty
+    # when the link is missing; cur naming a non-directory when it dangles —
+    # readlink -f resolves a link whose last component does not exist). Heal
+    # first, then decide; never delete around a broken default.
+    { [ -n "$cur" ] && [ -d "$ir/versions/$cur" ]; } \
+      || die "current is dangling — 'cast use <version>' to repoint the default first (refusing to remove versions while it is broken)"
+    [ "$ver" != "$cur" ] || die "$ver is the CURRENT version — 'cast use <other>' first, or 'cast uninstall --all' for everything"
+    uninstall_confirm "remove cast version $ver from $ir"
+    # rm's exit code is not the verdict — the absence re-check below is (a
+    # half-removed tree must be reported as INCOMPLETE, not as a crash).
+    rm -rf "${ir:?}/versions/$ver" || true
+    if [ -e "$ir/versions/$ver" ] || [ -L "$ir/versions/$ver" ]; then
+      echo "cast: uninstall INCOMPLETE — still present: $ir/versions/$ver" >&2
+      exit 1
+    fi
+    log "removed version $ver (the default stays $cur)"
+    return 0
+  fi
+  if [ -n "$ver" ]; then
+    printf 'cast: a version and --all together is ambiguous\n' >&2
+    exit 2
+  fi
+
+  # -- everything (bare 'cast uninstall' and '--all' both mean all of it) ----
+  uninstall_confirm "remove the ENTIRE cast install at $ir (every version)"
+
+  # The removal set, gathered BEFORE anything is deleted, so the absence
+  # assert below re-checks exactly what was promised gone. PATH symlinks are
+  # removed only when they resolve into (or dangle at) THIS install root.
+  targets+=("$ir")
+  while IFS= read -r p; do
+    [ -L "$p" ] || continue
+    t="$(readlink -f "$p" 2>/dev/null || true)"
+    [ -n "$t" ] || t="$(readlink "$p" 2>/dev/null || true)"
+    case "$t" in "$ir"/*) targets+=("$p") ;; esac
+  done < <(bin_links)
+  mapfile -t targets < <(printf '%s\n' "${targets[@]}" | awk '!seen[$0]++')
+
+  # rm's exit code is not the verdict — the absence assert below is (a
+  # half-removed tree must be reported as INCOMPLETE by name, not as a crash).
+  for p in "${targets[@]}"; do rm -rf "$p" || true; done
+
+  # END WITH THE ABSENCE ASSERT: every path re-checked — file, dir OR symlink.
+  # A leftover makes this exit 1 by name; "uninstalled" is a claim, and claims
+  # get verified.
+  for p in "${targets[@]}"; do
+    if [ -e "$p" ] || [ -L "$p" ]; then leftover="$leftover $p"; fi
+  done
+  if [ -n "$leftover" ]; then
+    echo "cast: uninstall INCOMPLETE — still present:$leftover" >&2
+    echo "cast: remove them by hand, and re-check each path is really gone." >&2
+    exit 1
+  fi
+  echo "cast: uninstalled — removed:"
+  for p in "${targets[@]}"; do echo "cast:   · $p"; done
+}
+
+# --- dispatch: layout verbs here, everything else is dist/cli.js -------------
+case "${1:-}" in
+  versions)
+    shift
+    cmd_versions "$@"
+    exit 0
+    ;;
+  use)
+    shift
+    cmd_use "$@"
+    exit 0
+    ;;
+  uninstall)
+    shift
+    cmd_uninstall "$@"
+    exit 0
+    ;;
+esac
 
 command -v node >/dev/null 2>&1 || {
   printf 'cast: node (>=22.12) is required but was not found.\n' >&2

@@ -126,6 +126,9 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
        cast smoke     <org>/<repo> --env <env> [--project <name>] [--environment <name>]
        cast team [--env <env>]
+       cast versions                                      # list installed versions
+       cast use <version>                                 # switch the default version
+       cast uninstall [<version>|--all] [--force]         # remove versions (CAST_YES=1 skips the prompt)
        cast --version                                     # version + install root
 
   --state <dir>   the state checkout holding environments.yaml, secrets/ and
@@ -1302,13 +1305,13 @@ async function runProject(
 }
 
 // The version lives in package.json — the tree's single source of truth
-// (cast#96, deliberately no separate VERSION file). dist/cli.js sits one
-// level below it in a source checkout and in an installed release asset
-// alike, so resolving from import.meta.url answers for both without
-// caring how this tree got here. The install root rides along in the
-// output (the family's shape — rig prints its ROOT too) because "which
-// cast is this" and "where does it run from" are the same question when
-// several trees exist on one machine.
+// (deliberately no separate VERSION file; the ecosystem already has one).
+// dist/cli.js sits one level below it in a source checkout and in an
+// installed versions/<v> tree alike, so resolving from import.meta.url
+// answers for both without caring how this tree got here. The install
+// root rides along in the output (the family's shape — rig prints its
+// ROOT too) because "which cast is this" and "where does it run from"
+// are the same question once versions install side by side.
 function formatVersion(): string {
   const pkgPath = fileURLToPath(new URL("../package.json", import.meta.url));
   const version: unknown = JSON.parse(readFileSync(pkgPath, "utf8")).version;

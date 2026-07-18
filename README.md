@@ -21,16 +21,22 @@ are decrypted by shelling out to it). Re-run any time to upgrade. Unlike rig —
 which is pure bash so it can run on a bare box — cast runs on **your** machine:
 it is an API client, and a server should never install it.
 
-By default that installs the **latest release**: a prebuilt `cast-X.Y.Z.tgz`
-asset built once in CI — nothing compiles on your machine, and
-`cast --version` names exactly what you got. `CAST_REF` selects the other
-channels:
+Installs are **versioned**, the same layout box and rig use: each install
+lands at `~/.local/share/cast/versions/<version>` (the version is the tree's
+`package.json` version), a `current` symlink names the default, and the
+`cast` on your PATH points through it. Versions install side by side:
 
-| | channel | what happens |
-|---|---|---|
-| unset | latest release | the newest tag's prebuilt asset |
-| `CAST_REF=0.1.0` | pinned | that release's prebuilt asset |
-| `CAST_REF=main` | dev | that ref's source tarball, built here (`npm ci` + `tsc` — needs `npm`) |
+```sh
+cast versions          # list what is installed, marking (current) and (running)
+cast use <version>     # switch the default — atomic, then asserted
+cast uninstall [<version>|--all]   # remove one non-current version, or everything
+```
+
+Re-running the installer with an already-installed version is a converging
+no-op (`CAST_REINSTALL=1` rebuilds and replaces that version's tree); a new
+version installs beside the old one and becomes the default — `cast use <old>`
+switches back. A pre-versioning flat install is migrated in place on the next
+run. `CAST_REF=<branch>` installs from another branch instead of `main`.
 
 The installer symlinks `cast` into `~/.local/bin` (or `/usr/local/bin` as root)
 and, if that directory is not already on your `PATH`, appends it to your shell

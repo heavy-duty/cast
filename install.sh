@@ -3,23 +3,36 @@ set -euo pipefail
 
 # cast installer — intended for: curl -fsSL .../install.sh | bash
 #
-# Three channels from one script (cast#96, the flow shared with box#83):
+# Downloads the cast repo tarball, builds it, and installs it into the
+# VERSIONED layout under $DEST (box#79's layout, ported the way rig#36
+# ported it):
 #
-#   CAST_REF unset      → the latest GitHub release's prebuilt asset
-#                         (cast-X.Y.Z.tgz). No npm ci, no tsc, no
-#                         devDependencies on this machine — the build
-#                         happened once, in CI, on the tag.
-#   CAST_REF=X.Y.Z      → that release's asset, when one exists — a pin.
-#   CAST_REF=<branch>   → build from source: the repo tarball for that
-#                         ref (tags tried before branches), npm ci + tsc
-#                         here. CAST_REF=main is the dev channel.
+#   $DEST/versions/<version>/    one full tree per installed version
+#   $DEST/current -> versions/<version>        the default version
+#   $BINDIR/cast  -> $DEST/current/bin/cast    the PATH entry
 #
-# Re-run any time to upgrade. Unlike rig (pure bash, runs on bare boxes),
-# cast runs on YOUR machine and needs node — it is an API client, never
-# something a server installs.
+# Versions install side by side: `cast versions` lists them, `cast use <v>`
+# switches the default, `cast uninstall` removes them. Re-running with an
+# already-installed version is a converging no-op (CAST_REINSTALL=1 replaces
+# that version's tree); a NEW version installs beside the old one and becomes
+# the default. cast neither refuses nor warns where box refuses and rig
+# warns: box protects live boxes and rig a converged host, but cast is an
+# API client — flipping its version strands nothing on this machine, and
+# `cast use <old>` is always one command away. A pre-versioning flat tree is
+# migrated in place, so upgrading is seamless.
+#
+# The version IS the tree's package.json version — cast's single source of
+# truth (deliberately no separate VERSION file).
+#
+# CAST_INSTALL_SOURCE=<dir-or-tarball> installs from a local tree instead of
+# downloading — for CI and the test suite, so what lands is the code under
+# review.
+#
+# Unlike rig (pure bash, runs on bare boxes), cast runs on YOUR machine and
+# needs node — it is an API client, never something a server installs.
 
 REPO="${CAST_REPO:-heavy-duty/cast}"
-REF="${CAST_REF:-}"
+REF="${CAST_REF:-main}"
 DEST="${CAST_HOME:-$HOME/.local/share/cast}"
 if [ "$(id -u)" -eq 0 ]; then
   BINDIR="${CAST_BIN:-/usr/local/bin}"
@@ -31,10 +44,37 @@ log() { printf 'cast-install: %s\n' "$*"; }
 warn() { printf 'cast-install: WARNING: %s\n' "$*" >&2; }
 die() { printf 'cast-install: ERROR: %s\n' "$*" >&2; exit 1; }
 
+# A version is a DIRECTORY NAME under versions/ — nothing else. One strict
+# gate for every caller that builds a path from one (the installer's new_ver,
+# migration's flat_ver, and bin/cast's 'use'/single-version uninstall): only
+# [A-Za-z0-9._+-], no leading '.' or '-'. That forbids '/', '..'-escapes,
+# spaces and option-lookalikes by construction — a crafted version dies HERE,
+# never in an rm -rf or an ln. bin/cast carries a byte-identical copy;
+# test/install-sh.test.ts diffs the two so the gates cannot drift.
+valid_version() {
+  case "$1" in
+    ''|.*|-*) return 1 ;;
+    *[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# The tree's package.json version, or empty. Read via node (a prerequisite
+# anyway) — never by regexing JSON. The path travels by env var, not by
+# splicing it into the expression, so no filename can break the quoting.
+pkg_version() {
+  CAST_PKG_PATH="$1/package.json" node -p 'require(process.env.CAST_PKG_PATH).version' 2>/dev/null || true
+}
+
 # --- prerequisites -----------------------------------------------------------
-command -v curl >/dev/null 2>&1 || die "curl is required but was not found."
+# curl only when something must be downloaded — a local CAST_INSTALL_SOURCE
+# needs none, which is what lets the test suite drive REAL installs offline.
+if [ -z "${CAST_INSTALL_SOURCE:-}" ]; then
+  command -v curl >/dev/null 2>&1 || die "curl is required but was not found."
+fi
 command -v tar  >/dev/null 2>&1 || die "tar is required but was not found."
 command -v node >/dev/null 2>&1 || die "node >=22.12 is required but was not found."
+command -v npm  >/dev/null 2>&1 || die "npm is required but was not found."
 
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$NODE_MAJOR" -ge 22 ] || die "node >=22.12 is required (found $(node -v))."
@@ -46,114 +86,189 @@ if ! command -v age >/dev/null 2>&1; then
   warn "  Fedora: sudo dnf install age | macOS: brew install age"
 fi
 
+if [ -n "${CAST_INSTALL_SOURCE:-}" ]; then
+  SRCDESC="local source $CAST_INSTALL_SOURCE"
+else
+  SRCDESC="$REPO@$REF"
+fi
+
+# Flip $DEST/current to versions/<v> atomically: build the new link beside it,
+# rename over. Plain ln -sfn is unlink+create — a window where current names
+# nothing and a concurrent 'cast' invocation dies mid-chain. bin/cast's
+# cmd_use flips with the same pattern.
+flip_current() {
+  ln -sfn "versions/$1" "$DEST/current.new.$$"
+  mv -Tf "$DEST/current.new.$$" "$DEST/current"
+}
+
+# --- migrate a pre-versioning flat install -----------------------------------
+# The old installer put the tree FLAT at $DEST (bin/cast directly under it).
+# Move such a tree to versions/<its-version> BEFORE anything else, so the
+# upgrade is seamless and the version comparison below sees the truth. The
+# move is two renames inside one parent directory — no copying, no window with
+# no install — and the operator's tree is preserved bit for bit.
+if [ -e "$DEST/bin/cast" ] && [ ! -d "$DEST/versions" ]; then
+  flat_ver="$(pkg_version "$DEST")"
+  [ -n "$flat_ver" ] || flat_ver="0.0.0-unknown"
+  # The flat tree's version is data from disk, not from this installer — the
+  # same trust boundary as the new_ver check, so the same gate: a corrupted
+  # (or hostile) package.json must not steer the mv/ln below out of versions/.
+  valid_version "$flat_ver" || die "the flat install's package.json version is not a sane directory name: '$flat_ver' — fix $DEST/package.json, then re-run"
+  log "found a pre-versioning flat install at $DEST (version $flat_ver) — migrating it into the versioned layout"
+  staging="$DEST.migrating.$$"
+  mv "$DEST" "$staging"
+  mkdir -p "$DEST/versions"
+  mv "$staging" "$DEST/versions/$flat_ver"
+  flip_current "$flat_ver"
+  mkdir -p "$BINDIR"
+  ln -sfn "$DEST/current/bin/cast" "$BINDIR/cast"
+  log "migrated: it now lives at $DEST/versions/$flat_ver (still current)"
+fi
+
 # --- temp workspace ----------------------------------------------------------
 TMPDIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT
 
-# Resolve the latest release tag by following the releases/latest redirect
-# and reading where it landed — no API, no token, no rate-limit pain
-# (box#83's trick). GitHub answers .../releases/tag/<TAG>; anything else
-# (a repo with no releases redirects nowhere useful) is a loud failure.
-resolve_latest_tag() {
-  local landed
-  landed="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")" || return 1
-  case "$landed" in
-    */releases/tag/*) printf '%s\n' "${landed##*/releases/tag/}" ;;
-    *) return 1 ;;
-  esac
-}
-
-# fetch_ok <url> <outfile> — download, true/false. -f keeps a 404 an
-# error instead of saving GitHub's error page as a tarball.
-fetch_ok() {
-  curl -fsSL "$1" -o "$2" 2>/dev/null
-}
-
 # --- acquire the tree --------------------------------------------------------
-# PREBUILT=1 means the tarball is a CI-built runnable tree (bin/, dist/,
-# production node_modules/, package.json) — nothing to compile here.
-PREBUILT=0
-SRCDESC=""
-
-if [ -z "$REF" ]; then
-  TAG="$(resolve_latest_tag)" \
-    || die "could not resolve the latest release of $REPO — no releases yet, or no network. CAST_REF=main installs from source."
-  URL="https://github.com/$REPO/releases/download/$TAG/cast-$TAG.tgz"
-  log "installing cast $TAG (latest release of $REPO)"
-  log "downloading $URL"
-  fetch_ok "$URL" "$TMPDIR/cast.tar.gz" \
-    || die "failed to download the $TAG release asset: $URL"
-  PREBUILT=1
-  SRCDESC="$REPO@$TAG (release asset)"
-else
-  # A pinned tag that has a release asset gets the asset — same bits as the
-  # default channel, just older. Everything else (a branch, a tag from
-  # before releases carried assets) falls back to build-from-source.
-  ASSET_URL="https://github.com/$REPO/releases/download/$REF/cast-$REF.tgz"
-  if fetch_ok "$ASSET_URL" "$TMPDIR/cast.tar.gz"; then
-    log "installing cast $REF (pinned release asset)"
-    PREBUILT=1
-    SRCDESC="$REPO@$REF (release asset)"
+if [ -n "${CAST_INSTALL_SOURCE:-}" ]; then
+  SRC="$CAST_INSTALL_SOURCE"
+  INSTALLED_FROM="local:$SRC"
+  if [ -d "$SRC" ]; then
+    log "copying local tree $SRC"
+    mkdir -p "$TMPDIR/tree"
+    # tar, not cp -a: --exclude=.git so a working checkout never carries its
+    # VCS state into the install tree, --exclude=./node_modules (top level
+    # only — nested ones are npm's own business) because npm ci below builds
+    # dependencies fresh from the lockfile anyway.
+    tar -C "$SRC" --exclude=.git --exclude=./node_modules -cf - . | tar -xf - -C "$TMPDIR/tree"
+    EXTRACTED="$TMPDIR/tree"
+  elif [ -f "$SRC" ]; then
+    log "extracting local tarball $SRC"
+    tar -xzf "$SRC" -C "$TMPDIR" || die "failed to extract $SRC"
+    EXTRACTED="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d | head -n1)"
   else
-    log "no release asset for '$REF' — building from source"
-    for kind in tags heads; do
-      URL="https://github.com/$REPO/archive/refs/$kind/$REF.tar.gz"
-      if fetch_ok "$URL" "$TMPDIR/cast.tar.gz"; then
-        SRCDESC="$REPO@$REF (source, refs/$kind)"
-        break
-      fi
-      SRCDESC=""
-    done
-    [ -n "$SRCDESC" ] || die "no tag or branch named '$REF' in $REPO (tried the release asset, refs/tags and refs/heads)"
-    log "downloaded from refs — $SRCDESC"
+    die "CAST_INSTALL_SOURCE is set but is neither a directory nor a tarball: $SRC"
   fi
-fi
-
-log "extracting archive"
-tar -xzf "$TMPDIR/cast.tar.gz" -C "$TMPDIR" \
-  || die "failed to extract archive"
-
-# Both shapes carry exactly ONE top-level directory (GitHub names its
-# archives <repo>-<ref>; release.yml stages cast-<version>). Deriving that
-# name is guesswork — it broke for real at box's repo rename — so take the
-# single directory, whatever it is called, and judge the tree by its content.
-EXTRACTED="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d | head -n1)"
-[ -n "$EXTRACTED" ] || die "could not find the cast tree in the archive"
-[ -f "$EXTRACTED/bin/cast" ] || die "archive does not contain bin/cast — is $SRCDESC correct?"
-
-# --- build (source channel only) ---------------------------------------------
-if [ "$PREBUILT" -eq 1 ]; then
-  # Verify the shape before touching $DEST: a prebuilt tree that cannot run
-  # is better refused here than discovered at `cast apply` time.
-  [ -f "$EXTRACTED/dist/cli.js" ] && [ -d "$EXTRACTED/node_modules" ] \
-    || die "the release asset is not a runnable tree (missing dist/ or node_modules/) — broken release? CAST_REF=main installs from source"
 else
-  command -v npm >/dev/null 2>&1 || die "npm is required to build from source (CAST_REF=$REF) but was not found."
+  INSTALLED_FROM="$REPO@$REF"
+  URL="https://github.com/$REPO/archive/refs/heads/$REF.tar.gz"
+  log "installing cast ($REPO@$REF)"
+  log "downloading $URL"
+  curl -fsSL "$URL" -o "$TMPDIR/cast.tar.gz" \
+    || die "failed to download $URL"
+
+  log "extracting archive"
+  tar -xzf "$TMPDIR/cast.tar.gz" -C "$TMPDIR" \
+    || die "failed to extract archive"
+
+  # GitHub names the archive's top dir <repo>-<ref> — deriving that name is
+  # guesswork (it broke for real at box's repo rename). The tarball has
+  # exactly ONE top-level directory: take the directory, whatever it is
+  # called, and let the bin/cast check below judge whether it is the right
+  # tree.
+  EXTRACTED="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+fi
+[ -n "${EXTRACTED:-}" ] || die "could not find the source tree in $SRCDESC"
+[ -f "$EXTRACTED/bin/cast" ] || die "source does not contain bin/cast — is $SRCDESC correct?"
+
+# The tree's own package.json names the directory it lands in — the version
+# IS the identity of what is being installed, and 'cast versions' lists
+# these names.
+new_ver="$(pkg_version "$EXTRACTED")"
+[ -n "$new_ver" ] || die "source has no package.json version — cannot install it as a version"
+valid_version "$new_ver" || die "the source's package.json version is not a sane directory name: '$new_ver'"
+
+set_exec() {   # $1 = a cast tree: the executable bits install.sh owns
+  chmod +x "$1/bin/cast"
+  if [ -d "$1/scripts" ]; then
+    find "$1/scripts" -name '*.sh' -exec chmod +x {} +
+  fi
+}
+
+# Build the tree IN PLACE, in the temp workspace — deps + tsc, then drop the
+# dev deps. Landing in versions/ happens after, by rename: a half-built tree
+# never sits where the version chain can resolve to it.
+build_tree() {   # $1 = the tree to build
   log "building (npm ci && npm run build)"
-  ( cd "$EXTRACTED" && npm ci --silent && npm run build --silent ) \
+  ( cd "$1" && npm ci --silent && npm run build --silent ) \
     || die "build failed"
-  ( cd "$EXTRACTED" && npm prune --omit=dev --silent ) || warn "could not prune dev dependencies"
+  ( cd "$1" && npm prune --omit=dev --silent ) || warn "could not prune dev dependencies"
+}
+
+# --- install into $DEST/versions/<version> -----------------------------------
+VDIR="$DEST/versions/$new_ver"
+newly_installed=0
+if [ -d "$VDIR" ]; then
+  if [ -n "${CAST_REINSTALL:-}" ]; then
+    # Replace THIS version's tree, as atomically as two renames allow — never
+    # a partial overlay of new files onto an old tree.
+    log "CAST_REINSTALL=1 — replacing the installed $new_ver tree"
+    build_tree "$EXTRACTED"
+    stage="$VDIR.new.$$"; old="$VDIR.old.$$"
+    rm -rf "$stage" "$old"
+    set_exec "$EXTRACTED"
+    mv "$EXTRACTED" "$stage"
+    # Swap by renames, delete LAST: rm-then-move leaves a hole the whole
+    # length of the delete where current -> this version resolves to nothing.
+    mv "$VDIR" "$old"
+    mv "$stage" "$VDIR"
+    rm -rf "$old"
+    printf '%s\n' "$INSTALLED_FROM" > "$VDIR/INSTALLED_FROM"
+    log "reinstalled $new_ver"
+  else
+    cur_from="$(cat "$VDIR/INSTALLED_FROM" 2>/dev/null || echo '<unknown source>')"
+    log "cast $new_ver is already installed ($cur_from) — nothing to do, and nothing was built."
+    log "(CAST_REINSTALL=1 replaces this version's tree; 'cast versions' lists what is installed.)"
+  fi
+else
+  build_tree "$EXTRACTED"
+  log "installing $new_ver into $VDIR"
+  mkdir -p "$DEST/versions"
+  set_exec "$EXTRACTED"
+  mv "$EXTRACTED" "$VDIR"
+  newly_installed=1
+  # Record WHAT was installed, so a caller can assert it got what it asked
+  # for — an installer invoked with stale env vars silently falls back to the
+  # defaults, and INSTALLED_FROM is how that lie gets caught.
+  printf '%s\n' "$INSTALLED_FROM" > "$VDIR/INSTALLED_FROM"
 fi
 
-# --- atomically replace $DEST --------------------------------------------------
-log "installing into $DEST"
-rm -rf "$DEST"
-mkdir -p "$(dirname "$DEST")"
-mv "$EXTRACTED" "$DEST"
-
-chmod +x "$DEST/bin/cast"
-# Source installs carry scripts/; the release asset deliberately does not.
-if [ -d "$DEST/scripts" ]; then
-  find "$DEST/scripts" -name '*.sh' -exec chmod +x {} +
+# --- which version is the default? -------------------------------------------
+# 'current' is the tracked default; flipping it is the ONLY step that changes
+# what an operator's `cast` runs. A fresh host (or a dangling current) is
+# claimed outright; an upgrade flips, because a re-run that silently left you
+# on the old version would make "re-run any time to upgrade" a lie. Judged
+# from versions/<v> itself (readlink -f), never from what a wedged current
+# claims.
+cur="$(readlink -f "$DEST/current" 2>/dev/null || true)"
+want="$(readlink -f "$VDIR")"
+if [ -z "$cur" ] || [ ! -d "$cur" ]; then
+  flip_current "$new_ver"
+  log "default version: $new_ver"
+elif [ "$cur" = "$want" ]; then
+  : # already the default — nothing to flip
+elif [ "$newly_installed" -eq 0 ]; then
+  # A converge/no-op (or CAST_REINSTALL) of a version that is NOT the default
+  # never moves the default — a re-run must change nothing; switching is
+  # 'cast use', a deliberate act.
+  log "the default stays $(basename "$cur") — 'cast use $new_ver' switches."
+else
+  old_ver="$(basename "$cur")"
+  flip_current "$new_ver"
+  log "default version switched: $old_ver -> $new_ver ('cast use $old_ver' switches back)"
 fi
 
-# --- put cast on PATH ----------------------------------------------------------
+# --- put cast on PATH --------------------------------------------------------
+# Through the current chain, and converging — that includes HEALING: a stale
+# or dangling $BINDIR/cast (say, its tree half-removed by hand) must never
+# block or wedge an install — it gets repointed at the current chain,
+# whatever it said before.
 mkdir -p "$BINDIR"
-ln -sf "$DEST/bin/cast" "$BINDIR/cast"
-log "linked $BINDIR/cast -> $DEST/bin/cast"
+ln -sfn "$DEST/current/bin/cast" "$BINDIR/cast"
+log "linked $BINDIR/cast -> $DEST/current/bin/cast"
 
-# --- wire $BINDIR onto PATH, durably -------------------------------------------
+# --- wire $BINDIR onto PATH, durably -----------------------------------------
 # `curl | bash` runs in a subshell, so exporting PATH here would die with this
 # process. The only durable place is the user's shell profile — so append there,
 # once, marked. Opt out with CAST_NO_MODIFY_PATH=1 and wire it yourself.
@@ -208,4 +323,4 @@ else
   log "this shell does not have it yet — open a new one, or: source $PROFILE"
 fi
 
-log "done ($SRCDESC) — try: cast --help"
+log "done ($SRCDESC, version $new_ver) — try: cast --help"

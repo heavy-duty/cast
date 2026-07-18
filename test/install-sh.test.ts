@@ -1,11 +1,13 @@
 import { execFile } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,82 +17,48 @@ import { describe, expect, it } from "vitest";
 
 const run = promisify(execFile);
 
-// These tests run the REAL install.sh — not a reimplementation of its
-// logic — with curl and npm replaced by PATH shims, so every channel
-// (latest asset, pinned asset, build-from-source) is exercised offline.
-// The shims record what was requested; the assertions read the wire log
-// and the resulting tree, the same way rig's cli.sh proves its installer.
+// These tests drive the REAL install.sh — not a reimplementation of its
+// logic — via CAST_INSTALL_SOURCE (the offline channel the installer carries
+// for exactly this, rig's RIG_INSTALL_SOURCE precedent) and an npm PATH shim
+// whose `run build` drops a tiny runnable cli.js. Every assertion reads the
+// resulting tree, the symlink chain, or the shim's invocation log. The real
+// npm-ci-and-tsc build path runs end to end in CI's install job instead —
+// here it would cost minutes per test for no extra layout coverage.
 
 const INSTALL_SH = join(process.cwd(), "install.sh");
+const REAL_BIN_CAST = join(process.cwd(), "bin", "cast");
 
-// curl shim: answers from CAST_TEST_* env vars, appends every URL to
-// CAST_TEST_CURL_LOG. Exit 22 is curl's own "-f saw an HTTP error".
-const CURL_SHIM = `#!/usr/bin/env bash
-set -euo pipefail
-out=""; url=""
-args=("$@")
-i=0
-while [ $i -lt \${#args[@]} ]; do
-  a="\${args[$i]}"
-  case "$a" in
-    -o) i=$((i+1)); out="\${args[$i]}" ;;
-    -w) i=$((i+1)) ;;
-    http*) url="$a" ;;
-  esac
-  i=$((i+1))
-done
-printf '%s\\n' "$url" >> "$CAST_TEST_CURL_LOG"
-case "$url" in
-  */releases/latest)
-    [ -n "\${CAST_TEST_LATEST:-}" ] || exit 22
-    printf '%s' "$CAST_TEST_LATEST"
-    ;;
-  */releases/download/*)
-    if [ -n "\${CAST_TEST_ASSET_FILE:-}" ] && [ "$url" = "\${CAST_TEST_ASSET_URL:-}" ]; then
-      cp "$CAST_TEST_ASSET_FILE" "$out"
-    else
-      exit 22
-    fi
-    ;;
-  */archive/refs/tags/*)
-    if [ -n "\${CAST_TEST_TAGS_TARBALL:-}" ]; then cp "$CAST_TEST_TAGS_TARBALL" "$out"; else exit 22; fi
-    ;;
-  */archive/refs/heads/*)
-    if [ -n "\${CAST_TEST_HEADS_TARBALL:-}" ]; then cp "$CAST_TEST_HEADS_TARBALL" "$out"; else exit 22; fi
-    ;;
-  *) exit 22 ;;
-esac
+// What `npm run build` produces in a fixture tree: enough of a cli.js that
+// the launcher chain — BINDIR/cast -> current -> versions/<v>/bin/cast ->
+// node dist/cli.js — can be asserted end to end, --version included (cmd_use
+// verifies the flip through it).
+const FAKE_CLI = `const path = require("path");
+const root = path.resolve(__dirname, "..");
+const pkg = require(path.join(root, "package.json"));
+const [cmd] = process.argv.slice(2);
+if (cmd === "--version" || cmd === "-V") {
+  console.log("cast " + pkg.version + " (" + root + ")");
+  process.exit(0);
+}
+console.log("fake-cast " + pkg.version);
 `;
 
-// npm shim: logs every invocation; 'run build' produces dist/cli.js so a
-// source install ends up runnable. The prebuilt channels get a POISONED
-// npm instead — if the installer touches npm at all on an asset install,
-// the install fails and so does the test.
 const NPM_SHIM = `#!/usr/bin/env bash
 printf 'npm %s\\n' "$*" >> "$CAST_TEST_NPM_LOG"
 case "\${1:-}" in
-  ci) exit 0 ;;
-  run) mkdir -p dist && printf '// built by npm shim\\n' > dist/cli.js ;;
-  prune) exit 0 ;;
+  run) mkdir -p dist && cp "$CAST_TEST_FAKECLI" dist/cli.js ;;
 esac
-`;
-
-const POISONED_NPM = `#!/usr/bin/env bash
-printf 'npm %s\\n' "$*" >> "$CAST_TEST_NPM_LOG"
-exit 97
 `;
 
 type Sandbox = {
   root: string;
-  stubs: string;
   dest: string;
   bindir: string;
-  curlLog: string;
   npmLog: string;
   env: Record<string, string>;
 };
 
-function sandbox(opts: { poisonNpm: boolean }): Sandbox {
+function sandbox(): Sandbox {
   const root = mkdtempSync(join(tmpdir(), "cast-install-"));
   const stubs = join(root, "stubs");
   const home = join(root, "home");
@@ -98,20 +66,16 @@ function sandbox(opts: { poisonNpm: boolean }): Sandbox {
   const bindir = join(root, "bin");
   mkdirSync(stubs);
   mkdirSync(home);
-  const curlLog = join(root, "curl.log");
   const npmLog = join(root, "npm.log");
-  writeFileSync(curlLog, "");
+  const fakeCli = join(root, "fake-cli.js");
   writeFileSync(npmLog, "");
-  writeFileSync(join(stubs, "curl"), CURL_SHIM);
-  writeFileSync(join(stubs, "npm"), opts.poisonNpm ? POISONED_NPM : NPM_SHIM);
-  chmodSync(join(stubs, "curl"), 0o755);
+  writeFileSync(fakeCli, FAKE_CLI);
+  writeFileSync(join(stubs, "npm"), NPM_SHIM);
   chmodSync(join(stubs, "npm"), 0o755);
   return {
     root,
-    stubs,
     dest,
     bindir,
-    curlLog,
     npmLog,
     env: {
       PATH: `${stubs}:${process.env.PATH}`,
@@ -120,180 +84,257 @@ function sandbox(opts: { poisonNpm: boolean }): Sandbox {
       CAST_HOME: dest,
       CAST_BIN: bindir,
       CAST_NO_MODIFY_PATH: "1",
-      CAST_TEST_CURL_LOG: curlLog,
       CAST_TEST_NPM_LOG: npmLog,
+      CAST_TEST_FAKECLI: fakeCli,
     },
   };
 }
 
-// Build a .tgz fixture with a single top-level dir, like both real shapes.
-async function makeTarball(
-  root: string,
-  topdir: string,
-  files: Record<string, string>,
-): Promise<string> {
-  const stage = join(root, "fixtures", topdir);
-  for (const [rel, content] of Object.entries(files)) {
-    const abs = join(stage, rel);
-    mkdirSync(join(abs, ".."), { recursive: true });
-    writeFileSync(abs, content);
-  }
-  const tgz = join(root, "fixtures", `${topdir}.tgz`);
-  await run("tar", ["-C", join(root, "fixtures"), "-czf", tgz, topdir]);
-  return tgz;
+// A source tree the installer can build: the REPO'S OWN bin/cast (so the
+// launcher and its layout verbs are the code under review), a package.json
+// carrying the version, and a src/ marker.
+function sourceTree(sb: Sandbox, version: string): string {
+  const src = join(sb.root, `src-${version.replace(/[^A-Za-z0-9.]/g, "_")}`);
+  mkdirSync(join(src, "bin"), { recursive: true });
+  mkdirSync(join(src, "src"), { recursive: true });
+  copyFileSync(REAL_BIN_CAST, join(src, "bin", "cast"));
+  writeFileSync(
+    join(src, "package.json"),
+    `${JSON.stringify({ name: "cast", version })}\n`,
+  );
+  writeFileSync(join(src, "src", "cli.ts"), "// fixture\n");
+  return src;
 }
 
-const PREBUILT_FILES = {
-  "bin/cast": "#!/usr/bin/env bash\necho fake-cast\n",
-  "dist/cli.js": "// prebuilt in CI\n",
-  "node_modules/yaml/package.json": "{}",
-  "package.json": '{ "name": "cast", "version": "0.2.0" }\n',
-};
+async function install(sb: Sandbox, extraEnv: Record<string, string>) {
+  return run("bash", [INSTALL_SH], { env: { ...sb.env, ...extraEnv } });
+}
 
-const SOURCE_FILES = {
-  "bin/cast": "#!/usr/bin/env bash\necho fake-cast\n",
-  "package.json": '{ "name": "cast", "version": "0.3.0-dev" }\n',
-  "src/cli.ts": "// source only — dist/ does not exist until npm run build\n",
-};
+function currentTarget(sb: Sandbox): string {
+  return realpathSync(join(sb.dest, "current"));
+}
 
-async function runInstaller(sb: Sandbox, extraEnv: Record<string, string>) {
-  return run("bash", [INSTALL_SH], {
-    env: { ...sb.env, ...extraEnv },
+describe("install.sh — the versioned layout", () => {
+  it("lands versions/<v>, points current and the PATH link through it, and the chain answers", async () => {
+    const sb = sandbox();
+    const src = sourceTree(sb, "0.5.0");
+    const { stdout } = await install(sb, { CAST_INSTALL_SOURCE: src });
+
+    expect(stdout).toContain("done (local source");
+    // The layout: one tree per version, named by package.json's version.
+    expect(existsSync(join(sb.dest, "versions/0.5.0/bin/cast"))).toBe(true);
+    expect(
+      readFileSync(join(sb.dest, "versions/0.5.0/dist/cli.js"), "utf8"),
+    ).toContain("pkg.version");
+    expect(
+      readFileSync(join(sb.dest, "versions/0.5.0/INSTALLED_FROM"), "utf8"),
+    ).toBe(`local:${src}\n`);
+    // The chain: current -> versions/0.5.0, BINDIR/cast -> current/bin/cast.
+    expect(currentTarget(sb)).toBe(
+      realpathSync(join(sb.dest, "versions/0.5.0")),
+    );
+    expect(readlinkSync(join(sb.bindir, "cast"))).toBe(
+      join(sb.dest, "current/bin/cast"),
+    );
+    // And it ANSWERS, through the whole chain.
+    const { stdout: v } = await run(join(sb.bindir, "cast"), ["--version"], {
+      env: sb.env,
+    });
+    expect(v.trim()).toBe(
+      `cast 0.5.0 (${realpathSync(join(sb.dest, "versions/0.5.0"))})`,
+    );
+    // The build ran: ci, build, prune — in that order.
+    expect(readFileSync(sb.npmLog, "utf8")).toBe(
+      "npm ci --silent\nnpm run build --silent\nnpm prune --omit=dev --silent\n",
+    );
   });
-}
 
-describe("install.sh — default channel (latest release asset)", () => {
-  it("resolves the latest tag via the redirect and installs the prebuilt tree without npm", async () => {
-    const sb = sandbox({ poisonNpm: true });
-    const asset = await makeTarball(sb.root, "cast-0.2.0", PREBUILT_FILES);
-    const { stdout } = await runInstaller(sb, {
-      CAST_TEST_LATEST: "https://github.com/heavy-duty/cast/releases/tag/0.2.0",
-      CAST_TEST_ASSET_URL:
-        "https://github.com/heavy-duty/cast/releases/download/0.2.0/cast-0.2.0.tgz",
-      CAST_TEST_ASSET_FILE: asset,
+  it("re-running the same version is a converging no-op — nothing rebuilt, nothing touched", async () => {
+    const sb = sandbox();
+    const src = sourceTree(sb, "0.5.0");
+    await install(sb, { CAST_INSTALL_SOURCE: src });
+    const npmCallsAfterFirst = readFileSync(sb.npmLog, "utf8");
+    writeFileSync(join(sb.dest, "versions/0.5.0/SENTINEL"), "survives\n");
+
+    const { stdout } = await install(sb, { CAST_INSTALL_SOURCE: src });
+    expect(stdout).toContain("cast 0.5.0 is already installed");
+    expect(stdout).toContain("nothing was built");
+    // No second build, and the installed tree was not replaced.
+    expect(readFileSync(sb.npmLog, "utf8")).toBe(npmCallsAfterFirst);
+    expect(readFileSync(join(sb.dest, "versions/0.5.0/SENTINEL"), "utf8")).toBe(
+      "survives\n",
+    );
+  });
+
+  it("CAST_REINSTALL=1 replaces that version's tree — no partial overlays", async () => {
+    const sb = sandbox();
+    const src = sourceTree(sb, "0.5.0");
+    await install(sb, { CAST_INSTALL_SOURCE: src });
+    writeFileSync(join(sb.dest, "versions/0.5.0/SENTINEL"), "stale\n");
+
+    const { stdout } = await install(sb, {
+      CAST_INSTALL_SOURCE: src,
+      CAST_REINSTALL: "1",
+    });
+    expect(stdout).toContain("replacing the installed 0.5.0 tree");
+    // A replaced tree, not an overlay: the stale file is gone.
+    expect(existsSync(join(sb.dest, "versions/0.5.0/SENTINEL"))).toBe(false);
+    expect(existsSync(join(sb.dest, "versions/0.5.0/dist/cli.js"))).toBe(true);
+  });
+
+  it("a NEW version installs beside the old one and becomes the default", async () => {
+    const sb = sandbox();
+    await install(sb, { CAST_INSTALL_SOURCE: sourceTree(sb, "0.5.0") });
+    const { stdout } = await install(sb, {
+      CAST_INSTALL_SOURCE: sourceTree(sb, "0.6.0"),
     });
 
     expect(stdout).toContain(
-      "installing cast 0.2.0 (latest release of heavy-duty/cast)",
+      "default version switched: 0.5.0 -> 0.6.0 ('cast use 0.5.0' switches back)",
     );
-    // The tree landed, prebuilt: dist/ came from the tarball, not a build.
-    expect(readFileSync(join(sb.dest, "dist/cli.js"), "utf8")).toContain(
-      "prebuilt in CI",
+    expect(existsSync(join(sb.dest, "versions/0.5.0/bin/cast"))).toBe(true);
+    expect(currentTarget(sb)).toBe(
+      realpathSync(join(sb.dest, "versions/0.6.0")),
     );
-    expect(existsSync(join(sb.dest, "node_modules/yaml/package.json"))).toBe(
-      true,
-    );
-    expect(readlinkSync(join(sb.bindir, "cast"))).toBe(
-      join(sb.dest, "bin/cast"),
-    );
-    // npm is poisoned — a single invocation would have failed the install.
-    expect(readFileSync(sb.npmLog, "utf8")).toBe("");
+    const { stdout: v } = await run(join(sb.bindir, "cast"), ["--version"], {
+      env: sb.env,
+    });
+    expect(v).toContain("cast 0.6.0");
   });
 
-  it("dies loudly when there is no release to resolve, pointing at CAST_REF=main", async () => {
-    const sb = sandbox({ poisonNpm: true });
-    await expect(runInstaller(sb, {})).rejects.toMatchObject({
-      stderr: expect.stringContaining("CAST_REF=main installs from source"),
+  it("re-running an installed NON-default version never moves the default", async () => {
+    const sb = sandbox();
+    const old = sourceTree(sb, "0.5.0");
+    await install(sb, { CAST_INSTALL_SOURCE: old });
+    await install(sb, { CAST_INSTALL_SOURCE: sourceTree(sb, "0.6.0") });
+
+    const { stdout } = await install(sb, { CAST_INSTALL_SOURCE: old });
+    expect(stdout).toContain(
+      "the default stays 0.6.0 — 'cast use 0.5.0' switches.",
+    );
+    expect(currentTarget(sb)).toBe(
+      realpathSync(join(sb.dest, "versions/0.6.0")),
+    );
+  });
+
+  it("migrates a pre-versioning flat install in place, preserving the tree", async () => {
+    const sb = sandbox();
+    // The OLD layout: the tree sits flat at $DEST, bin/cast directly under it.
+    mkdirSync(join(sb.dest, "bin"), { recursive: true });
+    mkdirSync(join(sb.dest, "dist"), { recursive: true });
+    copyFileSync(REAL_BIN_CAST, join(sb.dest, "bin/cast"));
+    writeFileSync(
+      join(sb.dest, "package.json"),
+      `${JSON.stringify({ name: "cast", version: "0.4.0" })}\n`,
+    );
+    writeFileSync(
+      join(sb.dest, "SENTINEL"),
+      "the operator's tree, bit for bit\n",
+    );
+
+    const { stdout } = await install(sb, {
+      CAST_INSTALL_SOURCE: sourceTree(sb, "0.5.0"),
+    });
+    expect(stdout).toContain("found a pre-versioning flat install at");
+    expect(stdout).toContain("migrating it into the versioned layout");
+    // The flat tree moved — preserved, not rebuilt — and the new version
+    // installed beside it and took the default.
+    expect(readFileSync(join(sb.dest, "versions/0.4.0/SENTINEL"), "utf8")).toBe(
+      "the operator's tree, bit for bit\n",
+    );
+    expect(existsSync(join(sb.dest, "versions/0.5.0/bin/cast"))).toBe(true);
+    expect(currentTarget(sb)).toBe(
+      realpathSync(join(sb.dest, "versions/0.5.0")),
+    );
+  });
+
+  it("refuses a source whose package.json version is not a sane directory name", async () => {
+    const sb = sandbox();
+    const src = sourceTree(sb, "../evil");
+    await expect(
+      install(sb, { CAST_INSTALL_SOURCE: src }),
+    ).rejects.toMatchObject({
+      stderr: expect.stringContaining("not a sane directory name: '../evil'"),
     });
     expect(existsSync(sb.dest)).toBe(false);
   });
 
-  it("dies when the redirect lands somewhere that is not a tag page", async () => {
-    const sb = sandbox({ poisonNpm: true });
-    await expect(
-      runInstaller(sb, {
-        CAST_TEST_LATEST: "https://github.com/heavy-duty/cast/releases",
-      }),
-    ).rejects.toMatchObject({
-      stderr: expect.stringContaining("could not resolve the latest release"),
-    });
-  });
-});
-
-describe("install.sh — pinned channel (CAST_REF=X.Y.Z)", () => {
-  it("uses that tag's release asset and never falls through to a source build", async () => {
-    const sb = sandbox({ poisonNpm: true });
-    const asset = await makeTarball(sb.root, "cast-0.1.0", {
-      ...PREBUILT_FILES,
-      "package.json": '{ "name": "cast", "version": "0.1.0" }\n',
-    });
-    const { stdout } = await runInstaller(sb, {
-      CAST_REF: "0.1.0",
-      CAST_TEST_ASSET_URL:
-        "https://github.com/heavy-duty/cast/releases/download/0.1.0/cast-0.1.0.tgz",
-      CAST_TEST_ASSET_FILE: asset,
-    });
-
-    expect(stdout).toContain("installing cast 0.1.0 (pinned release asset)");
-    const urls = readFileSync(sb.curlLog, "utf8");
-    // No latest-resolution, no archive fallbacks — the pin answered.
-    expect(urls).not.toContain("/releases/latest");
-    expect(urls).not.toContain("/archive/refs/");
-    expect(readFileSync(sb.npmLog, "utf8")).toBe("");
-  });
-
-  it("refuses a prebuilt asset that is not a runnable tree, leaving the old install alone", async () => {
-    const sb = sandbox({ poisonNpm: true });
-    // An asset missing dist/ — a broken release.
-    const asset = await makeTarball(sb.root, "cast-0.4.0", {
-      "bin/cast": "#!/usr/bin/env bash\n",
-      "package.json": "{}",
-    });
-    // A previous install that must survive the refused upgrade.
+  it("refuses to migrate a flat install whose version would escape versions/", async () => {
+    const sb = sandbox();
     mkdirSync(join(sb.dest, "bin"), { recursive: true });
-    writeFileSync(join(sb.dest, "bin/cast"), "#!/usr/bin/env bash\necho old\n");
+    copyFileSync(REAL_BIN_CAST, join(sb.dest, "bin/cast"));
+    writeFileSync(
+      join(sb.dest, "package.json"),
+      `${JSON.stringify({ name: "cast", version: "../evil" })}\n`,
+    );
 
     await expect(
-      runInstaller(sb, {
-        CAST_REF: "0.4.0",
-        CAST_TEST_ASSET_URL:
-          "https://github.com/heavy-duty/cast/releases/download/0.4.0/cast-0.4.0.tgz",
-        CAST_TEST_ASSET_FILE: asset,
-      }),
+      install(sb, { CAST_INSTALL_SOURCE: sourceTree(sb, "0.5.0") }),
     ).rejects.toMatchObject({
-      stderr: expect.stringContaining("not a runnable tree"),
+      stderr: expect.stringContaining("not a sane directory name"),
     });
-    // The shape check fired BEFORE rm -rf $DEST — the old tree survives.
-    expect(readFileSync(join(sb.dest, "bin/cast"), "utf8")).toContain(
-      "echo old",
+    // Refused BEFORE anything moved: the flat tree is untouched.
+    expect(existsSync(join(sb.dest, "bin/cast"))).toBe(true);
+  });
+
+  it("downloads refs/heads/<ref> when no local source is given", async () => {
+    const sb = sandbox();
+    // A curl shim standing in for GitHub: serves the fixture tarball and
+    // logs the URL it was asked for.
+    sourceTree(sb, "0.5.0");
+    await run("tar", [
+      "-C",
+      sb.root,
+      "-czf",
+      join(sb.root, "src.tgz"),
+      "src-0.5.0",
+    ]);
+    const stubs = join(sb.root, "stubs");
+    const curlLog = join(sb.root, "curl.log");
+    writeFileSync(curlLog, "");
+    writeFileSync(
+      join(stubs, "curl"),
+      `#!/usr/bin/env bash
+out=""; url=""
+for a in "$@"; do
+  case "$prev" in -o) out="$a" ;; esac
+  case "$a" in http*) url="$a" ;; esac
+  prev="$a"
+done
+printf '%s\\n' "$url" >> "${curlLog}"
+cp "${join(sb.root, "src.tgz")}" "$out"
+`,
     );
+    chmodSync(join(stubs, "curl"), 0o755);
+
+    const { stdout } = await install(sb, { CAST_REF: "dev-branch" });
+    expect(readFileSync(curlLog, "utf8").trim()).toBe(
+      "https://github.com/heavy-duty/cast/archive/refs/heads/dev-branch.tar.gz",
+    );
+    expect(stdout).toContain("installing cast (heavy-duty/cast@dev-branch)");
+    expect(
+      readFileSync(join(sb.dest, "versions/0.5.0/INSTALLED_FROM"), "utf8"),
+    ).toBe("heavy-duty/cast@dev-branch\n");
   });
 });
 
-describe("install.sh — dev channel (CAST_REF=<branch>)", () => {
-  it("falls back asset → refs/tags → refs/heads and builds from source", async () => {
-    const sb = sandbox({ poisonNpm: false });
-    const src = await makeTarball(sb.root, "cast-main", SOURCE_FILES);
-    const { stdout } = await runInstaller(sb, {
-      CAST_REF: "main",
-      CAST_TEST_HEADS_TARBALL: src,
-    });
+describe("the shared gates cannot drift", () => {
+  // install.sh and bin/cast each carry valid_version and pkg_version — the
+  // same trust boundary enforced in two places. A byte-identical diff is the
+  // rig-precedent guard that an edit to one cannot quietly miss the other.
+  function extractFunction(file: string, name: string): string {
+    const text = readFileSync(file, "utf8");
+    const start = text.indexOf(`${name}() {`);
+    expect(start, `${name}() not found in ${file}`).toBeGreaterThan(-1);
+    const end = text.indexOf("\n}", start);
+    return text.slice(start, end + 2);
+  }
 
-    expect(stdout).toContain(
-      "no release asset for 'main' — building from source",
-    );
-    const urls = readFileSync(sb.curlLog, "utf8").trim().split("\n");
-    expect(urls).toEqual([
-      "https://github.com/heavy-duty/cast/releases/download/main/cast-main.tgz",
-      "https://github.com/heavy-duty/cast/archive/refs/tags/main.tar.gz",
-      "https://github.com/heavy-duty/cast/archive/refs/heads/main.tar.gz",
-    ]);
-    // The build ran here — ci, build, prune — and produced the dist tree.
-    const npm = readFileSync(sb.npmLog, "utf8");
-    expect(npm).toContain("npm ci");
-    expect(npm).toContain("npm run build");
-    expect(npm).toContain("npm prune --omit=dev");
-    expect(readFileSync(join(sb.dest, "dist/cli.js"), "utf8")).toContain(
-      "built by npm shim",
-    );
-  });
-
-  it("dies when the ref exists nowhere (asset, tags, heads all miss)", async () => {
-    const sb = sandbox({ poisonNpm: true });
-    await expect(
-      runInstaller(sb, { CAST_REF: "no-such-ref" }),
-    ).rejects.toMatchObject({
-      stderr: expect.stringContaining("no tag or branch named 'no-such-ref'"),
+  for (const fn of ["valid_version", "pkg_version"]) {
+    it(`${fn}() is byte-identical between install.sh and bin/cast`, () => {
+      expect(extractFunction(INSTALL_SH, fn)).toBe(
+        extractFunction(REAL_BIN_CAST, fn),
+      );
     });
-  });
+  }
 });

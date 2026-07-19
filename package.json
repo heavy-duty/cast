@@ -1,6 +1,6 @@
 {
   "name": "cast",
-  "version": "0.1.0",
+  "version": "0.1.1-dev",
   "type": "module",
   "private": true,
   "engines": { "node": ">=22.12.0" },

@@ -608,8 +608,12 @@ Coolify's default `production`) in a blueprint that claims to describe the box.
 
 An environment's age identity is resolved in exactly two ways:
 
-1. `$CAST_AGE_KEY_FILE_<ENV>` — injected for this invocation
-2. `~/.config/cast/age-<env>.key` — a standing key on this machine
+1. `$CAST_AGE_KEY_FILE_<ENV>` — injected for this invocation. `<ENV>` is the
+   environment name uppercased, with every character a shell cannot carry in a
+   variable name mapped to `_`: env `drill-b` reads
+   `CAST_AGE_KEY_FILE_DRILL_B`.
+2. `~/.config/cast/age-<env>.key` — a standing key on this machine, under the
+   environment's exact name.
 
 That is the whole mechanism behind attended vs unattended applies: **an
 environment whose key you never leave on disk can only be applied by someone who

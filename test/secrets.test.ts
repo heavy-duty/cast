@@ -107,6 +107,32 @@ describe("keyFileFor", () => {
     expect(keyFileFor("prod")).toBe("/tmp/prod.key");
     Reflect.deleteProperty(process.env, "CAST_AGE_KEY_FILE_PROD");
   });
+  // #102: `drill-b`.toUpperCase() is `DRILL-B`, and a var named
+  // CAST_AGE_KEY_FILE_DRILL-B cannot be set by any POSIX shell — the injected
+  // channel (and its process-substitution trick) was unreachable for every
+  // hyphenated environment name. Non-alphanumerics map to `_`.
+  it("a hyphenated env name maps to a settable var name", () => {
+    process.env.CAST_AGE_KEY_FILE_DRILL_B = "/tmp/drill-b.key";
+    try {
+      expect(keyFileFor("drill-b")).toBe("/tmp/drill-b.key");
+    } finally {
+      Reflect.deleteProperty(process.env, "CAST_AGE_KEY_FILE_DRILL_B");
+    }
+  });
+  it("the refusal advertises the mapped (settable) var, and the exact-name standing path", () => {
+    Reflect.deleteProperty(process.env, "CAST_AGE_KEY_FILE_DRILL_B");
+    // Isolate $HOME: a standing age-drill-b.key on the dev machine must not
+    // turn the refusal into a hit (os.homedir() reads $HOME on POSIX).
+    const home = process.env.HOME;
+    process.env.HOME = mkdtempSync(join(tmpdir(), "cast-home-"));
+    try {
+      expect(() => keyFileFor("drill-b")).toThrow(
+        /no age key for drill-b.*CAST_AGE_KEY_FILE_DRILL_B.*age-drill-b\.key/s,
+      );
+    } finally {
+      process.env.HOME = home;
+    }
+  });
   it("falls back to a standing key on disk when one exists", () => {
     const home = process.env.HOME;
     const dir = mkdtempSync(join(tmpdir(), "cast-home-"));

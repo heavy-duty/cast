@@ -5,6 +5,38 @@ since its first commit, but grew its release surface (this file,
 `cast --version`, tagged releases with a prebuilt asset) on the way to
 actually cutting it, and this file starts there.
 
+## Unreleased
+
+### Fixed
+
+- **The release ceremony re-arms the changelog, and CI notices when it
+  doesn't** (#113) — stamping `## Unreleased` into `## X.Y.Z — DATE` is
+  done by hand in the ceremony PR; no workflow writes this file, and
+  nothing put the heading back. So `main` sat with the shipped section on
+  top and no `## Unreleased` above it — this repo's state from 0.1.0
+  until this entry. A PR authored before a release and merged after has
+  its entry land under whatever heading now occupies that position: the
+  release that already shipped. Git does that *cleanly*. The stamped
+  heading and the incoming entry never overlap textually, so the one
+  signal an author trusts — "git told me to look" — is missing exactly
+  when the result is wrong. rig watched it happen (heavy-duty/rig#66, the
+  origin of this fix): an entry landed inside published `## 0.1.0` an
+  hour after 0.1.0 shipped, and was caught only because someone was
+  reading. The published release body is never at risk — `release.yml`
+  extracts notes from the tree at the tag, before anything late can merge
+  — which is also why nobody notices: the file that drifts is the one
+  only maintainers read. Three moves. `## Unreleased` is back above
+  `## 0.1.0` (this entry re-creating it *is* the repair). CONTRIBUTING's
+  ceremony step now re-arms in the same diff that stamps. And
+  `test/release.test.ts` keys the rule to `package.json`: a stamped top
+  section is legal while the version is bare — the ceremony's own tree,
+  and main until the `-dev` bump — but once the version says `-dev`, the
+  top section must be `## Unreleased`. That is the distinction #108 had
+  to collapse to make the ceremony shippable at all, recovered rather
+  than reverted: the ceremony stays green at every step, and a disarmed
+  dev `main` goes red. box and rig carry the same fix
+  (heavy-duty/box#108, heavy-duty/rig#66).
+
 ## 0.1.0 — 2026-07-19
 
 ### Fixed

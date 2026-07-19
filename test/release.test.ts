@@ -164,6 +164,103 @@ describe("release-notes.sh", () => {
   });
 });
 
+// --- the changelog is ARMED — the version says which state is legal --------
+// heavy-duty/rig#66. The section above proves the top section EXTRACTS; it
+// deliberately does not care what the top section is CALLED, and cannot:
+// #108 relaxed exactly that, because the ceremony PR's own tree has a
+// stamped `## X.Y.Z` on top and a literal-Unreleased demand made the
+// release unshippable by construction. So nothing on main notices when
+// `## Unreleased` is simply gone.
+//
+// That gap is not theoretical. A PR that writes its entry under
+// `## Unreleased`, is authored before a release and merged after, has that
+// entry land under whatever heading now occupies the position — the
+// just-shipped `## X.Y.Z`. Git merges it CLEANLY: the stamped heading and
+// the incoming entry never overlap textually, so the one signal an author
+// relies on ("git told me to look") is absent precisely when the outcome is
+// wrong. It happened in rig: #60's entry landed inside published `## 0.1.0`.
+//
+// The rule that separates the two states #108 collapsed, without demanding
+// Unreleased unconditionally: **the package.json version keys it.** A bare
+// `X.Y.Z` means the tree IS (or immediately follows) a release — the
+// ceremony's stamped top section is legal there, and so is a re-armed
+// Unreleased. A `-dev` version means main between releases, where a stamped
+// top section can only mean the re-arm was skipped: `## Unreleased` is
+// mandatory. Green through the whole ceremony; red on a disarmed `-dev`
+// main, which is the state the guard exists to name.
+
+/** The top `## ` section's token — `Unreleased`, or a stamped version. */
+function topSection(changelog: string): string {
+  const top = changelog.match(/^## (\S+)/m);
+  if (!top) throw new Error("changelog has no ## section at all");
+  return top[1];
+}
+
+/** null = armed. A string = why this (version, changelog) pair is illegal. */
+function disarmedBecause(version: string, changelog: string): string | null {
+  const top = topSection(changelog);
+  if (version.endsWith("-dev")) {
+    return top === "Unreleased"
+      ? null
+      : `version ${version} is a dev tree, so the top section must be '## Unreleased' — found '## ${top}'. The release ceremony stamps Unreleased into the shipped version and must re-add an empty one (heavy-duty/rig#66); without it the next PR's entry lands inside ${top}'s published notes, with no merge conflict to warn anyone.`;
+  }
+  if (top === "Unreleased" || top === version) return null;
+  return `version ${version} is bare, so the top section must be '## Unreleased' (re-armed) or the matching '## ${version}' (the ceremony tree) — found '## ${top}'.`;
+}
+
+describe("the changelog is armed for the next entry (rig#66)", () => {
+  const dated = (v: string) => `## ${v} — 2026-07-19`;
+  const body = "\n\n- **An entry** — prose.\n";
+  const armed = `# Changelog\n\n## Unreleased${body}\n${dated("0.2.0")}${body}`;
+  const stamped = `# Changelog\n\n${dated("0.2.0")}${body}`;
+
+  it("the REAL tree is armed — package.json and CHANGELOG.md agree", () => {
+    const version = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"))
+      .version as string;
+    const changelog = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8");
+    expect(disarmedBecause(version, changelog)).toBeNull();
+  });
+
+  // The ceremony, walked end to end. Every state green — this is the #108
+  // regression the guard must not re-introduce.
+  it("stays green through the ceremony: the release PR's own stamped tree", () => {
+    expect(disarmedBecause("0.2.0", stamped)).toBeNull();
+  });
+
+  it("stays green through the ceremony: the ceremony PR that re-arms too", () => {
+    expect(disarmedBecause("0.2.0", armed)).toBeNull();
+  });
+
+  it("stays green through the ceremony: main in the post-release window", () => {
+    // Merged, tagged, published — the -dev bump has not landed yet.
+    expect(disarmedBecause("0.2.0", stamped)).toBeNull();
+  });
+
+  it("stays green through the ceremony: main after the -dev bump, re-armed", () => {
+    expect(disarmedBecause("0.2.1-dev", armed)).toBeNull();
+  });
+
+  // And red on the one state the extraction guard cannot see.
+  it("goes RED on a disarmed -dev main — the rig#66 failure, exactly", () => {
+    const why = disarmedBecause("0.2.1-dev", stamped);
+    expect(why).toContain("must be '## Unreleased'");
+    expect(why).toContain("rig#66");
+  });
+
+  it("goes RED when a bare version's stamp names a different release", () => {
+    // A hand-stamp that drifted from the bump it shipped with.
+    expect(
+      disarmedBecause("0.2.0", `# Changelog\n\n${dated("0.1.9")}${body}`),
+    ).toContain("the ceremony tree");
+  });
+
+  it("refuses a changelog with no sections at all rather than passing it", () => {
+    expect(() => disarmedBecause("0.2.1-dev", "# Changelog\n")).toThrow(
+      "no ## section",
+    );
+  });
+});
+
 // --- release.yml — the wiring, pinned --------------------------------------
 // The workflow itself only runs on a tag push upstream, so its load-bearing
 // pieces are pinned here, fail-closed (the house discipline: the labels

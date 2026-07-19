@@ -143,12 +143,24 @@ describe("release-notes.sh", () => {
     expect(r.output).toContain("no such file");
   });
 
-  // The REAL changelog: its Unreleased section must extract non-empty with
-  // the exact tool release.yml runs — the guard against header-format drift.
-  it("the real CHANGELOG.md's Unreleased section extracts", async () => {
-    const r = await notes("Unreleased", join(ROOT, "CHANGELOG.md"));
+  // The REAL changelog: the guard against header-format drift. The file has
+  // two legitimate states, and this test used to know only one (#108, found
+  // the day the first release PR turned CI red): BETWEEN releases the top
+  // section is `## Unreleased`; on a `release: X.Y.Z` tree — the ceremony's
+  // own PR stamps that heading into `## X.Y.Z — date` — and on main right
+  // after it, the top section IS the stamped release. Demanding the literal
+  // Unreleased (with an issue number inside it, rotting per release) made
+  // the release PR unshippable by construction, invisible to fork
+  // rehearsals (a tag push runs release.yml, never ci.yml). Whatever the
+  // top section is called, the exact tool release.yml runs must extract it
+  // non-empty.
+  it("the real CHANGELOG.md's top section extracts", async () => {
+    const changelog = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8");
+    const top = changelog.match(/^## (\S+)/m);
+    expect(top).not.toBeNull();
+    const r = await notes(top![1], join(ROOT, "CHANGELOG.md"));
     expect(r.code).toBe(0);
-    expect(r.output).toContain("#96");
+    expect(r.output.trim()).not.toBe("");
   });
 });
 

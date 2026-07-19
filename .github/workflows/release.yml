@@ -39,7 +39,11 @@ on:
     branches: [main]
 
 permissions:
-  contents: write # tag create via the API + gh release create
+  contents: write # tag create via the API + gh release create + the bump push
+  # Two consumers (labels.yml precedent — a declared permissions: block
+  # zeroes every unspecified scope): the decide step's label read
+  # (commits/<sha>/pulls) and the bump fallback's `gh pr create --label`.
+  pull-requests: write
 
 jobs:
   release:
@@ -58,6 +62,10 @@ jobs:
           # merge commit the maintainer shipped, which the tag created
           # below will name).
           ref: ${{ github.sha }}
+          # Depth 2: the pushed head's first parent must be resolvable for
+          # the decide step's all-zeros fallback (event.before on a
+          # branch-creation push).
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -159,9 +167,10 @@ jobs:
           MERGE_SHA: ${{ github.sha }}
         run: |
           # Assert 4 — no tag and no release exist for this version. Re-runs
-          # stay idempotent, and a manual race (an operator who tagged by
-          # hand between merge and here) fails loudly instead of
-          # double-publishing.
+          # of a completed ceremony REFUSE LOUDLY (red, creating nothing —
+          # the correct direction), and a manual race (an operator who
+          # tagged by hand between merge and here) fails the same way
+          # instead of double-publishing.
           if git ls-remote --exit-code origin "refs/tags/$RELEASE_VERSION" > /dev/null; then
             echo "tag '$RELEASE_VERSION' already exists — creating nothing (already released, or a manual tag won the race)." >&2
             exit 1
@@ -214,6 +223,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # next is computed from the RELEASE tree (the checkout), then
+          # applied to whatever main is by the time of the push — if main
+          # moved in the window, release+1 still lands on the newer head,
+          # which is the intended arithmetic either way.
           next="$(node -p 'const v = require("./package.json").version.split("."); v[2] = String(Number(v[2]) + 1) + "-dev"; v.join(".")')"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

@@ -69,12 +69,15 @@ on box#83's shape):
    *Manual fallback and backfill:* push a bare `X.Y.Z` tag on the merge
    commit yourself — the same workflow runs the same asserts, build, and
    publish from the tag.
-3. **Right after the release, a follow-up PR bumps `package.json` to
-   `X.Y.(Z+1)-dev`** (and `package-lock.json` with it) — box#90's step of
-   the family ritual. Installs are versioned by the tree's `package.json`
-   version, so a `CAST_REF=main` install between releases must land as
+3. **The release re-arms main itself**: the same workflow run bumps
+   `package.json` (and `package-lock.json`) to `X.Y.(Z+1)-dev` and pushes
+   the commit straight to main — no follow-up PR (it opens one only if
+   branch protection refuses the direct push, and says so loudly).
+   Installs are versioned by the tree's `package.json` version, so a
+   `CAST_REF=main` install between releases must land as
    `versions/X.Y.(Z+1)-dev`, never as `versions/X.Y.Z` — main's tree must
-   not impersonate the release it merely descends from.
+   not impersonate the release it merely descends from. On the *manual*
+   tag path the bump stays yours: open the one-line PR after publishing.
 
 ## Labels — who sets what
 

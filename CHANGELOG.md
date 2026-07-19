@@ -7,6 +7,22 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Fixed
+
+- **`apply` no longer demands a GitHub App for a manifest that declares no
+  applications** (#103) — found live in the 2026-07-19 release drill, where a
+  databases-only manifest (`applications: {}`) rendered its plan of two
+  creates and then died in preflight on `no GitHub App bound`, over a binding
+  nothing in the run would ever have used: a GitHub App exists to clone
+  application source, cast reads it in exactly one call (the application
+  create), and databases and services never touch it. That unconditional
+  resolution gated infra-only projects — the databases a fleet's other
+  projects share — behind the GitHub-App browser-registration ceremony for no
+  reason. `apply` now resolves the App only when the desired state actually
+  contains an application; a manifest that does declare one still refuses on
+  a missing binding exactly as before, clean plan or not, because that
+  binding is state the next create will need.
+
 ### Added
 
 - **Tagged releases with a prebuilt dist asset, and an installer that

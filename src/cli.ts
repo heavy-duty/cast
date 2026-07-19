@@ -1275,9 +1275,22 @@ async function runProject(
     );
   }
   const serverUuid = await ctx.client.serverUuid(ctx.binding.server);
-  const githubAppUuid = await ctx.client.githubAppUuid(
-    githubAppNameFor(ctx.bindings, orgRepo),
-  );
+  // A GitHub App is how Coolify clones application SOURCE, and cast reads it in
+  // exactly one place — the application create (buildExecutor's POST
+  // /applications/private-github-app). Databases and services never touch it,
+  // so it is resolved only when the manifest actually declares an application.
+  // Resolving it unconditionally is what killed a databases-only apply in
+  // preflight (#103, found live in the 2026-07-19 release drill): the plan
+  // rendered its two creates and then githubAppNameFor threw over a binding
+  // nothing in the run would ever have used — gating infra-only projects
+  // behind the GitHub-App browser-registration ceremony. Keyed off DESIRED
+  // rather than the plan's changes, deliberately: a manifest that declares an
+  // application keeps the refusal even on a clean plan, exactly as before —
+  // a missing binding there is state the next create will need, and the
+  // operator should hear about it now, not mid-bootstrap.
+  const githubAppUuid = desired.some((d) => d.kind === "application")
+    ? await ctx.client.githubAppUuid(githubAppNameFor(ctx.bindings, orgRepo))
+    : null;
   const exec = buildExecutor(ctx.client, {
     projectName,
     // The name the environment gets ON COOLIFY when apply creates it — so an
@@ -3155,7 +3168,10 @@ export function buildExecutor(
     projectName: string;
     envName: string;
     serverUuid: string;
-    githubAppUuid: string;
+    // null when the desired state declares no applications (#103): the App is
+    // read by the application create alone, and runProject only resolves one
+    // when there is an application for it to clone.
+    githubAppUuid: string | null;
     // The three names the multi-destination 400 has to be able to say back, and
     // the only reason they are here: none of them is on the wire. A create sends
     // `serverUuid`, but the operator wrote a server NAME — and the UUID they now
@@ -3379,6 +3395,16 @@ export function buildExecutor(
         );
         const projectUuid = await projectEnv();
         if (change.kind === "application") {
+          // Unreachable by construction (#103): githubAppUuid is null only
+          // when the desired state holds no applications, and a plan can only
+          // create resources the desired state holds. Guarded anyway — this is
+          // the uuid's single consumer, and a null slipping onto the wire
+          // would surface as a Coolify 422 about somebody else's field.
+          if (ctx.githubAppUuid === null) {
+            throw new Error(
+              "internal: application create reached an executor built without a GitHub App uuid — resolution was skipped as applications-free, yet the plan creates an application",
+            );
+          }
           const res = (await client.post("/applications/private-github-app", {
             project_uuid: projectUuid,
             environment_name: ctx.envName,

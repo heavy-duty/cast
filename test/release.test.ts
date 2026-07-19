@@ -205,7 +205,7 @@ describe("release.yml", () => {
       // Code-unique phrasings (the workflow's own comment table paraphrases
       // these states, so the pins anchor on the echo strings, not prose):
       "release-flow work under the release label, not a ceremony. Nothing to publish.", // work no-op, green
-      "— half a ceremony; a release PR ships a bare X.Y.Z", // -dev but changed: refuse
+      "a dev tree is by definition not a release", // -dev endstate: always work (the bump PR no-ops green)
       "release-flow work merged in the post-release window (before the -dev bump)", // window no-op
       "Refusing to guess — creating nothing.", // bare, unchanged, unreleased: refuse
       ".github/scripts/release-notes.sh", // assert: notes extract

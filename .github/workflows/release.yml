@@ -75,8 +75,10 @@ jobs:
       # trigger included. The version tells them apart, in four states:
       #   -dev, unchanged            → work under the label: green NOTICE
       #                                no-op, not a red run per infra PR
-      #   -dev, changed              → a bump that forgot to leave -dev:
-      #                                half a ceremony, refuse
+      #   -dev, changed              → still a dev tree, so still work —
+      #                                the post-release bump PR above all
+      #                                (bare -> -dev after every release):
+      #                                green NOTICE no-op
       #   bare, unchanged, released  → work merged in the post-release
       #                                window (ceremony landed, the -dev
       #                                bump has not — and cast's ENTIRE
@@ -109,8 +111,9 @@ jobs:
                 echo "ceremony=no" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
-              echo "version changed ('$base' -> '$ver') but is still -dev — half a ceremony; a release PR ships a bare X.Y.Z (CONTRIBUTING.md, Releasing) — creating nothing." >&2
-              exit 1 ;;
+              echo "NOTICE: version changed ('$base' -> '$ver') and still ends -dev — a dev tree is by definition not a release. This is work (the post-release bump, a renumber); nothing to publish."
+              echo "ceremony=no" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
           esac
           if [ "$base" = "$ver" ]; then
             if gh release view "$ver" > /dev/null 2>&1; then

@@ -7,6 +7,8 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+## 0.1.1 — 2026-07-19
+
 ### Fixed
 
 - **The release ceremony re-arms the changelog, and CI notices when it

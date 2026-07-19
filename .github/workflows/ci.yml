@@ -34,6 +34,12 @@ jobs:
       - run: npm test
       - name: installer is valid bash
         run: bash -n install.sh bin/cast scripts/*.sh .github/scripts/*.sh
+      # `bash -n` above is a syntax check on a hand-maintained list; it is not
+      # a linter and it does not notice a script it was never told about.
+      # This sweep derives its list from git and asserts the list covers every
+      # tracked *.sh, so a new script cannot go unlinted quietly (#118).
+      - name: shellcheck — every tracked shell script
+        run: bash .github/scripts/shellcheck-all.sh
       - name: labels state-machine tests
         run: bash test/labels-reconcile.sh
 

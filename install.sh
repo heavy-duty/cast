@@ -410,6 +410,10 @@ profile_for_shell() {
 }
 
 path_line_for() {
+  # $PATH below must land in the profile LITERALLY — it is expanded by the
+  # user's future shells, not by this one. The directive sits on the whole
+  # case because a directive on an individual branch is rejected (SC1124).
+  # shellcheck disable=SC2016
   case "$1" in
     */config.fish) printf 'fish_add_path %s\n' "$BINDIR" ;;
     *) printf 'export PATH="%s:$PATH"\n' "$BINDIR" ;;
@@ -427,6 +431,7 @@ else
     log "$PROFILE already puts $BINDIR on PATH — this shell just predates it."
   else
     mkdir -p "$(dirname "$PROFILE")"
+    # shellcheck disable=SC2094 # false positive: path_line_for only cases on its argument's NAME, it never reads the file
     { printf '\n%s\n' "$MARKER"; path_line_for "$PROFILE"; } >>"$PROFILE" \
       || die "could not write $PROFILE — add this line yourself: $(path_line_for "$PROFILE")"
     log "wired $BINDIR onto PATH in $PROFILE"

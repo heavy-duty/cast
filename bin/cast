@@ -263,6 +263,7 @@ command -v node >/dev/null 2>&1 || {
 }
 
 if [ ! -f "$ROOT/dist/cli.js" ]; then
+  # shellcheck disable=SC2016 # intentional: the backticked text is advice for a human to type, not something to expand here
   printf 'cast: %s/dist/cli.js is missing — run the installer, or `npm ci && npm run build` in %s\n' "$ROOT" "$ROOT" >&2
   exit 1
 fi

@@ -5,28 +5,7 @@ since its first commit, but grew its release surface (this file,
 `cast --version`, tagged releases with a prebuilt asset) on the way to
 actually cutting it, and this file starts there.
 
-## Unreleased
-
-### Added
-
-- **Merging a release-labeled PR is the release — and the release re-arms
-  main itself** (#111; box#96's design) — `release.yml` now also fires on
-  pushes to main (not `pull_request` events: fork-sourced ceremony PRs get
-  a read-only token there — the round-1 catch). A decide step reads the
-  version transition from the push (`event.before` → the pushed head) and
-  answers four states: release-flow *work* merged under the `release`
-  label — `-dev` endstates, and the post-release window — no-ops green
-  with a NOTICE; the two genuinely ambiguous bare states refuse loudly;
-  a true transition then requires a merged, `release`-labeled PR behind
-  the commit (read via the API — the label is the operator's declared
-  intent) before the door opens. It then tags the merge commit, builds
-  the `cast-X.Y.Z.tgz` asset once, publishes — and bumps main to
-  `X.Y.(Z+1)-dev` itself, direct push with a loud open-a-PR fallback, so
-  no follow-up bump PR exists on the paved road. The tag-push path stays
-  as the documented fallback and backfill, and both paths run the same
-  steps so they cannot drift. First-release edge: 0.1.0 never carried
-  `-dev`, so its ceremony (#110) ships by manual tag; the automation
-  applies from 0.1.1 on.
+## 0.1.0 — 2026-07-19
 
 ### Fixed
 
@@ -84,6 +63,25 @@ actually cutting it, and this file starts there.
   their own keys on disk.
 
 ### Added
+
+- **Merging a release-labeled PR is the release — and the release re-arms
+  main itself** (#111; box#96's design) — `release.yml` now also fires on
+  pushes to main (not `pull_request` events: fork-sourced ceremony PRs get
+  a read-only token there — the round-1 catch). A decide step reads the
+  version transition from the push (`event.before` → the pushed head) and
+  answers four states: release-flow *work* merged under the `release`
+  label — `-dev` endstates, and the post-release window — no-ops green
+  with a NOTICE; the two genuinely ambiguous bare states refuse loudly;
+  a true transition then requires a merged, `release`-labeled PR behind
+  the commit (read via the API — the label is the operator's declared
+  intent) before the door opens. It then tags the merge commit, builds
+  the `cast-X.Y.Z.tgz` asset once, publishes — and bumps main to
+  `X.Y.(Z+1)-dev` itself, direct push with a loud open-a-PR fallback, so
+  no follow-up bump PR exists on the paved road. The tag-push path stays
+  as the documented fallback and backfill, and both paths run the same
+  steps so they cannot drift. First-release edge: 0.1.0 never carried
+  `-dev`, so its ceremony (#110) ships by manual tag; the automation
+  applies from 0.1.1 on.
 
 - **Tagged releases with a prebuilt dist asset, and an installer that
   installs them** (#96) — the cast half of the flow designed in

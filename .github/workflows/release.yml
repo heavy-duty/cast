@@ -26,11 +26,15 @@ on:
     # assert LOUDLY below, not be silently skipped by a pattern that didn't
     # match.
     tags: ["**"]
-  pull_request:
-    # The merge-is-the-release path (#111). `closed` is the only type that
-    # can mean "merged"; the job gate below drops closed-unmerged and
-    # unlabeled closures.
-    types: [closed]
+  push:
+    # The merge-is-the-release path (#111) rides pushes to MAIN, not
+    # pull_request events, for one load-bearing reason the first review
+    # round caught: a workflow run triggered by a pull_request from a
+    # public FORK gets a READ-ONLY GITHUB_TOKEN — `permissions:` cannot
+    # raise that ceiling — and every ceremony PR this org has ever merged
+    # is cross-repo from the bot fork. The asserts would pass and the tag
+    # create would 403, red on main, every release. A push to main is an
+    # in-repo event with the full write token, whoever authored the PR.
     branches: [main]
 
 permissions:
@@ -38,28 +42,27 @@ permissions:
 
 jobs:
   release:
-    # Tag pushes always enter (the asserts below are the filter). PR
-    # closures enter only when the PR actually MERGED and carries the
-    # hand-set `release` label (LABELS.md: `release` is the operator's —
-    # automation never guesses intent).
-    if: >-
-      github.event_name == 'push' ||
-      (github.event.pull_request.merged == true &&
-       contains(github.event.pull_request.labels.*.name, 'release'))
+    # Tag pushes and main pushes both enter (the asserts below are the
+    # filter); the steps split on the ref. The hand-set `release` label
+    # (LABELS.md: `release` is the operator's — automation never guesses
+    # intent) is read via the API off the merge commit's PR, inside the
+    # decide step — a push event carries no PR payload, and the PR itself
+    # lives on a fork (the trigger comment).
+    if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          # Tag push: the tag. Merged PR: the MERGE COMMIT on main — the
-          # exact tree the maintainer shipped, which the tag created below
-          # will name.
-          ref: ${{ github.event.pull_request.merge_commit_sha || github.ref }}
+          # Either door: the pushed ref — a tag, or main's new head (the
+          # merge commit the maintainer shipped, which the tag created
+          # below will name).
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
       - name: "tag push: the tag must name package.json's version"
-        if: github.event_name == 'push'
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ver="$(node -p 'require("./package.json").version')"
           if [ "$GITHUB_REF_NAME" != "$ver" ]; then
@@ -94,14 +97,17 @@ jobs:
       #   bare, changed              → the ceremony: proceed
       - name: 'decide: ceremony, or release-flow work under the label?'
         id: decide
-        if: github.event_name == 'pull_request'
+        if: github.ref == 'refs/heads/main'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.before }}
           GH_TOKEN: ${{ github.token }}
         run: |
           # Versions read via node, never regex (the pkg_version discipline).
           ver="$(node -p 'require("./package.json").version')"
-          git fetch --depth=1 origin "$BASE_SHA"
+          # event.before is all-zeros on a branch-create push; the pushed
+          # head's first parent is main the instant before, either way.
+          case "$BASE_SHA" in *[!0]*) ;; *) BASE_SHA="$(git rev-parse "$GITHUB_SHA^1")" ;; esac
+          git fetch --depth=1 origin "$BASE_SHA" || true
           git show "$BASE_SHA:package.json" > "$RUNNER_TEMP/base-package.json"
           base="$(node -p 'require(process.env.RUNNER_TEMP + "/base-package.json").version')"
           case "$ver" in
@@ -125,10 +131,20 @@ jobs:
             echo "(If this PR was mislabeled, drop the label; if it was meant to release, it forgot the bump. The 0.1.0 first-release edge ships by manual tag — #111.)" >&2
             exit 1
           fi
+          # The version transitioned — now the LABEL, the operator's declared
+          # intent, read via the API because a push event carries no PR
+          # payload (and the PR lives on a fork — the trigger comment). No
+          # merged, release-labeled PR behind this commit = a transition
+          # nobody declared: refuse.
+          if ! gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+              -q '[.[] | select(.merged_at != null) | .labels[].name] | index("release") != null' | grep -qx true; then
+            echo "version transitioned ('$base' -> '$ver') but no merged, release-labeled PR is behind this commit — a release is a labeled ceremony PR (#111), not a bare push — creating nothing." >&2
+            exit 1
+          fi
           echo "ceremony=yes" >> "$GITHUB_OUTPUT"
           echo "RELEASE_VERSION=$ver" >> "$GITHUB_ENV"
       - name: release notes — the version's own CHANGELOG.md section
-        if: github.event_name == 'push' || steps.decide.outputs.ceremony == 'yes'
+        if: startsWith(github.ref, 'refs/tags/') || steps.decide.outputs.ceremony == 'yes'
         # Assert 3 on the merge path, the same fact on the tag path:
         # release-notes.sh fails loudly on a missing/empty section, which
         # fails the release here — before anything is created.
@@ -136,10 +152,10 @@ jobs:
           bash .github/scripts/release-notes.sh "$RELEASE_VERSION" > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
       - name: "merged release PR: nothing exists yet, then tag the merge commit"
-        if: github.event_name == 'pull_request' && steps.decide.outputs.ceremony == 'yes'
+        if: github.ref == 'refs/heads/main' && steps.decide.outputs.ceremony == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          MERGE_SHA: ${{ github.sha }}
         run: |
           # Assert 4 — no tag and no release exist for this version. Re-runs
           # stay idempotent, and a manual race (an operator who tagged by
@@ -161,7 +177,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/git/refs" \
             -f "ref=refs/tags/$RELEASE_VERSION" -f "sha=$MERGE_SHA"
       - name: build the prebuilt dist asset
-        if: github.event_name == 'push' || steps.decide.outputs.ceremony == 'yes'
+        if: startsWith(github.ref, 'refs/tags/') || steps.decide.outputs.ceremony == 'yes'
         # Build ONCE, in CI — the whole point of the asset (#96): the
         # installer's release channels never run npm or tsc. Deliberately no
         # check/tests here: ci.yml already gated the merge commit this
@@ -176,7 +192,7 @@ jobs:
           cp -R bin dist node_modules package.json "$RUNNER_TEMP/stage/cast-$RELEASE_VERSION/"
           tar -C "$RUNNER_TEMP/stage" -czf "$RUNNER_TEMP/cast-$RELEASE_VERSION.tgz" "cast-$RELEASE_VERSION"
       - name: create the release
-        if: github.event_name == 'push' || steps.decide.outputs.ceremony == 'yes'
+        if: startsWith(github.ref, 'refs/tags/') || steps.decide.outputs.ceremony == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

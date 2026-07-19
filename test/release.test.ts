@@ -176,13 +176,22 @@ describe("release.yml", () => {
     expect(RY).toContain('tags: ["**"]');
   });
 
-  it("triggers on closed PRs into main, gated on merged AND the release label (#111)", () => {
-    expect(RY).toContain("types: [closed]");
+  it("the merge door rides pushes to main — fork PR tokens are read-only (#111 r1)", () => {
+    // A pull_request run from a public fork gets a read-only GITHUB_TOKEN
+    // (permissions: cannot raise it), and every ceremony PR this org merges
+    // is cross-repo from the bot fork — the tag create would 403 after
+    // green asserts. The door triggers on push to main; the doors split on
+    // the pushed ref; the release label — still the operator's declared
+    // intent — is read via the API off the merge commit's PR, and a
+    // transition with no labeled PR behind it refuses.
     expect(RY).toContain("branches: [main]");
-    expect(RY).toContain("github.event.pull_request.merged == true");
+    expect(RY).toContain("startsWith(github.ref, 'refs/tags/')");
+    expect(RY).toContain("github.ref == 'refs/heads/main'");
+    expect(RY).toContain("commits/$GITHUB_SHA/pulls");
     expect(RY).toContain(
-      "contains(github.event.pull_request.labels.*.name, 'release')",
+      "no merged, release-labeled PR is behind this commit",
     );
+    expect(RY).not.toContain("pull_request:");
   });
 
   it("asserts tag == package.json version, and the assert precedes the create", () => {

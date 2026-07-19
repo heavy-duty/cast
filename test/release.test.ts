@@ -194,6 +194,15 @@ describe("release.yml", () => {
     expect(RY).not.toContain("pull_request:");
   });
 
+  it("the release re-arms main itself — the -dev bump folds into the release act", () => {
+    // Operator decision (#111 followup): the post-release bump PR was
+    // ceremony debris. Direct push with the job's token, PR fallback when
+    // branch protection refuses, merge-door only.
+    expect(RY).toContain("bump main to the next -dev");
+    expect(RY).toContain("opening the bump PR instead");
+    expect(RY).toContain("npm install --package-lock-only");
+  });
+
   it("asserts tag == package.json version, and the assert precedes the create", () => {
     expect(RY).toContain('require("./package.json").version');
     expect(RY).toContain("creating nothing");

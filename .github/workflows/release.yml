@@ -199,3 +199,35 @@ jobs:
           gh release create "$RELEASE_VERSION" --verify-tag \
             --title "$RELEASE_VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
             "$RUNNER_TEMP/cast-$RELEASE_VERSION.tgz"
+      # The post-release bump, folded into the release act (#111 followup —
+      # operator decision: a mechanical one-liner deserves no PR of its
+      # own). X.Y.(Z+1)-dev is arithmetic, not judgment: derived, committed
+      # straight to main with this job's token. A GITHUB_TOKEN push fires
+      # no workflows (anti-recursion), so the bump triggers neither the
+      # merge path nor a red run; should branch protection ever refuse the
+      # direct push, the step opens the bump PR itself and says so, loudly.
+      # Merge-door only (the decide gate): the manual tag path stays a
+      # fallback and does not rewrite main.
+      - name: bump main to the next -dev — the release re-arms main itself
+        if: github.ref == 'refs/heads/main' && steps.decide.outputs.ceremony == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          next="$(node -p 'const v = require("./package.json").version.split("."); v[2] = String(Number(v[2]) + 1) + "-dev"; v.join(".")')"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+          npm pkg set version="$next"
+          npm install --package-lock-only --ignore-scripts
+          git add package.json package-lock.json
+          git commit -m "chore: bump main to $next — a dev install must not impersonate $RELEASE_VERSION"
+          if ! git push origin main; then
+            echo "direct push refused (branch protection?) — opening the bump PR instead" >&2
+            git checkout -b "chore/bump-$next"
+            git push origin "chore/bump-$next"
+            gh pr create -R "$GITHUB_REPOSITORY" --head "chore/bump-$next" \
+              --title "chore: bump main to $next" \
+              --body "The post-release re-arm, opened by release.yml because the direct push was refused." \
+              --label release
+          fi

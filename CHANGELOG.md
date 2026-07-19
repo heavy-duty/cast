@@ -9,6 +9,18 @@ actually cutting it, and this file starts there.
 
 ### Fixed
 
+- **The release suite accepts the ceremony's own tree** (#108) —
+  `test/release.test.ts` demanded the real `CHANGELOG.md`'s literal
+  `Unreleased` section extract non-empty and contain `#96`: false by
+  construction on the `release: X.Y.Z` tree the ceremony's own PR produces
+  (it stamps that heading into `## X.Y.Z — date`), so the first real
+  release PR turned CI red and the flow blocked itself — invisible to the
+  fork rehearsals, which tag a branch (`release.yml` runs; `ci.yml` never
+  does). The guard now asserts its actual purpose: whatever the TOP `## `
+  section is — `Unreleased` between releases, the stamped version on and
+  right after one — the exact `release-notes.sh` the workflow runs
+  extracts it non-empty. rig's twin is heavy-duty/rig#44.
+
 - **`apply` no longer demands a GitHub App for a manifest that declares no
   applications** (#103) — found live in the 2026-07-19 release drill, where a
   databases-only manifest (`applications: {}`) rendered its plan of two

@@ -431,6 +431,13 @@ apply-from-nothing, so every generated secret in every store is a placeholder
 again. This used to be a hand `age` re-encrypt against production, with the prod
 key in a process substitution.
 
+**Greenfield needs zero passes** (#104): a manifest whose templates hold no
+`${…}` refs at all — databases only, or apps whose env is pure literals —
+applies from nothing. No store, no age key: `diff` and `apply` say out loud that
+the store is absent and was not needed, and proceed. The store appears the first
+time `capture` writes it, or the first time a template gains a placeholder —
+from then on, an absent store refuses exactly as before.
+
 `--generated-only` **inverts** capture's rule and changes nothing else: it fills
 the `generated_secrets` names and leaves every other name in the store **exactly as
 it is, byte for byte** — never re-read from the box, so a secret you rotated by

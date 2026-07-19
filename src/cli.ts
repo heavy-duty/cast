@@ -1158,7 +1158,24 @@ async function runProject(
   // store was never written is a project a fleet run cannot read — and under
   // --all the headline of this message is what the summary carries, so it has to
   // say which project and which file rather than "Command failed: age -d".
-  if (!existsSync(store)) {
+  //
+  // Unless nothing would ever be read from it (#104). A manifest whose templates
+  // hold no ${…} refs resolves against an absent store exactly as it would
+  // against an empty one — and the greenfield first apply (fresh box, databases
+  // only, no secret authored yet) is precisely that manifest. Refusing there is
+  // a chicken-and-egg with no exit: apply demands a store, and capture — the
+  // documented way to get one — rightly refuses a project that does not exist on
+  // the box yet, because apply is the verb that would create it. So the refusal
+  // is gated on the manifest actually REFERENCING a secret, asked via
+  // requiredSecrets — the same parser resolution itself uses, so the two cannot
+  // disagree about what "no refs" means — and the zero-refs case proceeds on {}
+  // with a loud note. No store also means no decrypt, so the age key is not
+  // demanded either: nothing to open, nothing to protect yet. The store appears
+  // the first time capture writes it, or a template gains a placeholder.
+  let secrets: Record<string, string>;
+  if (existsSync(store)) {
+    secrets = decryptSecrets(store, keyFileFor(ctx.envName));
+  } else if (requiredSecrets(checkout, ctx.envName).required.length > 0) {
     throw new Error(
       [
         `no secret store for ${orgRepo} in ${ctx.envName}`,
@@ -1169,8 +1186,12 @@ async function runProject(
         "diff or apply without it. `cast capture` writes one from a live box.",
       ].join("\n"),
     );
+  } else {
+    console.log(
+      `NOTE: no secret store for ${orgRepo} in ${ctx.envName} (looked for ${store}) — and none is needed: this manifest's templates hold no \${…} refs, so cast proceeds without a store or an age key. The store appears the first time capture writes it, or a template gains a placeholder.`,
+    );
+    secrets = {};
   }
-  const secrets = decryptSecrets(store, keyFileFor(ctx.envName));
   let { desired, resolvedEnvs } = desiredFromManifest(
     checkout,
     ctx.envName,

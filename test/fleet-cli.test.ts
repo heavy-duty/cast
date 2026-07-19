@@ -114,7 +114,7 @@ afterEach(async () => {
   await Promise.all(stubs.splice(0).map((s) => s.close()));
 });
 
-const manifest = (repo: string) => `project: ${repo}
+const manifest = (repo: string, withRef = false) => `project: ${repo}
 environments:
   staging:
     applications:
@@ -122,20 +122,33 @@ environments:
         source: { repo: heavy-duty/${repo}, branch: main }
         build: { pack: nixpacks, base_directory: / }
         domains: ["http://${repo}.example.com"]
-`;
+${withRef ? "        env_template: core.env\n" : ""}`;
 
 // A state dir + three clonable product repos. `registry` is the knob: which
 // slugs the `projects:` block registers for staging — undefined writes no
 // `projects:` block at all (a state file from before the registry existed).
+// `refIn` gives ONE repo a template with a ${…} ref: since #104 gated the
+// missing-store refusal on the manifest actually referencing a secret, a
+// fixture that wants to exercise that refusal has to reference one.
 function fixture(
   url: string,
-  opts: { registry?: string[]; registryEnv?: string } = {},
+  opts: { registry?: string[]; registryEnv?: string; refIn?: string } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "cast-fleet-"));
   for (const repo of REPOS) {
     const dir = join(root, "repos", "heavy-duty", `${repo}.git`);
     mkdirSync(join(dir, ".infra"), { recursive: true });
-    writeFileSync(join(dir, ".infra", "manifest.yaml"), manifest(repo));
+    writeFileSync(
+      join(dir, ".infra", "manifest.yaml"),
+      manifest(repo, repo === opts.refIn),
+    );
+    if (repo === opts.refIn) {
+      mkdirSync(join(dir, ".infra", "env"));
+      writeFileSync(
+        join(dir, ".infra", "env", "core.env"),
+        "API_KEY=${API_KEY}\n",
+      );
+    }
     const git = (...args: string[]) =>
       execFileSync("git", args, { cwd: dir, stdio: "pipe" });
     git("init", "-q");
@@ -157,9 +170,10 @@ function fixture(
     `COOLIFY_BASE_URL="${url}"\nCOOLIFY_ACCESS_TOKEN="t"\n`,
   );
   for (const repo of REPOS) {
-    // No template refs a secret, but the store still has to exist and open —
-    // a project whose store is missing is a project cast cannot read, which is
-    // a fleet ERROR, not a fleet skip (asserted below).
+    // No template refs a secret, so since #104 none of these stores is strictly
+    // required — but the pre-greenfield shape (store on disk, key injected) is
+    // the shape most fleets are in, and it has to keep working unchanged. The
+    // missing-store-with-a-ref refusal is exercised below by deleting one.
     execFileSync("age", ["-r", recipient, "-o", `${repo}.staging.env.age`], {
       input: "\n",
       cwd: join(state, "secrets"),
@@ -292,8 +306,11 @@ describe("cast diff --all (#26)", () => {
     expect(r.output).toContain("500");
   });
 
-  it("treats a missing secret store as unreachable, naming the file", async () => {
-    const f = fixture((await stubCoolify()).url);
+  // `refIn` matters: since #104 the refusal is gated on the manifest actually
+  // referencing a secret, so the missing store is only an error because beta's
+  // template holds a ${…} ref. The gate's other half is the test after this one.
+  it("treats a missing secret store as unreachable when a template refs a secret, naming the file", async () => {
+    const f = fixture((await stubCoolify()).url, { refIn: "beta" });
     execFileSync("rm", [join(f.state, "secrets", "beta.staging.env.age")]);
     const r = await run("diff", fleet(f), f);
     expect(r.code).toBe(2);
@@ -301,6 +318,22 @@ describe("cast diff --all (#26)", () => {
       "no secret store for heavy-duty/beta in staging",
     );
     expect(r.output).toContain("UNREACHABLE:  1  heavy-duty/beta");
+  });
+
+  // The greenfield gate (#104) under --all: a zero-refs project whose store was
+  // never written is READ, not failed — the note prints, the fleet stays whole.
+  it("reads a zero-refs project with no store, noting the absence instead of failing it", async () => {
+    const f = fixture((await stubCoolify()).url);
+    execFileSync("rm", [join(f.state, "secrets", "beta.staging.env.age")]);
+    const r = await run("diff", fleet(f), f);
+    expect(r.code).toBe(0);
+    expect(r.output).toContain(
+      "NOTE: no secret store for heavy-duty/beta in staging",
+    );
+    expect(r.output).toContain("read:         3 of 3");
+    expect(r.output).toContain(
+      "all 3 registered project(s) were read, and every one is clean.",
+    );
   });
 });
 

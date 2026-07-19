@@ -22,6 +22,23 @@ actually cutting it, and this file starts there.
   contains an application; a manifest that does declare one still refuses on
   a missing binding exactly as before, clean plan or not, because that
   binding is state the next create will need.
+- **A manifest with no `${…}` refs applies without a store** (#104) — the
+  greenfield manifest-first bootstrap was a chicken-and-egg with no exit,
+  found by the 2026-07-19 release drill against two fresh Coolify 4.1.2
+  instances: a registered project whose manifest declared databases only
+  (zero `${…}` refs) could not take its first `apply` — apply refused with
+  `no secret store for <org>/<repo> in <env>`, and `capture`, the documented
+  way to get a store, rightly refuses a project that is absent on the box,
+  because apply is the verb that would create it. The drill unblocked with a
+  hand-rolled empty store (`printf '' | age -r … -o secrets/….env.age`),
+  documented nowhere. Now `diff`/`apply` gate that refusal on the manifest
+  actually *referencing* a secret, asked via the same parser resolution
+  uses: when the templates resolve zero `${…}` refs, an absent store is
+  treated as empty and the run proceeds, printing a loud one-line note
+  naming the path the store would live at — and since there is nothing to
+  decrypt, the age key is not demanded either. The moment any template
+  gains a `${…}` ref, the refusal returns byte-identical to before.
+  `capture` and `destroy` are untouched.
 
 ### Added
 

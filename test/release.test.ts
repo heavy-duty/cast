@@ -157,8 +157,8 @@ describe("release-notes.sh", () => {
   it("the real CHANGELOG.md's top section extracts", async () => {
     const changelog = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8");
     const top = changelog.match(/^## (\S+)/m);
-    expect(top).not.toBeNull();
-    const r = await notes(top![1], join(ROOT, "CHANGELOG.md"));
+    if (!top) throw new Error("CHANGELOG.md has no ## section at all");
+    const r = await notes(top[1], join(ROOT, "CHANGELOG.md"));
     expect(r.code).toBe(0);
     expect(r.output.trim()).not.toBe("");
   });

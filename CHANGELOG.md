@@ -34,8 +34,24 @@ actually cutting it, and this file starts there.
   top section must be `## Unreleased`. That is the distinction #108 had
   to collapse to make the ceremony shippable at all, recovered rather
   than reverted: the ceremony stays green at every step, and a disarmed
-  dev `main` goes red. box and rig carry the same fix
-  (heavy-duty/box#108, heavy-duty/rig#66).
+  dev `main` goes red. The re-arm also forced the older extraction guard
+  to move. It asserted that the **top** section extracts non-empty, which
+  the re-armed ceremony tree — a deliberately empty `## Unreleased` above
+  the stamp — makes false by construction: the re-arm and the guard would
+  have contradicted each other, and the next release PR would have been
+  unshippable for a second time, the way #108 was. Keying to the top
+  section was only ever a stand-in for "the section `release.yml` will
+  publish", so the assert now names that section directly — on a bare
+  version the `## X.Y.Z` being shipped, on a `-dev` tree the newest
+  stamped one. Existence is checked with it: a bare version with no
+  matching section is a bump that never stamped, which used to pass every
+  test and fail only *after* the merge, in `release.yml`'s notes step,
+  past the ship decision and leaving `main` with a minted, unreleased
+  version to repair by hand. A double re-arm — two `## Unreleased`
+  headings, the extracted section silently the empty one — is red too.
+  box and rig carry the same fix (heavy-duty/box#110,
+  heavy-duty/rig#67); rig#67 retargeted the identical assert for the
+  identical reason.
 
 ## 0.1.0 — 2026-07-19
 

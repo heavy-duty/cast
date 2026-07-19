@@ -58,10 +58,17 @@ on box#83's shape):
    and merged after has its entry land *inside the shipped section*, which
    git does cleanly, with no conflict to warn anyone
    (heavy-duty/rig#66 — it happened there). `test/release.test.ts` keys
-   this to the version: a stamped top section is legal while
-   `package.json` is bare, but the moment step 3's `-dev` bump lands, the
-   top section must be `## Unreleased` or CI is red. CI green on it, same
-   loop as any PR.
+   this to the version, and checks both halves of the stamp:
+   - while `package.json` is bare, the top section may be the stamp or the
+     re-armed `## Unreleased`, but a `## X.Y.Z` section for the version you
+     are shipping **must exist and extract non-empty** — a bump without a
+     stamp is red here rather than after the merge, in release.yml;
+   - the moment step 3's `-dev` bump lands, the top section must be
+     `## Unreleased` or CI is red.
+
+   The empty `## Unreleased` this step adds is deliberately tolerated: what
+   must extract non-empty is the section that SHIPS, not the top one. CI
+   green on it, same loop as any PR.
 2. **Merge. That's the ship decision — nothing else to do.**
    [release.yml](.github/workflows/release.yml) fires on the merged,
    `release`-labeled PR and asserts, in order, each fail-loud and creating

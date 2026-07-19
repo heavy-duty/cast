@@ -151,16 +151,228 @@ describe("release-notes.sh", () => {
   // after it, the top section IS the stamped release. Demanding the literal
   // Unreleased (with an issue number inside it, rotting per release) made
   // the release PR unshippable by construction, invisible to fork
-  // rehearsals (a tag push runs release.yml, never ci.yml). Whatever the
-  // top section is called, the exact tool release.yml runs must extract it
-  // non-empty.
-  it("the real CHANGELOG.md's top section extracts", async () => {
+  // rehearsals (a tag push runs release.yml, never ci.yml).
+  //
+  // But keying the assert to the TOP section was only ever a stand-in for
+  // "the section release.yml will publish", and the re-arm (#113) breaks the
+  // stand-in: the ceremony PR now leaves a fresh, deliberately EMPTY
+  // `## Unreleased` on top of the section it just stamped, and an empty
+  // section is exactly what release-notes.sh refuses. Asserting the top
+  // section extracts would make the re-armed ceremony tree CI-red — #108's
+  // unshippability by another route, and the re-arm and the guard would
+  // contradict each other. So the assert retargets to the section that
+  // SHIPS, keyed on package.json the same way the arming rule below is
+  // (rig#67 made the identical move):
+  //
+  //   version BARE  — the tree is, or follows, the release of that version.
+  //                   `## <version>` is what release.yml extracts. It must
+  //                   exist and be non-empty. The top section is NOT
+  //                   constrained here; an empty re-armed Unreleased above
+  //                   it is correct.
+  //   version -dev  — nothing ships from this tree, and the top section is
+  //                   `## Unreleased`, legitimately empty between releases.
+  //                   Drift coverage retargets to the most recent STAMPED
+  //                   section, which release.yml did publish. Before the
+  //                   first release there is none, and that is not a fault.
+  it("the real CHANGELOG.md's SHIPPING section extracts (#113)", async () => {
+    const version = realVersion();
     const changelog = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8");
-    const top = changelog.match(/^## (\S+)/m);
-    if (!top) throw new Error("CHANGELOG.md has no ## section at all");
-    const r = await notes(top[1], join(ROOT, "CHANGELOG.md"));
+    const target = version.endsWith("-dev") ? firstStamped(changelog) : version;
+    if (!target) return; // greenfield -dev: nothing has shipped yet.
+    const r = await notes(target, join(ROOT, "CHANGELOG.md"));
     expect(r.code).toBe(0);
     expect(r.output.trim()).not.toBe("");
+  });
+});
+
+// --- the changelog is ARMED — the version says which state is legal --------
+// heavy-duty/rig#66. The section above proves the SHIPPING section extracts;
+// it deliberately does not care what the top section is CALLED, and cannot:
+// #108 relaxed exactly that, because the ceremony PR's own tree has a
+// stamped `## X.Y.Z` on top and a literal-Unreleased demand made the
+// release unshippable by construction. So nothing on main notices when
+// `## Unreleased` is simply gone.
+//
+// That gap is not theoretical. A PR that writes its entry under
+// `## Unreleased`, is authored before a release and merged after, has that
+// entry land under whatever heading now occupies the position — the
+// just-shipped `## X.Y.Z`. Git merges it CLEANLY: the stamped heading and
+// the incoming entry never overlap textually, so the one signal an author
+// relies on ("git told me to look") is absent precisely when the outcome is
+// wrong. It happened in rig: #60's entry landed inside published `## 0.1.0`.
+//
+// The rule that separates the two states #108 collapsed, without demanding
+// Unreleased unconditionally: **the package.json version keys it.** A bare
+// `X.Y.Z` means the tree IS (or immediately follows) a release — the
+// ceremony's stamped top section is legal there, and so is a re-armed
+// Unreleased. A `-dev` version means main between releases, where a stamped
+// top section can only mean the re-arm was skipped: `## Unreleased` is
+// mandatory. Green through the whole ceremony; red on a disarmed `-dev`
+// main, which is the state the guard exists to name.
+
+/** package.json's version — the fact the whole rule is keyed on. */
+function realVersion(): string {
+  return JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"))
+    .version as string;
+}
+
+/** The top `## ` section's token — `Unreleased`, or a stamped version. */
+function topSection(changelog: string): string {
+  const top = changelog.match(/^## (\S+)/m);
+  if (!top) throw new Error("changelog has no ## section at all");
+  return top[1];
+}
+
+/** The newest stamped (non-Unreleased) section's token, or null if none. */
+function firstStamped(changelog: string): string | null {
+  for (const m of changelog.matchAll(/^## (\S+)/gm)) {
+    if (m[1] !== "Unreleased") return m[1];
+  }
+  return null;
+}
+
+/** Does `## <token>` appear as a section heading at all? */
+function hasSection(changelog: string, token: string): boolean {
+  return [...changelog.matchAll(/^## (\S+)/gm)].some((m) => m[1] === token);
+}
+
+/** null = armed. A string = why this (version, changelog) pair is illegal. */
+function disarmedBecause(version: string, changelog: string): string | null {
+  const top = topSection(changelog);
+
+  // Idempotence: re-arming twice leaves two `## Unreleased` headings, and
+  // the section awk extracts is then the EMPTY first one — armed by the
+  // heading test, unpublishable in fact. One heading, always.
+  const unreleased = [...changelog.matchAll(/^## Unreleased\s*$/gm)].length;
+  if (unreleased > 1) {
+    return `the changelog carries ${unreleased} '## Unreleased' headings — the re-arm ran twice. Entries split across them, and the section release-notes.sh extracts is the empty first one.`;
+  }
+
+  if (version.endsWith("-dev")) {
+    return top === "Unreleased"
+      ? null
+      : `version ${version} is a dev tree, so the top section must be '## Unreleased' — found '## ${top}'. The release ceremony stamps Unreleased into the shipped version and must re-add an empty one (heavy-duty/rig#66); without it the next PR's entry lands inside ${top}'s published notes, with no merge conflict to warn anyone.`;
+  }
+
+  if (top !== "Unreleased" && top !== version) {
+    return `version ${version} is bare, so the top section must be '## Unreleased' (re-armed) or the matching '## ${version}' (the ceremony tree) — found '## ${top}'.`;
+  }
+
+  // A bare version is a SHIP claim: release.yml will extract `## <version>`
+  // and publish it. Every legal bare state has that section — the ceremony
+  // tree (stamped on top), the re-armed ceremony tree (stamped under an
+  // empty Unreleased), and main in the post-release window. Its absence is
+  // the half-ceremony: bumped, never stamped. That passed the heading rule
+  // alone and failed only AFTER merge, in release.yml's notes step — past
+  // the ship decision, leaving main with a minted, unreleased bare version
+  // the decide step then refuses on re-runs. Red here, one round earlier.
+  if (!hasSection(changelog, version)) {
+    return `version ${version} is bare — a ship claim — but there is no '## ${version}' section to publish. The ceremony bumped the version without stamping the changelog; release.yml's notes step would refuse AFTER the merge, past the ship decision.`;
+  }
+
+  return null;
+}
+
+describe("the changelog is armed for the next entry (rig#66)", () => {
+  const work = mkdtempSync(join(tmpdir(), "cast-arming-"));
+  const dated = (v: string) => `## ${v} — 2026-07-19`;
+  const body = "\n\n- **An entry** — prose.\n";
+  const armed = `# Changelog\n\n## Unreleased${body}\n${dated("0.2.0")}${body}`;
+  const stamped = `# Changelog\n\n${dated("0.2.0")}${body}`;
+  // The tree CONTRIBUTING step 1 actually mandates: the stamped section with
+  // a fresh, EMPTY `## Unreleased` above it. The `armed` fixture gives
+  // Unreleased a body and so never exercises this one.
+  const rearmed = `# Changelog\n\n## Unreleased\n\n${dated("0.2.0")}${body}`;
+
+  /** Run the REAL release-notes.sh against a fixture changelog. */
+  const extract = (name: string, changelog: string, ver: string) => {
+    const file = join(work, `${name}.md`);
+    writeFileSync(file, changelog);
+    return run("bash", [NOTES, ver, file]);
+  };
+
+  it("the REAL tree is armed — package.json and CHANGELOG.md agree", () => {
+    const changelog = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8");
+    expect(disarmedBecause(realVersion(), changelog)).toBeNull();
+  });
+
+  // The ceremony, walked end to end. Every state green — this is the #108
+  // regression the guard must not re-introduce.
+  it("stays green through the ceremony: the release PR's own stamped tree", () => {
+    expect(disarmedBecause("0.2.0", stamped)).toBeNull();
+  });
+
+  it("stays green through the ceremony: the ceremony PR that re-arms too", () => {
+    expect(disarmedBecause("0.2.0", armed)).toBeNull();
+  });
+
+  // The state the whole re-arm turns on, and the one this guard is most at
+  // risk of contradicting: CONTRIBUTING's mandated tree, whose top section is
+  // an EMPTY `## Unreleased`. Asserted end to end — the arming rule passes it
+  // AND the exact tool release.yml runs extracts the section that ships. An
+  // assert aimed at the TOP section here is #108's unshippability again
+  // (rig#67 retargeted the same assert for the same reason).
+  it("the MANDATED ceremony tree — empty Unreleased over the stamp — is green end to end", async () => {
+    expect(disarmedBecause("0.2.0", rearmed)).toBeNull();
+    const r = await extract("rearmed", rearmed, "0.2.0");
+    expect(r.code).toBe(0);
+    expect(r.output).toContain("An entry");
+    // And the empty top section is untouchable by release.yml, as intended.
+    const top = await extract("rearmed", rearmed, "Unreleased");
+    expect(top.code).toBe(1);
+  });
+
+  it("stays green through the ceremony: main in the post-release window", () => {
+    // Merged, tagged, published — the -dev bump has not landed yet.
+    expect(disarmedBecause("0.2.0", stamped)).toBeNull();
+  });
+
+  it("stays green through the ceremony: main after the -dev bump, re-armed", () => {
+    expect(disarmedBecause("0.2.1-dev", armed)).toBeNull();
+  });
+
+  // And red on the one state the extraction guard cannot see.
+  it("goes RED on a disarmed -dev main — the rig#66 failure, exactly", () => {
+    const why = disarmedBecause("0.2.1-dev", stamped);
+    expect(why).toContain("must be '## Unreleased'");
+    expect(why).toContain("rig#66");
+  });
+
+  it("goes RED when a bare version's stamp names a different release", () => {
+    // A hand-stamp that drifted from the bump it shipped with.
+    expect(
+      disarmedBecause("0.2.0", `# Changelog\n\n${dated("0.1.9")}${body}`),
+    ).toContain("the ceremony tree");
+  });
+
+  // The half-ceremony: bumped, never stamped. Green under the heading rule
+  // alone — the top IS `## Unreleased`, re-armed and populated — and it fails
+  // only after the merge, in release.yml's notes step, past the ship
+  // decision. Asserted against the real tool so the post-merge failure this
+  // pre-empts is the actual one, not a paraphrase of it.
+  it("goes RED on the half-ceremony: bumped bare, changelog never stamped", async () => {
+    const half = `# Changelog\n\n## Unreleased${body}`;
+    const why = disarmedBecause("0.2.0", half);
+    expect(why).toContain("no '## 0.2.0' section");
+    // Exactly what release.yml would have done instead, after the merge.
+    const r = await extract("half", half, "0.2.0");
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("no section for '0.2.0'");
+  });
+
+  // Idempotence: re-arming an already-armed file is silently wrong, because
+  // the section awk extracts is then the empty first heading.
+  it("goes RED on a double re-arm — two Unreleased headings", () => {
+    const twice = `# Changelog\n\n## Unreleased\n\n## Unreleased${body}\n${dated("0.2.0")}${body}`;
+    expect(disarmedBecause("0.2.1-dev", twice)).toContain(
+      "2 '## Unreleased' headings",
+    );
+  });
+
+  it("refuses a changelog with no sections at all rather than passing it", () => {
+    expect(() => disarmedBecause("0.2.1-dev", "# Changelog\n")).toThrow(
+      "no ## section",
+    );
   });
 });
 

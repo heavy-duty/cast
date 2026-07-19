@@ -51,7 +51,24 @@ on box#83's shape):
 1. A small PR — `release: X.Y.Z`, labeled `release` — bumps `package.json`'s
    `version` (and `package-lock.json`; `npm install --package-lock-only`
    keeps them in step) and stamps `CHANGELOG.md`'s Unreleased section as
-   `## X.Y.Z — YYYY-MM-DD`. CI green on it, same loop as any PR.
+   `## X.Y.Z — YYYY-MM-DD`. **Then re-arm: add a fresh, empty
+   `## Unreleased` immediately above the section you just stamped.** The
+   same PR, the same diff — stamping without re-arming leaves main with no
+   `## Unreleased`, and the next PR that was authored before the release
+   and merged after has its entry land *inside the shipped section*, which
+   git does cleanly, with no conflict to warn anyone
+   (heavy-duty/rig#66 — it happened there). `test/release.test.ts` keys
+   this to the version, and checks both halves of the stamp:
+   - while `package.json` is bare, the top section may be the stamp or the
+     re-armed `## Unreleased`, but a `## X.Y.Z` section for the version you
+     are shipping **must exist and extract non-empty** — a bump without a
+     stamp is red here rather than after the merge, in release.yml;
+   - the moment step 3's `-dev` bump lands, the top section must be
+     `## Unreleased` or CI is red.
+
+   The empty `## Unreleased` this step adds is deliberately tolerated: what
+   must extract non-empty is the section that SHIPS, not the top one. CI
+   green on it, same loop as any PR.
 2. **Merge. That's the ship decision — nothing else to do.**
    [release.yml](.github/workflows/release.yml) fires on the merged,
    `release`-labeled PR and asserts, in order, each fail-loud and creating
@@ -78,6 +95,10 @@ on box#83's shape):
    `versions/X.Y.(Z+1)-dev`, never as `versions/X.Y.Z` — main's tree must
    not impersonate the release it merely descends from. On the *manual*
    tag path the bump stays yours: open the one-line PR after publishing.
+   This step re-arms the **version** only — the `## Unreleased` heading is
+   step 1's, in the ceremony PR's own diff, because no workflow ever writes
+   `CHANGELOG.md`. The two halves meet in `test/release.test.ts`: once this
+   bump makes the version `-dev`, a missing `## Unreleased` is CI-red.
 
 ## Labels — who sets what
 

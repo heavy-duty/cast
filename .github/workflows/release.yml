@@ -68,39 +68,64 @@ jobs:
             exit 1
           fi
           echo "RELEASE_VERSION=$ver" >> "$GITHUB_ENV"
-      - name: "merged release PR: the version must have left -dev in THIS PR"
+      # The decide step — the version asserts fused, because the `release`
+      # label carries TWO legitimate meanings (LABELS.md: "release flow and
+      # version/packaging work"): the ceremony PR that ships a version, and
+      # ordinary work ON the release machinery — the PR that added this very
+      # trigger included. The version tells them apart, in four states:
+      #   -dev, unchanged            → work under the label: green NOTICE
+      #                                no-op, not a red run per infra PR
+      #   -dev, changed              → a bump that forgot to leave -dev:
+      #                                half a ceremony, refuse
+      #   bare, unchanged, released  → work merged in the post-release
+      #                                window (ceremony landed, the -dev
+      #                                bump has not — and cast's ENTIRE
+      #                                pre-0.1.1 era, since 0.1.0 never
+      #                                carried -dev): green NOTICE no-op
+      #   bare, unchanged, UNreleased→ the label says ship but this PR did
+      #                                not mint the version: refuse to
+      #                                guess. This is also the known
+      #                                first-release edge (#111): the 0.1.0
+      #                                ceremony (#110) ships by manual tag,
+      #                                the fallback path; the automation
+      #                                applies from 0.1.1 on.
+      #   bare, changed              → the ceremony: proceed
+      - name: 'decide: ceremony, or release-flow work under the label?'
+        id: decide
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Assert 1 — the merged tree carries a release version, read via
-          # node, never regex (the pkg_version discipline).
+          # Versions read via node, never regex (the pkg_version discipline).
           ver="$(node -p 'require("./package.json").version')"
-          case "$ver" in
-            *-dev)
-              echo "package.json version '$ver' is a -dev version — creating nothing." >&2
-              echo "A release PR bumps package.json OFF -dev (CONTRIBUTING.md, Releasing); this merge did not." >&2
-              exit 1 ;;
-          esac
-          # Assert 2 — the version CHANGED in this PR (PR base vs merge):
-          # the -dev transition is the interlock, so a mislabeled ordinary
-          # PR — whose merge leaves the version untouched — fails HERE,
-          # loudly, instead of re-releasing main's standing version.
-          #
-          # Known first-release edge (#111): 0.1.0 never carried -dev (cast
-          # predates the -dev ritual), so this interlock correctly does NOT
-          # fire for the 0.1.0 ceremony (#110) — that one ships by manual
-          # tag, the fallback path; the automation applies from 0.1.1 on.
           git fetch --depth=1 origin "$BASE_SHA"
           git show "$BASE_SHA:package.json" > "$RUNNER_TEMP/base-package.json"
           base="$(node -p 'require(process.env.RUNNER_TEMP + "/base-package.json").version')"
+          case "$ver" in
+            *-dev)
+              if [ "$base" = "$ver" ]; then
+                echo "NOTICE: version '$ver' is -dev and unchanged by this PR — release-flow work under the release label, not a ceremony. Nothing to publish."
+                echo "ceremony=no" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "version changed ('$base' -> '$ver') but is still -dev — half a ceremony; a release PR ships a bare X.Y.Z (CONTRIBUTING.md, Releasing) — creating nothing." >&2
+              exit 1 ;;
+          esac
           if [ "$base" = "$ver" ]; then
-            echo "package.json version is '$ver' both before and after this PR — creating nothing." >&2
-            echo "A release-labeled PR must BE the version transition (#111). If this PR was mislabeled, drop the label; if it was meant to release, it forgot the bump." >&2
+            if gh release view "$ver" > /dev/null 2>&1; then
+              echo "NOTICE: version '$ver' is already released and unchanged by this PR — release-flow work merged in the post-release window (before the -dev bump). Nothing to publish."
+              echo "ceremony=no" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "version '$ver' is bare, unchanged by this PR, and never released — the label says ship but this PR did not mint the version. Refusing to guess — creating nothing." >&2
+            echo "(If this PR was mislabeled, drop the label; if it was meant to release, it forgot the bump. The 0.1.0 first-release edge ships by manual tag — #111.)" >&2
             exit 1
           fi
+          echo "ceremony=yes" >> "$GITHUB_OUTPUT"
           echo "RELEASE_VERSION=$ver" >> "$GITHUB_ENV"
       - name: release notes — the version's own CHANGELOG.md section
+        if: github.event_name == 'push' || steps.decide.outputs.ceremony == 'yes'
         # Assert 3 on the merge path, the same fact on the tag path:
         # release-notes.sh fails loudly on a missing/empty section, which
         # fails the release here — before anything is created.
@@ -108,7 +133,7 @@ jobs:
           bash .github/scripts/release-notes.sh "$RELEASE_VERSION" > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
       - name: "merged release PR: nothing exists yet, then tag the merge commit"
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.decide.outputs.ceremony == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
@@ -133,6 +158,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/git/refs" \
             -f "ref=refs/tags/$RELEASE_VERSION" -f "sha=$MERGE_SHA"
       - name: build the prebuilt dist asset
+        if: github.event_name == 'push' || steps.decide.outputs.ceremony == 'yes'
         # Build ONCE, in CI — the whole point of the asset (#96): the
         # installer's release channels never run npm or tsc. Deliberately no
         # check/tests here: ci.yml already gated the merge commit this
@@ -147,6 +173,7 @@ jobs:
           cp -R bin dist node_modules package.json "$RUNNER_TEMP/stage/cast-$RELEASE_VERSION/"
           tar -C "$RUNNER_TEMP/stage" -czf "$RUNNER_TEMP/cast-$RELEASE_VERSION.tgz" "cast-$RELEASE_VERSION"
       - name: create the release
+        if: github.event_name == 'push' || steps.decide.outputs.ceremony == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

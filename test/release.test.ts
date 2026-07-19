@@ -193,19 +193,24 @@ describe("release.yml", () => {
     );
   });
 
-  it("the merge path asserts its four facts IN ORDER, all before tag-create, build, and publish", () => {
-    // Assert 1: non--dev version at the merge commit. Assert 2: the version
-    // changed in THIS PR (the -dev interlock; base read from git, version
-    // read via node). Assert 3: the shared notes extraction. Assert 4: no
-    // existing tag or release. Only then the acts: API-tag the merge
-    // commit, build, publish — every marker present, strictly in file
-    // order, fail-closed.
+  it("the merge path decides, then asserts, IN ORDER, all before tag-create, build, and publish", () => {
+    // The decide step (the fused version asserts — see the workflow's
+    // four-state table): base read from git, versions via node, work under
+    // the label no-ops green, half-ceremonies refuse. Then: the shared
+    // notes extraction, the no-existing-tag/release asserts, and only then
+    // the acts — API-tag the merge commit, build, publish. Every marker
+    // present, strictly in file order, fail-closed.
     const markers = [
-      "is a -dev version", // assert 1
-      'git show "$BASE_SHA:package.json"', // assert 2 — base vs merge
-      ".github/scripts/release-notes.sh", // assert 3
-      'git ls-remote --exit-code origin "refs/tags/$RELEASE_VERSION"', // assert 4a
-      'gh release view "$RELEASE_VERSION"', // assert 4b
+      'git show "$BASE_SHA:package.json"', // decide — base vs merge
+      // Code-unique phrasings (the workflow's own comment table paraphrases
+      // these states, so the pins anchor on the echo strings, not prose):
+      "release-flow work under the release label, not a ceremony. Nothing to publish.", // work no-op, green
+      "— half a ceremony; a release PR ships a bare X.Y.Z", // -dev but changed: refuse
+      "release-flow work merged in the post-release window (before the -dev bump)", // window no-op
+      "Refusing to guess — creating nothing.", // bare, unchanged, unreleased: refuse
+      ".github/scripts/release-notes.sh", // assert: notes extract
+      'git ls-remote --exit-code origin "refs/tags/$RELEASE_VERSION"', // assert: no tag
+      'gh release view "$RELEASE_VERSION"', // assert: no release (the decide's own view sits earlier — count checked below)
       'gh api "repos/$GITHUB_REPOSITORY/git/refs"', // act: tag the merge commit
       "npm prune --omit=dev", // act: build
       'gh release create "$RELEASE_VERSION"', // act: publish

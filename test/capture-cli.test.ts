@@ -1,17 +1,11 @@
 import { execFileSync, spawn } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { decryptSecrets, encryptSecrets } from "../src/secrets.js";
+import { tmp } from "./helpers/tmp.js";
 
 // End-to-end: the real CLI, a real age identity, a stub Coolify holding real
 // live values. The point is the store that comes out the other side — it is
@@ -34,7 +28,7 @@ let keyFile: string;
 let recipient: string;
 
 beforeAll(() => {
-  const dir = mkdtempSync(join(tmpdir(), "cast-age-"));
+  const dir = tmp("cast-age-");
   keyFile = join(dir, "age-staging.key");
   execFileSync("age-keygen", ["-o", keyFile], { stdio: "pipe" });
   const pub = execFileSync("age-keygen", ["-y", keyFile], { encoding: "utf8" });
@@ -110,7 +104,7 @@ function fixture(
   url: string,
   opts: { template?: string; manifest?: string } = {},
 ) {
-  const checkout = mkdtempSync(join(tmpdir(), "cast-co-"));
+  const checkout = tmp("cast-co-");
   mkdirSync(join(checkout, ".infra", "env"), { recursive: true });
   writeFileSync(
     join(checkout, ".infra", "manifest.yaml"),
@@ -121,7 +115,7 @@ function fixture(
     opts.template ?? TEMPLATE,
   );
 
-  const state = mkdtempSync(join(tmpdir(), "cast-state-"));
+  const state = tmp("cast-state-");
   mkdirSync(join(state, "secrets"));
   writeFileSync(
     join(state, ".coolify.env"),

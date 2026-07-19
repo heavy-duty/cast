@@ -2,20 +2,19 @@ import { execFileSync, spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { loadBindings } from "../src/bindings.js";
 import { GENERATED_PLACEHOLDER } from "../src/capture.js";
 import { loadManifest } from "../src/manifest.js";
 import { decryptSecrets } from "../src/secrets.js";
+import { tmp } from "./helpers/tmp.js";
 
 // `cast inventory --emit-draft` against a stub shaped like the box that made it
 // necessary: a Coolify nobody declared, holding our stack under names someone
@@ -215,7 +214,7 @@ let KEY_FILE = "";
 let RECIPIENT = "";
 
 beforeAll(() => {
-  const dir = mkdtempSync(join(tmpdir(), "cast-age-"));
+  const dir = tmp("cast-age-");
   KEY_FILE = join(dir, "key.txt");
   execFileSync("age-keygen", ["-o", KEY_FILE], { stdio: "ignore" });
   RECIPIENT = execFileSync("age-keygen", ["-y", KEY_FILE], {
@@ -224,7 +223,7 @@ beforeAll(() => {
 });
 
 function fixture(url: string, opts: { recipient?: string } = {}) {
-  const state = mkdtempSync(join(tmpdir(), "cast-state-"));
+  const state = tmp("cast-state-");
   writeFileSync(
     join(state, ".coolify.env"),
     `COOLIFY_BASE_URL="${url}"\nCOOLIFY_ACCESS_TOKEN="t"\n`,
@@ -242,7 +241,7 @@ function fixture(url: string, opts: { recipient?: string } = {}) {
       "",
     ].join("\n"),
   );
-  const out = join(mkdtempSync(join(tmpdir(), "cast-out-")), "draft");
+  const out = join(tmp("cast-out-"), "draft");
   return { state, out };
 }
 

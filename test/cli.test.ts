@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 // Spawned ASYNCHRONOUSLY, and that is load-bearing: the stub Coolify below
 // runs in THIS process, so a blocking execFileSync would hold the event loop
@@ -74,7 +74,7 @@ function stateWith(opts: {
   named?: Record<string, string>;
   boundInstance?: string;
 }): string {
-  const dir = mkdtempSync(join(tmpdir(), "cast-cli-"));
+  const dir = tmp("cast-cli-");
   if (opts.default) writeFileSync(join(dir, ".coolify.env"), opts.default);
   if (opts.named) {
     mkdirSync(join(dir, ".coolify"));

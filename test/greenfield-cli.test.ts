@@ -1,10 +1,10 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 // The greenfield manifest-first bootstrap (#104), end to end: fresh box,
 // registered project, a manifest that declares databases only and refs no
@@ -23,7 +23,7 @@ let recipient: string;
 let keyFile: string;
 
 beforeAll(() => {
-  const dir = mkdtempSync(join(tmpdir(), "cast-age-"));
+  const dir = tmp("cast-age-");
   keyFile = join(dir, "age.key");
   execFileSync("age-keygen", ["-o", keyFile], { stdio: "pipe" });
   recipient = execFileSync("age-keygen", ["-y", keyFile], {
@@ -100,7 +100,7 @@ function fixture(
     manifest: ZERO_REFS_MANIFEST,
   },
 ) {
-  const checkout = mkdtempSync(join(tmpdir(), "cast-co-"));
+  const checkout = tmp("cast-co-");
   mkdirSync(join(checkout, ".infra", "env"), { recursive: true });
   writeFileSync(join(checkout, ".infra", "manifest.yaml"), opts.manifest);
   writeFileSync(
@@ -108,7 +108,7 @@ function fixture(
     "API_KEY=${API_KEY}\n",
   );
 
-  const state = mkdtempSync(join(tmpdir(), "cast-state-"));
+  const state = tmp("cast-state-");
   mkdirSync(join(state, "secrets"));
   writeFileSync(
     join(state, ".coolify.env"),
@@ -148,7 +148,7 @@ function run(
     const { CAST_AGE_KEY_FILE_STAGING: _dropped, ...inherited } = process.env;
     const env = opts.withKey
       ? { ...inherited, CAST_AGE_KEY_FILE_STAGING: keyFile }
-      : { ...inherited, HOME: mkdtempSync(join(tmpdir(), "cast-home-")) };
+      : { ...inherited, HOME: tmp("cast-home-") };
     const child = spawn("node", ["dist/cli.js", "diff", ...args], {
       stdio: ["pipe", "pipe", "pipe"],
       env,

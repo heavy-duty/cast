@@ -4,16 +4,15 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readlinkSync,
   realpathSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 const run = promisify(execFile);
 
@@ -59,7 +58,7 @@ type Sandbox = {
 };
 
 function sandbox(): Sandbox {
-  const root = mkdtempSync(join(tmpdir(), "cast-install-"));
+  const root = tmp("cast-install-");
   const stubs = join(root, "stubs");
   const home = join(root, "home");
   const dest = join(root, "cast-home");

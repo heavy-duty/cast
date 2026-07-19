@@ -1,10 +1,10 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 // When does `apply` need a GitHub App at all? (#103, found live in the
 // 2026-07-19 release drill.)
@@ -26,7 +26,7 @@ let recipient: string;
 let keyFile: string;
 
 beforeAll(() => {
-  const dir = mkdtempSync(join(tmpdir(), "cast-age-"));
+  const dir = tmp("cast-age-");
   keyFile = join(dir, "age.key");
   execFileSync("age-keygen", ["-o", keyFile], { stdio: "pipe" });
   recipient = execFileSync("age-keygen", ["-y", keyFile], {
@@ -112,11 +112,11 @@ environments:
 
 // The state file the issue is about: no github_apps entry for this repo at all.
 function fixture(url: string, manifest: string) {
-  const checkout = mkdtempSync(join(tmpdir(), "cast-co-"));
+  const checkout = tmp("cast-co-");
   mkdirSync(join(checkout, ".infra", "env"), { recursive: true });
   writeFileSync(join(checkout, ".infra", "manifest.yaml"), manifest);
 
-  const state = mkdtempSync(join(tmpdir(), "cast-state-"));
+  const state = tmp("cast-state-");
   mkdirSync(join(state, "secrets"));
   writeFileSync(
     join(state, ".coolify.env"),

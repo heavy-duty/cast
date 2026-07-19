@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { classify } from "../src/capture.js";
@@ -12,6 +11,7 @@ import {
   requiredSecrets,
 } from "../src/resolve.js";
 import { SMOKE_KEEP_KEY, SMOKE_PROBE_KEY } from "../src/smoke.js";
+import { tmp } from "./helpers/tmp.js";
 
 // #50. Coolify injects SOURCE_COMMIT and the COOLIFY_* family itself, and SKIPS
 // its own injection of a name the resource already carries a var of
@@ -58,7 +58,7 @@ describe("the rule", () => {
 // --- resolve / apply: REFUSE ---------------------------------------------------
 
 function checkout(template: string, envName = "staging"): string {
-  const dir = mkdtempSync(join(tmpdir(), "infra-reserved-"));
+  const dir = tmp("infra-reserved-");
   mkdirSync(join(dir, ".infra", "env"), { recursive: true });
   writeFileSync(
     join(dir, ".infra", "manifest.yaml"),

@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 // `cast smoke`, end to end, against the instance shape #29 is actually about.
 //
@@ -167,7 +167,7 @@ function state(
     "acme/client-site": "core",
   },
 ): string {
-  const dir = mkdtempSync(join(tmpdir(), "cast-smoke-"));
+  const dir = tmp("cast-smoke-");
   writeFileSync(
     join(dir, ".coolify.env"),
     `COOLIFY_BASE_URL="${url}"\nCOOLIFY_ACCESS_TOKEN="t"\n`,

@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { GENERATED_PLACEHOLDER } from "../src/capture.js";
@@ -14,6 +13,7 @@ import {
 } from "../src/draft.js";
 import { templateKeys, templateRefs } from "../src/envtemplate.js";
 import { loadManifest } from "../src/manifest.js";
+import { tmp } from "./helpers/tmp.js";
 
 const ctx = {
   env: "prod",
@@ -240,7 +240,7 @@ describe("planDraft — the emitted shape", () => {
     expect(manifest?.content).toContain("`apply` does not read this file");
     expect(manifest?.content).toContain("box-b");
 
-    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const dir = tmp("cast-draft-");
     const path = join(dir, "manifest.yaml");
     writeFileSync(path, manifest?.content ?? "");
     const loaded = loadManifest(path);
@@ -285,7 +285,7 @@ describe("planDraft — the emitted shape", () => {
     });
     const plan = planDraft([p], ctx);
     const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
-    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const dir = tmp("cast-draft-");
     const path = join(dir, "manifest.yaml");
     writeFileSync(path, manifest?.content ?? "");
     const build =
@@ -325,7 +325,7 @@ describe("planDraft — the emitted shape", () => {
     });
     const plan = planDraft([p], ctx);
     const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
-    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const dir = tmp("cast-draft-");
     const path = join(dir, "manifest.yaml");
     writeFileSync(path, manifest?.content ?? "");
     // The whole point: it loads (does not throw), and simply carries no `static`.
@@ -374,7 +374,7 @@ describe("planDraft — the emitted shape", () => {
     // `static: true` would be exactly the fabrication UNCAPTURED.md exists to
     // prevent.
     const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
-    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const dir = tmp("cast-draft-");
     const path = join(dir, "manifest.yaml");
     writeFileSync(path, manifest?.content ?? "");
     const build =
@@ -598,7 +598,7 @@ describe("backup schedules — read and drafted, not hand-waved (#75)", () => {
   });
   const loadedDb = (plan: ReturnType<typeof planDraft>) => {
     const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
-    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const dir = tmp("cast-draft-");
     const path = join(dir, "manifest.yaml");
     writeFileSync(path, manifest?.content ?? "");
     return loadManifest(path).environments.prod.databases?.[
@@ -690,7 +690,7 @@ describe("service hostnames — read and drafted via the per-service GET (#83)",
     });
   const loadedSvc = (plan: ReturnType<typeof planDraft>) => {
     const manifest = plan.files.find((f) => f.path.endsWith("manifest.yaml"));
-    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const dir = tmp("cast-draft-");
     const path = join(dir, "manifest.yaml");
     writeFileSync(path, manifest?.content ?? "");
     return loadManifest(path).environments.prod.services?.["Incubator Umami"];
@@ -739,20 +739,20 @@ describe("service hostnames — read and drafted via the per-service GET (#83)",
 
 describe("the emit refusals — adoption is one-way", () => {
   it("refuses a target directory that is not empty", () => {
-    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const dir = tmp("cast-draft-");
     writeFileSync(join(dir, "README.md"), "a repo lives here\n");
     expect(() => assertEmptyTarget(dir)).toThrow(/is not empty/);
     expect(() => assertEmptyTarget(dir)).toThrow(/Adoption is one-way/);
   });
 
   it("allows a directory that does not exist yet, and an empty one", () => {
-    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const dir = tmp("cast-draft-");
     expect(() => assertEmptyTarget(dir)).not.toThrow();
     expect(() => assertEmptyTarget(join(dir, "new"))).not.toThrow();
   });
 
   it("refuses to write a manifest over one that already exists", () => {
-    const dir = mkdtempSync(join(tmpdir(), "cast-draft-"));
+    const dir = tmp("cast-draft-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     const path = join(dir, ".infra", "manifest.yaml");
     writeFileSync(path, "project: incubator\n");

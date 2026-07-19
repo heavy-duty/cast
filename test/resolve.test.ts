@@ -1,6 +1,8 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { computeDiff } from "../src/diff.js";
 import { DERIVED_UNRESOLVED } from "../src/envtemplate.js";
@@ -12,6 +14,7 @@ import {
   resolveCheckout,
   resolveGitAuth,
 } from "../src/resolve.js";
+import { tmp } from "./helpers/tmp.js";
 
 describe("resolveCheckout", () => {
   it("hard-refuses --path with prod", () => {
@@ -26,6 +29,57 @@ describe("resolveCheckout", () => {
         path: "/tmp/x",
       }),
     ).toBe("/tmp/x");
+  });
+
+  // #117: the ephemeral checkout used to survive the process that made it, so
+  // every `cast apply`/`diff`/`capture` without --path left a full clone behind.
+  // This has to run in a real child process — the reaper is an exit hook, and
+  // the thing under test is precisely what happens when the process ends.
+  //
+  // A stub `git` on PATH makes it hermetic and fast: the clone fails, which is
+  // the *harder* case, since the directory is created before the clone runs and
+  // the failure path rethrows. If the dir is gone after a failed clone, the
+  // registration happens early enough to cover the successful one too.
+  it("removes the ephemeral checkout when the process exits", () => {
+    const bin = tmp("cast-fakebin-");
+    writeFileSync(join(bin, "git"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+
+    // Other suites (and other machines) have their own checkouts lying around;
+    // only the one this child allocates is ours to assert on.
+    const preexisting = new Set(
+      readdirSync(tmpdir()).filter((d) => d.startsWith("infra-checkout-")),
+    );
+
+    const script = `
+      const { resolveCheckout } = await import(${JSON.stringify(
+        pathToFileURL(join(process.cwd(), "dist/resolve.js")).href,
+      )});
+      try { resolveCheckout("acme/widget", { env: "dev" }); } catch {}
+      // Report what was allocated, then let the process exit normally.
+      const fs = await import("node:fs");
+      const os = await import("node:os");
+      console.log(JSON.stringify(
+        fs.readdirSync(os.tmpdir()).filter((d) => d.startsWith("infra-checkout-")),
+      ));
+    `;
+
+    const out = execFileSync(
+      process.execPath,
+      ["--input-type=module", "-e", script],
+      {
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+        encoding: "utf8",
+      },
+    );
+
+    const allocated: string[] = JSON.parse(
+      out.trim().split("\n").pop() ?? "[]",
+    );
+    const mine = allocated.filter((d) => !preexisting.has(d));
+    // It must have allocated exactly one — otherwise this test proves nothing.
+    expect(mine).toHaveLength(1);
+    // ...and that one must be gone now that the child has exited.
+    expect(existsSync(join(tmpdir(), mine[0]))).toBe(false);
   });
 });
 
@@ -119,7 +173,7 @@ describe("cloneFailureMessage", () => {
 
 describe("desiredFromManifest", () => {
   it("maps manifest + templates to Desired[] with resolved env", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra", "env"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -171,7 +225,7 @@ environments:
     expect(desired[0].fields).not.toHaveProperty("start_command");
   });
   it("emits is_static:false when static:false is explicitly declared (a guard against a UI flip)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -190,7 +244,7 @@ environments:
   });
   // #63: the static-site build settings a workspace monorepo needs.
   it("emits is_static:true and the three commands for a non-compose app that declares them", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -226,7 +280,7 @@ environments:
   // /databases/{uuid}/backups), and the side channel is what made a `backup:`
   // block added to an existing database silently do nothing (#51).
   it("puts a database backup block in fields, so it is diffed like any other", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -249,7 +303,7 @@ environments:
     });
   });
   it("leaves `backup` out of fields entirely when none is declared", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -271,7 +325,7 @@ environments:
     expect("backup" in desired[0].fields).toBe(false);
   });
   it("emits a service's service_domains into fields, canonicalized (cast#72)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -297,7 +351,7 @@ environments:
     });
   });
   it("is clean for a service whose live per-container hostnames match (cast#72, no perpetual update)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -331,7 +385,7 @@ environments:
     expect(report.clean).toBe(true);
   });
   it("diffs a service whose declared hostname is missing live (apply will set it)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -370,7 +424,7 @@ environments:
     ]);
   });
   it("a service with no service_domains carries only its type", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -387,7 +441,7 @@ environments:
     expect(desired[0].fields).toEqual({ type: "plausible" });
   });
   it("resolves a dockercompose app to docker_compose_location/docker_compose_domains and no port/healthcheck/domains keys", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra", "env"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -436,7 +490,7 @@ environments:
     expect(desired[0].fields).not.toHaveProperty("start_command");
   });
   it('warns that apply cannot enable "Include Source Commit in Build" on a dockercompose app (unsettable via the Coolify 4.1.2 API)', () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -466,7 +520,7 @@ environments:
     );
   });
   it("does not warn about the source-commit toggle for a non-dockercompose app (the build arg is a compose concern)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -486,7 +540,7 @@ environments:
     warn.mockRestore();
   });
   it("throws when the env is missing from the manifest", () => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -505,7 +559,7 @@ describe("derived resource refs (#60)", () => {
     ref = "${resource:postgres.url}",
     dbBlock = "    databases:\n      postgres: { type: postgresql }\n",
   ): string => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra", "env"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),
@@ -580,7 +634,7 @@ describe("derived domain refs (#66)", () => {
   // Assemble a manifest from an applications block plus one env template. The
   // env_template line is appended to whichever app comes last in `apps`.
   const write = (apps: string, tmpl: string): string => {
-    const dir = mkdtempSync(join(tmpdir(), "infra-co-"));
+    const dir = tmp("infra-co-");
     mkdirSync(join(dir, ".infra", "env"), { recursive: true });
     writeFileSync(
       join(dir, ".infra", "manifest.yaml"),

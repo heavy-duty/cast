@@ -293,6 +293,31 @@ actually cutting it, and this file starts there.
   covers `git ls-files '*.sh'` and fails naming the strays otherwise, so a
   future sweep that quietly narrows is red rather than green over nothing.
 
+- **`cast` no longer leaves a full repo clone in the temp dir on every run**
+  (#117) — `resolveCheckout()` mkdtemps an `infra-checkout-` directory and
+  `git clone`s the infra repo into it, and nothing ever removed it. Every
+  `cast apply`, `diff`, or `capture` invoked *without* `--path` — the normal
+  way to run all three — left a shallow clone behind permanently. This is a
+  runtime leak, not a test one: #117 was filed as test-suite hygiene and
+  explicitly scoped the runtime out ("`cast` itself does not leak"), but the
+  box that found it was also holding 602 `infra-checkout-*` directories,
+  73 MB of real `.git` trees, from the same day. The leak fires on the
+  failure path too, since the directory is created before the clone runs.
+  Ephemeral checkouts are now registered and removed on process exit, which
+  is the lifetime that fits: the tree has to outlive `resolveCheckout`'s
+  return — every caller reads it — so a `finally` would delete the checkout
+  out from under the command that asked for it. A `--path` checkout is the
+  operator's own working tree and is never registered.
+
+- **The test suite reaps its temp directories** (#117) — 68 `mkdtempSync`
+  call sites across 21 files, zero cleanups, accumulating ~6700 directories
+  and 189 MB per machine-day, some holding age keys. All 68 now go through a
+  single `tmp()` helper (`test/helpers/tmp.ts`) that allocates inside a
+  per-run root, which vitest's `globalSetup` teardown removes wholesale. A
+  class-guard test (`test/tmp-guard.test.ts`) fails if `mkdtempSync` appears
+  anywhere under `test/` outside those helpers, so the next raw call is
+  caught at review rather than after a day of accumulation.
+
 ## 0.1.1 — 2026-07-19
 
 ### Fixed

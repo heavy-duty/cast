@@ -39,6 +39,16 @@ actually cutting it, and this file starts there.
   decrypt, the age key is not demanded either. The moment any template
   gains a `${…}` ref, the refusal returns byte-identical to before.
   `capture` and `destroy` are untouched.
+- **`CAST_AGE_KEY_FILE_<ENV>` is now settable for every environment name**
+  (#102) — `<ENV>` was the name uppercased verbatim, so env `drill-b`
+  advertised `CAST_AGE_KEY_FILE_DRILL-B`: a variable no POSIX shell can
+  export, which walled off the injected-key channel (and its
+  process-substitution trick) for every hyphenated environment. Found live
+  in the 2026-07-19 release drill. Characters outside `[A-Z0-9]` now map to
+  `_` — env `drill-b` reads `CAST_AGE_KEY_FILE_DRILL_B` — and the refusal
+  advertises the mapped name. The standing-key path keeps the exact
+  environment name, so two names that collide on the variable still resolve
+  their own keys on disk.
 
 ### Added
 

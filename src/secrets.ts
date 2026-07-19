@@ -79,13 +79,25 @@ export function encryptSecrets(
 // operator who injects it. Keep the key OUT of the state repo — the state repo
 // holds ciphertext, never the identity that opens it.
 export function keyFileFor(envName: string): string {
-  const injected = process.env[`CAST_AGE_KEY_FILE_${envName.toUpperCase()}`];
+  const injected = process.env[ageKeyVarFor(envName)];
   if (injected) return injected;
   const standing = join(homedir(), ".config", "cast", `age-${envName}.key`);
   if (existsSync(standing)) return standing;
   throw new Error(
-    `no age key for ${envName}: set CAST_AGE_KEY_FILE_${envName.toUpperCase()} (attended apply) or place a standing key at ${standing}`,
+    `no age key for ${envName}: set ${ageKeyVarFor(envName)} (attended apply) or place a standing key at ${standing}`,
   );
+}
+
+// The env var carrying an environment's injected key. Uppercased AND mapped to
+// the character set a shell can actually set: `drill-b`.toUpperCase() is
+// `DRILL-B`, and `CAST_AGE_KEY_FILE_DRILL-B` is a name no POSIX shell can
+// export — the refusal above used to advertise it anyway, an escape hatch that
+// pointed at a wall (#102, found live in the release drill). Every character
+// outside [A-Z0-9] collapses to `_`, so `drill-b` and `drill.b` both read
+// CAST_AGE_KEY_FILE_DRILL_B — a collision that costs nothing, because both
+// names still resolve their OWN standing key (which keeps the exact env name).
+export function ageKeyVarFor(envName: string): string {
+  return `CAST_AGE_KEY_FILE_${envName.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
 }
 
 export function secretsFileFor(

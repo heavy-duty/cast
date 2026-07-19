@@ -498,6 +498,107 @@ describe("buildExecutor createResource (application, dockercompose)", () => {
   });
 });
 
+// githubAppUuid is null when the desired state declares no applications (#103)
+// — legal for an executor that will only ever create databases and services,
+// and unreachable for an application create by construction. The guard exists
+// so that IF the construction is ever broken, the failure is cast's own
+// sentence and not a Coolify 422 about somebody else's field.
+describe("buildExecutor createResource (no GitHub App resolved, #103)", () => {
+  type Call = { method: string; path: string; body?: unknown };
+
+  // Records every request, so a test can assert what was NOT sent — the
+  // silently-included github_app_uuid is the shape of bug this pins against.
+  function recorder(handler: (path: string) => Response): {
+    calls: Call[];
+    fetchImpl: typeof fetch;
+  } {
+    const calls: Call[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      calls.push({
+        method: init?.method ?? "GET",
+        path,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      });
+      return handler(path);
+    }) as unknown as typeof fetch;
+    return { calls, fetchImpl };
+  }
+
+  const ctx = {
+    projectName: "drill-widget",
+    envName: "staging",
+    serverUuid: "srv-1",
+    githubAppUuid: null,
+    serverName: "drill-box",
+    orgRepo: "heavy-duty/drill-widget",
+    bindingEnv: "staging",
+  };
+
+  it("creates a database without one, sending no github_app_uuid", async () => {
+    const { calls, fetchImpl } = recorder((path) => {
+      if (path === "/api/v1/projects")
+        return new Response(
+          JSON.stringify([{ uuid: "proj-1", name: "drill-widget" }]),
+          { status: 200 },
+        );
+      if (path === "/api/v1/projects/proj-1/environments")
+        return new Response(JSON.stringify([{ name: "staging" }]), {
+          status: 200,
+        });
+      return new Response(JSON.stringify({ uuid: "db-9" }), { status: 201 });
+    });
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    const uuid = await exec.createResource({
+      kind: "database",
+      name: "cache",
+      op: "create",
+      fieldDiffs: [{ field: "type", desired: "redis", updatable: false }],
+      envDiffs: [],
+    });
+    expect(uuid).toBe("db-9");
+    const create = calls.find((c) => c.path === "/api/v1/databases/redis");
+    expect(create?.body).not.toHaveProperty("github_app_uuid");
+  });
+
+  it("refuses an application create with cast's own internal error, not a wire 422", async () => {
+    const { calls, fetchImpl } = recorder((path) => {
+      if (path === "/api/v1/projects")
+        return new Response(
+          JSON.stringify([{ uuid: "proj-1", name: "drill-widget" }]),
+          { status: 200 },
+        );
+      if (path === "/api/v1/projects/proj-1/environments")
+        return new Response(JSON.stringify([{ name: "staging" }]), {
+          status: 200,
+        });
+      return new Response("{}", { status: 200 });
+    });
+    const exec = buildExecutor(
+      new CoolifyClient("https://coolify.test", "tok", fetchImpl),
+      ctx,
+    );
+    await expect(
+      exec.createResource({
+        kind: "application",
+        name: "web",
+        op: "create",
+        fieldDiffs: [
+          { field: "build_pack", desired: "nixpacks", updatable: false },
+        ],
+        envDiffs: [],
+      }),
+    ).rejects.toThrow(/internal: application create/);
+    // The refusal happened before anything went near the create route.
+    expect(
+      calls.some((c) => c.path === "/api/v1/applications/private-github-app"),
+    ).toBe(false);
+  });
+});
+
 // Placement is create-time only, and every kind needs it: Coolify runs the same
 // destination logic in ApplicationsController, DatabasesController and
 // ServicesController, and 400s on a multi-destination server for whichever one

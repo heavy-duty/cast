@@ -188,7 +188,7 @@ describe("release.yml", () => {
     // YAML maps are last-key-wins: a second sibling push: key silently
     // replaces the first and kills a door (grok's round-2 catch — the tag
     // fallback had stopped triggering). Exactly ONE push key may exist.
-    expect(RY.match(/^  push:$/gm)).toHaveLength(1);
+    expect(RY.match(/^ {2}push:$/gm)).toHaveLength(1);
     expect(RY).toContain("startsWith(github.ref, 'refs/tags/')");
     expect(RY).toContain("github.ref == 'refs/heads/main'");
     expect(RY).toContain("commits/$GITHUB_SHA/pulls");

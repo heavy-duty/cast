@@ -185,12 +185,14 @@ describe("release.yml", () => {
     // intent — is read via the API off the merge commit's PR, and a
     // transition with no labeled PR behind it refuses.
     expect(RY).toContain("branches: [main]");
+    // YAML maps are last-key-wins: a second sibling push: key silently
+    // replaces the first and kills a door (grok's round-2 catch — the tag
+    // fallback had stopped triggering). Exactly ONE push key may exist.
+    expect(RY.match(/^  push:$/gm)).toHaveLength(1);
     expect(RY).toContain("startsWith(github.ref, 'refs/tags/')");
     expect(RY).toContain("github.ref == 'refs/heads/main'");
     expect(RY).toContain("commits/$GITHUB_SHA/pulls");
-    expect(RY).toContain(
-      "no merged, release-labeled PR is behind this commit",
-    );
+    expect(RY).toContain("no merged, release-labeled PR is behind this commit");
     expect(RY).not.toContain("pull_request:");
   });
 

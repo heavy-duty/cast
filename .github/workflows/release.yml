@@ -1,11 +1,18 @@
 name: release
-# The release publisher (#96; box#83's design), on a bare X.Y.Z tag push —
-# no 'v' prefix, box's and rig's tag scheme. Two facts, then one act: the
-# tag must name package.json's own version (a mismatch fails loudly and
-# creates NOTHING — a wrong release is worse than a missing one), and the
-# release body is that version's CHANGELOG.md section
-# (.github/scripts/release-notes.sh, shared with test/release.test.ts) —
-# the curated prose, not the generated PR list.
+# The release publisher (#96; box#83's design) — two ways in, one act (#111;
+# box#96's design):
+#
+#   - Merging a `release`-labeled PR into main IS the release. The ceremony
+#     PR carries the bumped version and the stamped changelog; the
+#     maintainer's merge is the ship decision, and tagging after it is
+#     transcription — exactly where humans err silently and machines fail
+#     loudly. This path asserts four facts (each fail-loud, creating
+#     nothing), then tags the merge commit and publishes.
+#   - A bare X.Y.Z tag push (no 'v' prefix — box's and rig's tag scheme)
+#     stays as the documented manual fallback and backfill.
+#
+# Both paths converge on the SAME steps below — one notes extraction, one
+# build, one asset name, one create — so they cannot drift.
 #
 # Where cast differs from its siblings: the release carries a PREBUILT
 # asset. box and rig are pure bash, so GitHub's source tarball for the tag
@@ -19,20 +26,40 @@ on:
     # assert LOUDLY below, not be silently skipped by a pattern that didn't
     # match.
     tags: ["**"]
+  pull_request:
+    # The merge-is-the-release path (#111). `closed` is the only type that
+    # can mean "merged"; the job gate below drops closed-unmerged and
+    # unlabeled closures.
+    types: [closed]
+    branches: [main]
 
 permissions:
-  contents: write # gh release create
+  contents: write # tag create via the API + gh release create
 
 jobs:
   release:
+    # Tag pushes always enter (the asserts below are the filter). PR
+    # closures enter only when the PR actually MERGED and carries the
+    # hand-set `release` label (LABELS.md: `release` is the operator's —
+    # automation never guesses intent).
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.merged == true &&
+       contains(github.event.pull_request.labels.*.name, 'release'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tag push: the tag. Merged PR: the MERGE COMMIT on main — the
+          # exact tree the maintainer shipped, which the tag created below
+          # will name.
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
-      - name: the tag must name package.json's version
+      - name: "tag push: the tag must name package.json's version"
+        if: github.event_name == 'push'
         run: |
           ver="$(node -p 'require("./package.json").version')"
           if [ "$GITHUB_REF_NAME" != "$ver" ]; then
@@ -40,29 +67,89 @@ jobs:
             echo "A release is a PR, then a tag (#96): the release PR bumps package.json (and package-lock.json) and stamps the changelog; the tag goes on its MERGE commit. Delete this tag and re-tag the right commit." >&2
             exit 1
           fi
+          echo "RELEASE_VERSION=$ver" >> "$GITHUB_ENV"
+      - name: "merged release PR: the version must have left -dev in THIS PR"
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Assert 1 — the merged tree carries a release version, read via
+          # node, never regex (the pkg_version discipline).
+          ver="$(node -p 'require("./package.json").version')"
+          case "$ver" in
+            *-dev)
+              echo "package.json version '$ver' is a -dev version — creating nothing." >&2
+              echo "A release PR bumps package.json OFF -dev (CONTRIBUTING.md, Releasing); this merge did not." >&2
+              exit 1 ;;
+          esac
+          # Assert 2 — the version CHANGED in this PR (PR base vs merge):
+          # the -dev transition is the interlock, so a mislabeled ordinary
+          # PR — whose merge leaves the version untouched — fails HERE,
+          # loudly, instead of re-releasing main's standing version.
+          #
+          # Known first-release edge (#111): 0.1.0 never carried -dev (cast
+          # predates the -dev ritual), so this interlock correctly does NOT
+          # fire for the 0.1.0 ceremony (#110) — that one ships by manual
+          # tag, the fallback path; the automation applies from 0.1.1 on.
+          git fetch --depth=1 origin "$BASE_SHA"
+          git show "$BASE_SHA:package.json" > "$RUNNER_TEMP/base-package.json"
+          base="$(node -p 'require(process.env.RUNNER_TEMP + "/base-package.json").version')"
+          if [ "$base" = "$ver" ]; then
+            echo "package.json version is '$ver' both before and after this PR — creating nothing." >&2
+            echo "A release-labeled PR must BE the version transition (#111). If this PR was mislabeled, drop the label; if it was meant to release, it forgot the bump." >&2
+            exit 1
+          fi
+          echo "RELEASE_VERSION=$ver" >> "$GITHUB_ENV"
       - name: release notes — the version's own CHANGELOG.md section
+        # Assert 3 on the merge path, the same fact on the tag path:
         # release-notes.sh fails loudly on a missing/empty section, which
         # fails the release here — before anything is created.
         run: |
-          bash .github/scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          bash .github/scripts/release-notes.sh "$RELEASE_VERSION" > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
+      - name: "merged release PR: nothing exists yet, then tag the merge commit"
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          # Assert 4 — no tag and no release exist for this version. Re-runs
+          # stay idempotent, and a manual race (an operator who tagged by
+          # hand between merge and here) fails loudly instead of
+          # double-publishing.
+          if git ls-remote --exit-code origin "refs/tags/$RELEASE_VERSION" > /dev/null; then
+            echo "tag '$RELEASE_VERSION' already exists — creating nothing (already released, or a manual tag won the race)." >&2
+            exit 1
+          fi
+          if gh release view "$RELEASE_VERSION" > /dev/null 2>&1; then
+            echo "release '$RELEASE_VERSION' already exists — creating nothing." >&2
+            exit 1
+          fi
+          # The act begins: tag the merge commit via the API. A tag created
+          # with GITHUB_TOKEN does not trigger other workflows, so the
+          # tag-push trigger above CANNOT fire on this tag and
+          # double-publish — which is also why the publish must happen in
+          # THIS job.
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$RELEASE_VERSION" -f "sha=$MERGE_SHA"
       - name: build the prebuilt dist asset
         # Build ONCE, in CI — the whole point of the asset (#96): the
         # installer's release channels never run npm or tsc. Deliberately no
-        # check/tests here: ci.yml already gated the merge commit this tag
-        # names, and the test suite needs `age`, which this runner does not
-        # install. The staged tree is exactly what an install needs to run.
+        # check/tests here: ci.yml already gated the merge commit this
+        # release names, and the test suite needs `age`, which this runner
+        # does not install. The staged tree is exactly what an install needs
+        # to run.
         run: |
           npm ci
           npm run build
           npm prune --omit=dev
-          mkdir -p "$RUNNER_TEMP/stage/cast-$GITHUB_REF_NAME"
-          cp -R bin dist node_modules package.json "$RUNNER_TEMP/stage/cast-$GITHUB_REF_NAME/"
-          tar -C "$RUNNER_TEMP/stage" -czf "$RUNNER_TEMP/cast-$GITHUB_REF_NAME.tgz" "cast-$GITHUB_REF_NAME"
+          mkdir -p "$RUNNER_TEMP/stage/cast-$RELEASE_VERSION"
+          cp -R bin dist node_modules package.json "$RUNNER_TEMP/stage/cast-$RELEASE_VERSION/"
+          tar -C "$RUNNER_TEMP/stage" -czf "$RUNNER_TEMP/cast-$RELEASE_VERSION.tgz" "cast-$RELEASE_VERSION"
       - name: create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --verify-tag \
-            --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" \
-            "$RUNNER_TEMP/cast-$GITHUB_REF_NAME.tgz"
+          gh release create "$RELEASE_VERSION" --verify-tag \
+            --title "$RELEASE_VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
+            "$RUNNER_TEMP/cast-$RELEASE_VERSION.tgz"

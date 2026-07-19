@@ -7,6 +7,20 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Added
+
+- **Merging a release-labeled PR is the release** (#111; box#96's design) —
+  `release.yml` now also fires when a `release`-labeled PR merges into
+  main: it asserts fail-loud (non-`-dev` version, version changed in the
+  PR — the `-dev` interlock, changelog section extracts non-empty, no
+  existing tag or release), then tags the merge commit, builds the
+  `cast-X.Y.Z.tgz` asset once, and publishes — the maintainer's merge is
+  the ship decision, no silent-when-forgotten manual tag step. The
+  tag-push path stays as the documented fallback and backfill, and both
+  paths run the same steps so they cannot drift. First-release edge:
+  0.1.0 never carried `-dev`, so its ceremony (#110) ships by manual tag;
+  the automation applies from 0.1.1 on.
+
 ### Fixed
 
 - **The release suite accepts the ceremony's own tree** (#108) —

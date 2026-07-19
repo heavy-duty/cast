@@ -172,30 +172,89 @@ describe("release-notes.sh", () => {
 describe("release.yml", () => {
   const RY = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8");
 
-  it("triggers on EVERY tag — a mismatch must fail loudly, not be pattern-skipped", () => {
+  it("triggers on EVERY tag — the manual fallback survives, and a mismatch must fail loudly, not be pattern-skipped", () => {
     expect(RY).toContain('tags: ["**"]');
+  });
+
+  it("triggers on closed PRs into main, gated on merged AND the release label (#111)", () => {
+    expect(RY).toContain("types: [closed]");
+    expect(RY).toContain("branches: [main]");
+    expect(RY).toContain("github.event.pull_request.merged == true");
+    expect(RY).toContain(
+      "contains(github.event.pull_request.labels.*.name, 'release')",
+    );
   });
 
   it("asserts tag == package.json version, and the assert precedes the create", () => {
     expect(RY).toContain('require("./package.json").version');
     expect(RY).toContain("creating nothing");
     expect(RY.indexOf("creating nothing")).toBeLessThan(
-      RY.indexOf('gh release create "$GITHUB_REF_NAME"'),
+      RY.indexOf('gh release create "$RELEASE_VERSION"'),
     );
+  });
+
+  it("the merge path asserts its four facts IN ORDER, all before tag-create, build, and publish", () => {
+    // Assert 1: non--dev version at the merge commit. Assert 2: the version
+    // changed in THIS PR (the -dev interlock; base read from git, version
+    // read via node). Assert 3: the shared notes extraction. Assert 4: no
+    // existing tag or release. Only then the acts: API-tag the merge
+    // commit, build, publish — every marker present, strictly in file
+    // order, fail-closed.
+    const markers = [
+      "is a -dev version", // assert 1
+      'git show "$BASE_SHA:package.json"', // assert 2 — base vs merge
+      ".github/scripts/release-notes.sh", // assert 3
+      'git ls-remote --exit-code origin "refs/tags/$RELEASE_VERSION"', // assert 4a
+      'gh release view "$RELEASE_VERSION"', // assert 4b
+      'gh api "repos/$GITHUB_REPOSITORY/git/refs"', // act: tag the merge commit
+      "npm prune --omit=dev", // act: build
+      'gh release create "$RELEASE_VERSION"', // act: publish
+    ];
+    let at = -1;
+    for (const m of markers) {
+      const i = RY.indexOf(m);
+      expect(i, m).toBeGreaterThan(at);
+      at = i;
+    }
+  });
+
+  it("the -dev interlock reads versions via node, never regex, and names the 0.1.0 first-release edge", () => {
+    expect(RY).not.toMatch(/grep.*version/);
+    expect(RY).toContain("node -p 'require(\"./package.json\").version'");
+    // 0.1.0 never carried -dev, so the interlock correctly skips #110's
+    // ceremony — the workflow must say so where the next reader will look.
+    expect(RY).toContain("applies from 0.1.1");
+  });
+
+  it("tag, build, and publish happen in the SAME job — a GITHUB_TOKEN tag fires no workflows", () => {
+    const jobs = RY.slice(RY.indexOf("\njobs:")).match(/^ {2}\S+:\s*$/gm) ?? [];
+    expect(jobs).toEqual(["  release:"]); // one job under jobs:
+    expect(RY).toContain("does not trigger other workflows");
+    expect(RY).toContain('-f "sha=$MERGE_SHA"');
   });
 
   it("the body comes from the shared extraction script", () => {
     expect(RY).toContain(".github/scripts/release-notes.sh");
   });
 
-  it("the release is bound to the pushed tag (--verify-tag)", () => {
+  it("the release is bound to its tag (--verify-tag)", () => {
     expect(RY).toContain("--verify-tag");
   });
 
   it("builds the prod-only tree once and attaches it as the asset", () => {
     expect(RY).toContain("npm prune --omit=dev");
     expect(RY).toContain("cp -R bin dist node_modules package.json");
-    expect(RY).toContain("cast-$GITHUB_REF_NAME.tgz");
+    expect(RY).toContain("cast-$RELEASE_VERSION.tgz");
+  });
+
+  it("both trigger paths converge on the SAME asset name — one build, one tar, no per-path naming", () => {
+    // Each path's entry step exports RELEASE_VERSION; everything downstream
+    // (notes, stage dir, tarball, release title) reads only that. A second
+    // tar or a $GITHUB_REF_NAME-named asset would be the paths drifting
+    // apart — the exact failure this shape exists to prevent.
+    expect(RY.match(/>> "\$GITHUB_ENV"/g)).toHaveLength(2);
+    expect(RY.match(/tar -C/g)).toHaveLength(1);
+    expect(RY).not.toContain("cast-$GITHUB_REF_NAME");
   });
 
   it("runs no tests — ci.yml gated the merge commit already", () => {

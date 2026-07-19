@@ -44,31 +44,40 @@ labels tell you where everything is without opening anything.
 
 ## Releasing
 
-A release is a PR, then a tag ([#96](https://github.com/heavy-duty/cast/issues/96);
-box#83's design):
+A release is a PR, and merging it IS the release
+([#111](https://github.com/heavy-duty/cast/issues/111); box#96's design,
+on box#83's shape):
 
 1. A small PR — `release: X.Y.Z`, labeled `release` — bumps `package.json`'s
    `version` (and `package-lock.json`; `npm install --package-lock-only`
    keeps them in step) and stamps `CHANGELOG.md`'s Unreleased section as
    `## X.Y.Z — YYYY-MM-DD`. CI green on it, same loop as any PR.
-2. Merge, tag the merge commit bare `X.Y.Z` (no `v` prefix — box's tag
-   scheme), push the tag. [release.yml](.github/workflows/release.yml)
-   takes it from there: it asserts tag == `package.json` version (a
-   mismatch fails loudly and creates nothing), extracts that version's
-   changelog section as the release body
-   ([.github/scripts/release-notes.sh](.github/scripts/release-notes.sh) —
-   a missing or empty section refuses the release), builds the package once
-   (`npm ci && npm run build && npm prune --omit=dev`), and attaches the
-   runnable tree — `bin/`, `dist/`, production `node_modules/`,
-   `package.json` — as `cast-X.Y.Z.tgz`. That asset is what the installer's
-   release channels download: the build happens once, in CI, never on an
-   operator's machine.
-3. **Right after the release, a follow-up PR bumps `package.json` to
-   `X.Y.(Z+1)-dev`** (and `package-lock.json` with it) — box#90's step of
-   the family ritual. Installs are versioned by the tree's `package.json`
-   version, so a `CAST_REF=main` install between releases must land as
+2. **Merge. That's the ship decision — nothing else to do.**
+   [release.yml](.github/workflows/release.yml) fires on the merged,
+   `release`-labeled PR and asserts, in order, each fail-loud and creating
+   nothing: the merged version is non-`-dev`; the version *changed in this
+   PR* (the `-dev` transition is the interlock — a mislabeled ordinary PR
+   fails here); that version's changelog section extracts non-empty
+   ([.github/scripts/release-notes.sh](.github/scripts/release-notes.sh));
+   and no tag or release exists for it yet. Then, in the same job, it tags
+   the merge commit bare `X.Y.Z` (no `v` prefix — box's tag scheme), builds
+   the package once (`npm ci && npm run build && npm prune --omit=dev`), and
+   publishes the release with the runnable tree — `bin/`, `dist/`,
+   production `node_modules/`, `package.json` — attached as
+   `cast-X.Y.Z.tgz`. That asset is what the installer's release channels
+   download: the build happens once, in CI, never on an operator's machine.
+   *Manual fallback and backfill:* push a bare `X.Y.Z` tag on the merge
+   commit yourself — the same workflow runs the same asserts, build, and
+   publish from the tag.
+3. **The release re-arms main itself**: the same workflow run bumps
+   `package.json` (and `package-lock.json`) to `X.Y.(Z+1)-dev` and pushes
+   the commit straight to main — no follow-up PR (it opens one only if
+   branch protection refuses the direct push, and says so loudly).
+   Installs are versioned by the tree's `package.json` version, so a
+   `CAST_REF=main` install between releases must land as
    `versions/X.Y.(Z+1)-dev`, never as `versions/X.Y.Z` — main's tree must
-   not impersonate the release it merely descends from.
+   not impersonate the release it merely descends from. On the *manual*
+   tag path the bump stays yours: open the one-line PR after publishing.
 
 ## Labels — who sets what
 

@@ -1,10 +1,14 @@
 {
   "name": "cast",
-  "version": "0.1.1",
+  "version": "0.1.2-dev",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=22.12.0" },
-  "bin": { "cast": "./dist/cli.js" },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "bin": {
+    "cast": "./dist/cli.js"
+  },
   "scripts": {
     "build": "tsc",
     "test": "vitest run",

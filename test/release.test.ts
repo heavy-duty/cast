@@ -26,15 +26,18 @@ import { describe, expect, it } from "vitest";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const NOTES = join(ROOT, ".github/scripts/release-notes.sh");
+const MONOTONIC = join(ROOT, ".github/scripts/changelog-monotonic.sh");
 
 function run(
   cmd: string,
   args: string[],
   env: Record<string, string> = {},
+  cwd?: string,
 ): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, {
       stdio: ["ignore", "pipe", "pipe"],
+      cwd,
       env: { ...process.env, ...env },
     });
     let output = "";
@@ -373,6 +376,201 @@ describe("the changelog is armed for the next entry (rig#66)", () => {
     expect(() => disarmedBecause("0.2.1-dev", "# Changelog\n")).toThrow(
       "no ## section",
     );
+  });
+});
+
+// --- no SHIPPED release heading was deleted (#133) --------------------------
+// The arming block above guards ONE heading — the top one, the one a PR is
+// about to write under — and is keyed on a single tree. This guards the REST
+// of the file, which no single tree can be asked about: "a heading
+// disappeared" is not a property of a tree, it is a property of a DIFF. So the
+// fixtures here are real throwaway git repos with a base branch and a PR
+// branch, and the assertions drive the REAL script the CI step runs, the same
+// way the block above drives the real release-notes.sh.
+//
+// Two halves, and they catch different shapes. CONTAINMENT catches a DELETED
+// heading (base's set must be a subset of HEAD's). It cannot catch a
+// DUPLICATED one — a duplicate is head-side SURPLUS, and base-minus-head is
+// blind to extras on the head side — so UNIQUENESS on HEAD is asserted
+// alongside it. The duplicate half matters more in cast than in box:
+// release-notes.sh has no `exit`, so `grab` re-arms on every matching '## '
+// line and two copies of a version heading make the published body ABSORB
+// whatever sits between them.
+
+describe("changelog-monotonic.sh — release headings are append-only (#133)", () => {
+  const dated = (v: string) => `## ${v} — 2026-07-19`;
+  const body = "\n\n- **An entry** — prose.\n";
+  /** The base branch's changelog: two shipped releases under an Unreleased. */
+  const BASE = `# Changelog\n\n## Unreleased\n\n${dated("0.1.1")}${body}\n${dated("0.1.0")}${body}`;
+
+  const git = (repo: string, ...args: string[]) =>
+    execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+
+  /**
+   * A throwaway repo with `base` carrying BASE, checked out on a PR branch
+   * whose CHANGELOG.md is `head` (unchanged when omitted).
+   */
+  function repoWith(head?: string): string {
+    const repo = mkdtempSync(join(tmpdir(), "cast-monotonic-"));
+    git(repo, "init", "-q");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "test");
+    git(repo, "checkout", "-q", "-b", "base");
+    writeFileSync(join(repo, "CHANGELOG.md"), BASE);
+    git(repo, "add", "CHANGELOG.md");
+    git(repo, "commit", "-qm", "base");
+    git(repo, "checkout", "-q", "-b", "pr");
+    if (head !== undefined) {
+      writeFileSync(join(repo, "CHANGELOG.md"), head);
+      git(repo, "add", "CHANGELOG.md");
+      git(repo, "commit", "-qm", "the PR");
+    }
+    return repo;
+  }
+
+  const check = (
+    repo: string,
+    env: Record<string, string> = {},
+    base = "base",
+  ) => run("bash", [MONOTONIC, base], env, repo);
+
+  it("a branch that touches nothing passes, and says how many headings it checked", async () => {
+    const r = await check(repoWith());
+    expect(r.code).toBe(0);
+    expect(r.output).toContain("all 2 release heading(s)");
+  });
+
+  it("adding an entry the CORRECT way — above the heading, never over it — passes", async () => {
+    const good = BASE.replace(
+      "## Unreleased\n",
+      "## Unreleased\n\n### Fixed\n\n- **A new entry**\n",
+    );
+    const r = await check(repoWith(good));
+    expect(r.code).toBe(0);
+  });
+
+  it("goes RED when an entry REPLACED the shipped heading below it — the #133 failure, exactly", async () => {
+    // The one-line edit git merges cleanly and nothing else notices: the
+    // author typed over `## 0.1.1 — …` instead of inserting above it.
+    const clobbered = BASE.replace(
+      `${dated("0.1.1")}`,
+      "## Unreleased\n\n### Fixed\n\n- **An entry**",
+    );
+    const r = await check(repoWith(clobbered));
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("DELETES release heading(s)");
+    expect(r.output).toContain("## 0.1.1");
+    expect(r.output).toContain("APPEND-ONLY");
+    // 0.1.0, untouched, must not be accused.
+    expect(r.output).not.toContain("    ## 0.1.0");
+  });
+
+  it("goes RED on a DUPLICATED version heading — the case containment cannot see", async () => {
+    // Head-side surplus: base {0.1.0, 0.1.1} minus head is still empty, so
+    // only the uniqueness half catches this. It is also the case the arming
+    // rule's "double re-arm" test does NOT cover — that one counts duplicate
+    // '## Unreleased' headings, not duplicate VERSION headings, and it is the
+    // version ones that reach release-notes.sh.
+    const twice = BASE.replace(
+      `${dated("0.1.1")}${body}`,
+      `${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`,
+    );
+    const r = await check(repoWith(twice));
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("DUPLICATE release heading(s)");
+    expect(r.output).toContain("## 0.1.1");
+    expect(r.output).toContain("absorbs");
+  });
+
+  it("the duplicate half survives the entry sitting BETWEEN the copies — the absorbing shape", async () => {
+    // What release-notes.sh would publish for 0.1.1 if this landed: its own
+    // prose, the stranded entry, AND the second copy's prose. Asserted with
+    // the real extractor, so the consequence is the actual one.
+    const absorbing = BASE.replace(
+      `${dated("0.1.1")}${body}`,
+      `${dated("0.1.1")}${body}\n- **A stranded entry**\n\n${dated("0.1.1")}${body}`,
+    );
+    const repo = repoWith(absorbing);
+    const r = await check(repo);
+    expect(r.code).toBe(1);
+    const notes = await run("bash", [
+      NOTES,
+      "0.1.1",
+      join(repo, "CHANGELOG.md"),
+    ]);
+    expect(notes.output).toContain("A stranded entry");
+  });
+
+  it("'## Unreleased' is NOT in the guarded set — the ceremony legitimately consumes it", async () => {
+    // The release stamp: Unreleased becomes 0.2.0. That ADDS a version
+    // heading and removes none, and the Unreleased that disappeared is not a
+    // version heading at all. The arming rule owns that one.
+    const stamped = `${BASE.replace("## Unreleased\n", `${dated("0.2.0")}${body}\n`)}`;
+    const r = await check(repoWith(stamped));
+    expect(r.code).toBe(0);
+    // And deleting Unreleased outright — a disarmed tree, red under the
+    // arming rule — is still not this guard's business.
+    const disarmed = BASE.replace("## Unreleased\n\n", "");
+    expect((await check(repoWith(disarmed))).code).toBe(0);
+  });
+
+  it("a changelog absent at the merge base is nothing-to-have-deleted, not a failure", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "cast-monotonic-new-"));
+    git(repo, "init", "-q");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "test");
+    git(repo, "checkout", "-q", "-b", "base");
+    writeFileSync(join(repo, "README.md"), "# hi\n");
+    git(repo, "add", "README.md");
+    git(repo, "commit", "-qm", "base");
+    git(repo, "checkout", "-q", "-b", "pr");
+    writeFileSync(join(repo, "CHANGELOG.md"), BASE);
+    git(repo, "add", "CHANGELOG.md");
+    git(repo, "commit", "-qm", "add the changelog");
+    const r = await check(repo);
+    expect(r.code).toBe(0);
+    expect(r.output).toContain("does not exist at the merge base");
+  });
+
+  it("a missing changelog refuses by path — never a silent pass", async () => {
+    const r = await run("bash", [MONOTONIC, "base", "nope.md"], {}, repoWith());
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("no such file");
+  });
+
+  // The fail-closed switch, both directions. A guard that can quietly stop
+  // guarding is the failure shape this whole family of checks refuses, so the
+  // degradation that is sensible locally must be RED in CI.
+  it("an unresolvable base ref is a SKIP locally", async () => {
+    const r = await check(repoWith(), {}, "origin/no-such-branch");
+    expect(r.code).toBe(0);
+    expect(r.output).toContain("SKIPPED");
+    expect(r.output).toContain("Nothing was checked");
+  });
+
+  it("...and the SAME condition is a hard FAILURE under STRICT=1, naming fetch-depth", async () => {
+    const r = await check(
+      repoWith(),
+      { CHANGELOG_MONOTONIC_STRICT: "1" },
+      "origin/no-such-branch",
+    );
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("CHANGELOG_MONOTONIC_STRICT=1");
+    expect(r.output).toContain("fetch-depth: 0");
+    expect(r.output).not.toContain("SKIPPED");
+  });
+
+  // The wiring, pinned the same way release.yml's is — the script existing is
+  // no use if CI stops running it, and every clause here is load-bearing.
+  it("ci.yml runs it on pull requests only, STRICT, against the base ref, with full history", () => {
+    const CI = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
+    expect(CI).toContain(".github/scripts/changelog-monotonic.sh");
+    expect(CI).toContain('"origin/${{ github.base_ref }}"');
+    // Pull requests only: on a push to main the merge base IS HEAD.
+    expect(CI).toContain("if: github.event_name == 'pull_request'");
+    expect(CI).toContain("CHANGELOG_MONOTONIC_STRICT");
+    // ...which is only reachable because the checkout has the base history.
+    expect(CI).toContain("fetch-depth: 0");
   });
 });
 

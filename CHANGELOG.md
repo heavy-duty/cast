@@ -49,6 +49,35 @@ actually cutting it, and this file starts there.
 
 ### Fixed
 
+- **A PR that deletes a shipped release heading is now CI-red** (#133,
+  heavy-duty/box#122) — `.github/scripts/changelog-monotonic.sh` asserts that
+  the set of `## X.Y.Z` headings on HEAD is a superset of the set at the merge
+  base, and that no version heading appears twice. Wired into `ci.yml` on pull
+  requests only (on a push to main the merge base *is* HEAD, so the assert is
+  vacuous), with `CHANGELOG_MONOTONIC_STRICT=1` and `fetch-depth: 0` so a
+  checkout that cannot reach the base ref fails loudly rather than skipping
+  quietly forever.
+
+  The failure it catches leaves no trace. An author adding an entry under
+  `## Unreleased` types *over* the heading below it instead of inserting above
+  it — a one-line edit, in a file nobody touched concurrently, so git merges it
+  cleanly with no conflict and no signal. The arming rule stays green and is
+  not wrong to: the top section is still the right one for the version. But
+  the shipped section's body is now sitting under `## Unreleased`, and the
+  version it belonged to has no section at all. Nothing surfaces until the
+  *next* release, when `release-notes.sh` cannot find the section it extracts
+  by heading — or worse, republishes the absorbed prose as if it were new.
+
+  The uniqueness half matters more here than in box. `release-notes.sh`'s awk
+  has no `exit`, so `grab` re-arms on every matching `## ` line: two
+  `## 0.1.1` headings make the published body **absorb** whatever sits between
+  the copies, and an entry stranded there is dropped from the next release's
+  notes as well. Containment alone cannot see it — a duplicate is head-side
+  surplus, and base-minus-head is blind to extras on the head side — so
+  uniqueness on HEAD is asserted alongside it. `## Unreleased` is deliberately
+  outside the guarded set: the arming rule owns that heading, and the ceremony
+  legitimately consumes it.
+
 - **A label the repo does not have no longer takes the whole edit down with
   it** — `gh issue edit --add-label` rejects the *entire* call on one unknown
   name, applying nothing. Batching state and blockers into a single edit (for

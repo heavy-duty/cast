@@ -7,6 +7,47 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Fixed
+
+- **`state:needs-human` no longer appears on PRs a human cannot merge**
+  (#127, heavy-duty/box#136) — `decide_state()` derived state from three inputs
+  (draft flag, requested reviewers, submitted reviews) and read *nothing* about
+  mergeability or checks. Combined with the `if requested "$HUMAN"`
+  short-circuit at the top of its precedence, the label was **sticky**: once
+  the maintainer was requested, the PR read `state:needs-human` through
+  conflicts, through red CI, through a force-push that staled every approval.
+  Nothing demoted it.
+
+  In this repo the *second* half is the live one: three PRs currently sit at
+  `state:needs-human` simultaneously, with nothing saying which to merge first
+  — and they will conflict through `CHANGELOG.md` the moment one lands. The
+  stickiness has not bitten here yet only because nothing has conflicted; the
+  code carried it identically, so the first merge would have reproduced box's
+  situation exactly.
+
+  The rule the label now keeps is that **`state:needs-human` means a human
+  could merge this right now**, so anything making that false outranks the
+  request that put it there. A `CONFLICTING` branch or a failing check is the
+  agent's to fix: new `state:needs-rebase`. Approvals staled by a push mean
+  nobody reviewed this tree: `state:addressing`, because the agent owes a
+  re-request. An *unfinished* round still yields to an explicit human request —
+  a maintainer pulling a PR to themselves early is deliberate, and `MISSING`
+  (nobody has reviewed yet) is a different fact from `STALE` (everyone reviewed
+  something else).
+
+  `UNKNOWN` mergeability is deliberately not treated as unmergeable: GitHub
+  reports it for about a minute after every merge while it recomputes, and
+  flapping every open PR through `needs-rebase` on each merge would be worse
+  than the bug. A failed read of either fact degrades to the same "do not know"
+  value, for the same reason.
+
+  Also adds `merge-next` — the label this repo needs most today, since a
+  correct `needs-human` still does not say *which* of three ready PRs to merge
+  first. Queue order is intent, so the reconciler never sets it; it only
+  **clears** it once the PR stops being mergeable-by-a-human. Ported from
+  heavy-duty/box#137 so the three repos' reconcilers stay byte-identical;
+  fixtures 19 → 29.
+
 ## 0.1.1 — 2026-07-19
 
 ### Fixed

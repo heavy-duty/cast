@@ -43,9 +43,35 @@ actually cutting it, and this file starts there.
 
   The reconciler carries a `RETIRED` array and strips `state:needs-rebase` on
   sight, so retiring a label heals the board instead of stranding one that
-  nothing recomputes. Fixtures 51 → 64.
+  nothing recomputes. A verdict is owed in two shapes and both raise
+  `blocker:unrequested`: `MISSING` (nobody reviewed) and `STALE` (everybody
+  reviewed an older head). Fixtures 51 → 68.
 
 ### Fixed
+
+- **A label the repo does not have no longer takes the whole edit down with
+  it** — `gh issue edit --add-label` rejects the *entire* call on one unknown
+  name, applying nothing. Batching state and blockers into a single edit (for
+  anti-flicker) meant one missing `blocker:*` would also drop the `state:*`
+  convergence, and the taxonomy was only created by a manual
+  `workflow_dispatch` — so the first sweep after this change would have healed
+  *nothing* on precisely the PRs it exists to fix, surfacing only as a log
+  line. The add side is now filtered against the repo's real label set, read
+  once per sweep. Removals need no filter (they are built from `has_label`, so
+  they provably exist), and an unreadable label set filters *nothing* rather
+  than everything — a failed read must not silently strip the board.
+
+- **An unreadable check rollup is no longer read as "nothing is failing"** —
+  when `gh pr view` failed, the fallback left the `statusCheckRollup` key
+  absent, and `(.statusCheckRollup // [])` collapsed that into the same `NONE`
+  as a PR that genuinely has no checks. `NONE` blocks nothing, so an API
+  hiccup presented as mergeable-by-a-human — the unknown-certified-as-green
+  shape this machine exists to stop, surviving in the one place the #128 fix
+  never looked. `checks_state` now returns `UNREADABLE` for the absent key,
+  distinct from `NONE` for a present-but-empty array, and the sweep leaves
+  that PR exactly as it is rather than recomputing on facts it did not read.
+  Deliberately *not* a blocker: blocking would flap the whole board on one bad
+  call, and the next tick is 15 minutes away.
 
 - **`state:needs-human` no longer appears on PRs a human cannot merge**
   (#127, heavy-duty/box#136) — `decide_state()` derived state from three inputs

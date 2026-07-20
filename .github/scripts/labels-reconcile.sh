@@ -56,7 +56,14 @@ run() { # every mutation goes through here — DRY_RUN=1 logs instead of doing
 
 requested() { grep -qxF "$1" <<<"$REQUESTED"; }
 
-checks_state() { # rollup JSON on stdin → SUCCESS | FAILURE | PENDING | NONE
+checks_state() { # rollup JSON on stdin → SUCCESS | FAILURE | PENDING | NONE | UNREADABLE
+  # UNREADABLE is the absence of the key itself, which is what a failed fetch
+  # leaves behind — distinct from a present-but-empty rollup, which honestly
+  # means this PR has no checks. Collapsing the two let an API hiccup present
+  # as "nothing is failing", i.e. as mergeable-by-a-human: the same
+  # unknown-certified-as-green shape as the bug this machine exists to stop.
+  # The caller skips the PR entirely rather than labelling on facts it did not
+  # read; blocking on it instead would flap the whole board on one bad call.
   # The rollup mixes two node types with two different closed enums: CheckRun
   # carries `conclusion` (CheckConclusionState), StatusContext carries `state`
   # (StatusState). Rather than list the outcomes that block — the version that
@@ -70,6 +77,8 @@ checks_state() { # rollup JSON on stdin → SUCCESS | FAILURE | PENDING | NONE
   # not in consequence: a false FAILURE parks the PR on the agent, who looks;
   # a false SUCCESS invites a human to merge a tree that will not merge.
   jq -r '
+    if (has("statusCheckRollup") | not) then "UNREADABLE" else
+
     # NEUTRAL and SKIPPED satisfy branch protection — a skipped required check
     # is not a failed one, and path-filtered jobs skip constantly here.
     ["SUCCESS", "NEUTRAL", "SKIPPED"] as $passing
@@ -121,7 +130,9 @@ checks_state() { # rollup JSON on stdin → SUCCESS | FAILURE | PENDING | NONE
     | if   ($latest | length) == 0                            then "NONE"
       elif (($latest - $passing - $waiting) | length) > 0     then "FAILURE"
       elif (($latest - $passing) | length) > 0                then "PENDING"
-      else "SUCCESS" end'
+      else "SUCCESS" end
+
+    end'
 }
 
 bot_verdict() { # $1 = login → MISSING | BLOCK | APPROVE | STALE | FEEDBACK
@@ -183,12 +194,17 @@ blockers() { # → the blocker:* labels this PR should carry, one per line
   # explicit human request — a maintainer claiming a PR early is deliberate,
   # not a dropped ball.
   if [ "$DRAFT" != true ] && ! requested "$HUMAN"; then
-    local b any_missing=false any_requested=false
+    local b v owed=false any_requested=false
     for b in "${BOTS[@]}"; do
       requested "$b" && any_requested=true
-      [ "$(bot_verdict "$b")" = MISSING ] && any_missing=true
+      # MISSING and STALE are both verdicts this head does not have: nobody
+      # reviewed it, or everybody reviewed something else. The agent owes an
+      # ask either way — the stale round is if anything the worse of the two,
+      # since it has approvals on the page that no longer describe the tree.
+      v="$(bot_verdict "$b")"
+      case "$v" in MISSING | STALE) owed=true ;; esac
     done
-    if [ "$any_missing" = true ] && [ "$any_requested" = false ]; then
+    if [ "$owed" = true ] && [ "$any_requested" = false ]; then
       echo blocker:unrequested
     fi
   fi
@@ -339,6 +355,30 @@ reconcile_pr() { # $1 = PR number; relies on the globals set from its fetch
   done
   add="${add#,}"
   remove="${remove#,}"
+
+  # Never NAME a label the repo does not have. `gh issue edit --add-label`
+  # rejects the WHOLE call on one unknown name — nothing is applied — so a
+  # single missing blocker would take the state convergence down with it, on
+  # exactly the PRs this change exists to fix, surfacing only as a log line.
+  # Batching state and blockers into one edit for anti-flicker is what widened
+  # that blast radius; filtering the add side is what closes it again.
+  # Removals need no filter: they are built from has_label, so the label
+  # provably exists. REPO_LABELS unreadable means no filtering rather than
+  # filtering everything out — a failed read must not silently strip the board.
+  if [ -n "${REPO_LABELS:-}" ]; then
+    local kept="" missing="" want
+    for want in ${add//,/ } "$desired"; do
+      [ "$want" = "$desired" ] && continue
+      if grep -qxF "$want" <<<"$REPO_LABELS"; then kept="$kept,$want"
+      else missing="$missing $want"; fi
+    done
+    add="${kept#,}"
+    if ! grep -qxF "$desired" <<<"$REPO_LABELS"; then
+      log "#$n: WARNING: state label '$desired' does not exist — run the workflow manually to bootstrap"
+      return
+    fi
+    [ -n "$missing" ] && log "#$n: WARNING: missing label(s)$missing — state still converged; dispatch the workflow to bootstrap"
+  fi
   if ! has_label "$desired" || [ -n "$remove" ] || [ -n "$add" ]; then
     args=(--add-label "$desired${add:+,$add}")
     [ -n "$remove" ] && args+=(--remove-label "$remove")
@@ -393,6 +433,11 @@ main() {
     bootstrap_labels
   fi
 
+  # The repo's label set, read ONCE per sweep — reconcile_pr filters every
+  # add against it, because one unknown name fails the whole edit call.
+  REPO_LABELS="$(gh label list -R "$REPO" --limit 200 --json name --jq '.[].name' 2>/dev/null || echo "")"
+  [ -z "$REPO_LABELS" ] && log "WARNING: could not read the label set — applying labels unfiltered"
+
   local n
   for n in $(gh pr list -R "$REPO" --state open --limit 100 --json number --jq '.[].number'); do
     (
@@ -414,6 +459,13 @@ main() {
       GH_VIEW="$(gh pr view "$n" -R "$REPO" --json mergeable,statusCheckRollup 2>/dev/null || echo '{}')"
       MERGEABLE="$(jq -r '.mergeable // "UNKNOWN"' <<<"$GH_VIEW")"
       CHECKS="$(checks_state <<<"$GH_VIEW")"
+      # Read failed: leave this PR exactly as it is. Recomputing on facts we
+      # did not read is how an API hiccup turns into a false "merge me" —
+      # and the next tick is 15 minutes away, not 15 hours.
+      if [ "$CHECKS" = UNREADABLE ]; then
+        log "#$n: could not read mergeability/checks — left alone this pass"
+        exit 0
+      fi
       reconcile_pr "$n"
     ) || log "#$n: reconcile failed — continuing with the remaining PRs"
   done

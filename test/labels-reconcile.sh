@@ -201,7 +201,17 @@ expect "ready, nobody asked, nothing reviewed raises unrequested" blocker:unrequ
 # ...the partial case is equally stalled: one verdict in, nobody asked for the rest
 REVIEWS_JSON="$(reviews "$(rev "$BOT1" APPROVED head1 "" t1)")"
 expect "one bot in, none requested is still unrequested" blocker:unrequested "$(blockers)"
+# ...a STALE round with nobody asked is the same debt, and arguably worse: the
+#    page carries approvals that no longer describe the tree. Guarding on
+#    MISSING alone let this one through with no blocker at all.
+REVIEWS_JSON="$(reviews \
+  "$(rev "$BOT1" APPROVED oldhead "" t1)" \
+  "$(rev "$BOT2" APPROVED oldhead "" t2)" \
+  "$(rev "$BOT3" APPROVED oldhead "" t3)")"
+expect "a stale round with nobody asked is unrequested too" blocker:unrequested "$(blockers)"
+expect "...and is still the agent's ball" state:addressing "$(decide_state)"
 # ...but a live request means an answer IS coming
+REVIEWS_JSON="$(reviews "$(rev "$BOT1" APPROVED head1 "" t1)")"
 REQUESTED="$BOT2"
 expect "a live bot request is not a stalled round" "" "$(blockers)"
 # ...and a draft is exempt: the bots ignore drafts by design
@@ -258,6 +268,13 @@ ctx_() { jq -n --arg n "$1" --arg s "$2" --arg t "${3:-2026-07-20T15:00:00Z}" \
   '{__typename:"StatusContext", context:$n, state:$s, createdAt:$t}'; }
 
 expect "no checks at all is NONE" NONE "$(rollup '[]' | checks_state)"
+# A failed fetch leaves no rollup KEY; a PR with no checks leaves an empty
+# ARRAY. Collapsing the two let an API hiccup read as "nothing is failing" —
+# the same unknown-certified-as-green shape as #136, in the one place that
+# fix did not look. The caller skips an UNREADABLE PR rather than relabelling.
+expect "a failed read is UNREADABLE, not NONE" UNREADABLE "$(echo '{}' | checks_state)"
+expect "...and a real empty rollup is still NONE" NONE \
+  "$(echo '{"mergeable":"MERGEABLE","statusCheckRollup":[]}' | checks_state)"
 expect "all green is SUCCESS" SUCCESS \
   "$(rollup "[$(run_ a SUCCESS),$(run_ b SUCCESS)]" | checks_state)"
 expect "a queued run is PENDING" PENDING \

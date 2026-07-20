@@ -45,7 +45,7 @@ actually cutting it, and this file starts there.
   sight, so retiring a label heals the board instead of stranding one that
   nothing recomputes. A verdict is owed in two shapes and both raise
   `blocker:unrequested`: `MISSING` (nobody reviewed) and `STALE` (everybody
-  reviewed an older head). Fixtures 51 → 68.
+  reviewed an older head). Fixtures 51 → 72.
 
 ### Fixed
 
@@ -59,7 +59,12 @@ actually cutting it, and this file starts there.
   line. The add side is now filtered against the repo's real label set, read
   once per sweep. Removals need no filter (they are built from `has_label`, so
   they provably exist), and an unreadable label set filters *nothing* rather
-  than everything — a failed read must not silently strip the board.
+  than everything — a failed read must not silently strip the board. A missing
+  *state* label skips only the label edit, not the rest of the PR: clearing a
+  stale `merge-next` and the staleness sweep depend on no part of the `state:*`
+  taxonomy, and a cold-start repo that skipped them would leave "merge this one
+  next" sitting on a PR the board had moved to the agent — the same false
+  invitation, one scope smaller.
 
 - **An unreadable check rollup is no longer read as "nothing is failing"** —
   when `gh pr view` failed, the fallback left the `statusCheckRollup` key

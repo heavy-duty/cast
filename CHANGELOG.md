@@ -7,7 +7,76 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Changed
+
+- **PR labels split into two axes: `state:*` (whose ball) and `blocker:*`
+  (what is in the way)** (heavy-duty/box#138) — `state:needs-rebase` is
+  retired, replaced by `blocker:conflict`, `blocker:ci-red` and
+  `blocker:unrequested`. One rule joins the axes: `state:needs-human` requires
+  zero blockers.
+
+  The entry below this one, added a day ago, closed by noting that cast had
+  not yet been bitten only because nothing had conflicted — that three PRs sat
+  at `state:needs-human` at once and would conflict through this very file the
+  moment one landed. #128 landed. A dry sweep now finds #119, #120 and #122
+  all still wearing `state:needs-human` over branches GitHub calls
+  `CONFLICTING`, which is the predicted failure arriving on schedule.
+
+  Fixing *that* is what the previous entry did. What this one fixes is the
+  shape that kept regrowing it. The single-label design projected independent
+  facts — mergeability, check status, where the review round stands — onto one
+  totally-ordered value, and a total order must pick a winner, so the rest
+  silently vanish. Every precedence bug this machine has had lived on that
+  ordering: `needs-human` surviving a conflict, `MISSING` swallowing `STALE`,
+  and `state:needs-rebase` firing on both a conflict and a red check when
+  those need opposite work — telling an agent to rebase when what it owed was
+  a bug fix. Blockers are a set. A set has no precedence between its members
+  to get wrong, and what remains on the ordered axis is purely about reviews,
+  the one place an ordering actually means something.
+
+  `state:bots-reviewing` tightens with it, to mean strictly *a request is live
+  and an answer is coming*. A ready PR nobody was asked to review used to read
+  "waiting on the reviewers" for the 48 hours it took the stale sweep to
+  notice; it is now `state:addressing` + `blocker:unrequested`, because the
+  ask is the agent's to make. Drafts are exempt, and so is an explicit human
+  request — a maintainer claiming a PR early is deliberate, not a dropped ball.
+
+  The reconciler carries a `RETIRED` array and strips `state:needs-rebase` on
+  sight, so retiring a label heals the board instead of stranding one that
+  nothing recomputes. A verdict is owed in two shapes and both raise
+  `blocker:unrequested`: `MISSING` (nobody reviewed) and `STALE` (everybody
+  reviewed an older head). Fixtures 51 → 72.
+
 ### Fixed
+
+- **A label the repo does not have no longer takes the whole edit down with
+  it** — `gh issue edit --add-label` rejects the *entire* call on one unknown
+  name, applying nothing. Batching state and blockers into a single edit (for
+  anti-flicker) meant one missing `blocker:*` would also drop the `state:*`
+  convergence, and the taxonomy was only created by a manual
+  `workflow_dispatch` — so the first sweep after this change would have healed
+  *nothing* on precisely the PRs it exists to fix, surfacing only as a log
+  line. The add side is now filtered against the repo's real label set, read
+  once per sweep. Removals need no filter (they are built from `has_label`, so
+  they provably exist), and an unreadable label set filters *nothing* rather
+  than everything — a failed read must not silently strip the board. A missing
+  *state* label skips only the label edit, not the rest of the PR: clearing a
+  stale `merge-next` and the staleness sweep depend on no part of the `state:*`
+  taxonomy, and a cold-start repo that skipped them would leave "merge this one
+  next" sitting on a PR the board had moved to the agent — the same false
+  invitation, one scope smaller.
+
+- **An unreadable check rollup is no longer read as "nothing is failing"** —
+  when `gh pr view` failed, the fallback left the `statusCheckRollup` key
+  absent, and `(.statusCheckRollup // [])` collapsed that into the same `NONE`
+  as a PR that genuinely has no checks. `NONE` blocks nothing, so an API
+  hiccup presented as mergeable-by-a-human — the unknown-certified-as-green
+  shape this machine exists to stop, surviving in the one place the #128 fix
+  never looked. `checks_state` now returns `UNREADABLE` for the absent key,
+  distinct from `NONE` for a present-but-empty array, and the sweep leaves
+  that PR exactly as it is rather than recomputing on facts it did not read.
+  Deliberately *not* a blocker: blocking would flap the whole board on one bad
+  call, and the next tick is 15 minutes away.
 
 - **`state:needs-human` no longer appears on PRs a human cannot merge**
   (#127, heavy-duty/box#136) — `decide_state()` derived state from three inputs

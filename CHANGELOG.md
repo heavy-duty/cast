@@ -83,8 +83,9 @@ actually cutting it, and this file starts there.
   **clears** it once the PR stops being mergeable-by-a-human. Ported from
   heavy-duty/box#137 so the three repos' reconcilers stay byte-identical; both
   live shapes, the mixed round, the in-flight run superseding a finished one —
-  in both spellings of an absent completion — and the whole check-outcome enum
-  are pinned in `test/labels-reconcile.sh` (fixtures 19 → 48).
+  in both spellings of an absent completion, and in both directions — and the
+  whole check-outcome enum are pinned in `test/labels-reconcile.sh`
+  (fixtures 19 → 49).
 
 ## 0.1.1 — 2026-07-19
 

@@ -40,8 +40,8 @@ actually cutting it, and this file starts there.
   optimistic write safe. The `scope` job is skipped on the two new actions,
   where no path can have changed and labeler has nothing to derive.
 
-  Landed in all three repos together (heavy-duty/box#141, heavy-duty/rig#96) — `labels.yml` and the label
-  taxonomy are shared.
+  Landed in all three repos together (heavy-duty/box#142,
+  heavy-duty/rig#97) — `labels.yml` and the label taxonomy are shared.
 
 - **PR labels split into two axes: `state:*` (whose ball) and `blocker:*`
   (what is in the way)** (heavy-duty/box#138) — `state:needs-rebase` is

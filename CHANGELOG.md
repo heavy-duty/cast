@@ -73,6 +73,53 @@ actually cutting it, and this file starts there.
   what it was told to write. Basic-auth-only is the safe slice until
   then.
 
+- **`cast github-app create` / `cast github-app register`** (#7, superseding
+  #5) — the GitHub App was the one piece of a Coolify instance cast could
+  not reproduce: made by hand in a browser, its four identifiers copied out
+  of the UI by eye, its private key downloaded to `~/Downloads`, its details
+  fed to `scripts/register-github-app.sh` as a six-variable env pile.
+  Nothing about that survived in state. There is no REST endpoint that
+  creates a GitHub App — no `POST /apps`, no GraphQL mutation, no `gh app`
+  subcommand, no PAT scope — so `create` runs the only programmatic path
+  there is, GitHub's App Manifest flow: a one-shot page served on
+  `127.0.0.1` whose form POST your own browser session authenticates,
+  followed by an unauthenticated code exchange. That exchange is the only
+  moment GitHub ever yields the private key, the client secret and the
+  webhook secret together, and cast now persists all three to
+  `<state>/github-apps/` at 0600 under a `.gitignore` of `*`, so `git add
+  -A` in the state repo cannot commit them by accident. `register` adopts
+  credentials you already hold (an App made by hand, or a DR restore from a
+  stored PEM) and reads the client secret from **stdin only** — argv is
+  visible in `ps`. `create` does not reimplement it: it obtains credentials
+  and then calls exactly the `register` path.
+
+  #5's three footguns are gone structurally rather than by validation. The
+  Coolify-facing name is resolved from `github_apps.<org>/<repo>` in
+  `environments.yaml` — the value every later `cast apply` resolves the App
+  by — and `--name` only *seeds* an absent entry (keyed by full slug, #6),
+  and is refused outright when it disagrees with one that exists. The state
+  file is written only after the App is registered *and* verified, because a
+  state file naming an App that does not work is worse than one naming none.
+  `--webhook-secret` is optional: a webhook-inactive App is the correct shape
+  for a tailnet-only Coolify, and nobody has to invent a placeholder.
+
+  Both verbs end at the step that matters most: `GET
+  /github-apps/{id}/repositories`, asserting the repo is actually reachable.
+  Until now a misconfigured App failed silently and surfaced hours later, in
+  a different command, as an unresolvable source at `cast apply` time.
+
+  No new dependencies — `node:http` serves the callback, `node:crypto`'s
+  `createSign("RSA-SHA256")` mints the App JWT that recovers the installation
+  id from the App's own key (never from the `installation_id` GitHub appends
+  to a redirect, which GitHub documents as a spoofable hint).
+
+  **Unvalidated, and load-bearing**: that GitHub accepts a `redirect_url` on
+  `http://127.0.0.1:<port>` at all. The manifest docs are silent on the
+  scheme, the precedent (Probot's setup flow) is strong, and validating it
+  requires a logged-in GitHub session — so the first real run is an
+  operator's, and README keeps the manual browser path documented until
+  `create` has succeeded once.
+
 ### Changed
 
 - **`state:needs-human` no longer waits on the cron to become true** (#131)
@@ -160,6 +207,13 @@ actually cutting it, and this file starts there.
   app whose basic auth is enabled on the box: it emits no `basic_auth:`
   block, because the password cannot be read and a block a rebuild cannot
   honour is exactly the failure `UNCAPTURED.md` exists to prevent.
+
+### Removed
+
+- **`scripts/register-github-app.sh`** — replaced by `cast github-app
+  register`. Kept as a thin wrapper it would have preserved exactly the
+  interface #5 catalogued as producing three live footguns, while adding a
+  second surface to keep in step with the CLI.
 
 ### Fixed
 

@@ -397,6 +397,19 @@ standing over nothing is worse than no guard, because it reads like one.
 > prints in a diff like any literal. Applications only. See
 > [semantics.md](docs/semantics.md) → *Derived domains*.
 
+> **An application can declare HTTP basic auth, and its password is a `${REF}`
+> like any other secret.** Write
+> `basic_auth: { enabled: true, username: ops, password: ${ADMIN_PW_PROD} }` on
+> the application, and `apply` sets it — closing the "a rebuilt resource comes
+> back UNPROTECTED" hole for applications (services have no API for it at all, on
+> 4.1.2 or v4.2). The schema **refuses a literal password**: a manifest is a
+> committed file, so a literal there is a password in git forever. What cast
+> cannot do is *verify* it — the password reads back only to a token with
+> sensitive-data reads, so `diff` compares the toggle and the username (a UI flip
+> is still caught) and says on every run that the password was not compared,
+> rather than implying it matches. See [semantics.md](docs/semantics.md) → *HTTP
+> Basic Auth on an application*.
+
 An **`--override`**'s value is read from `$CAST_CAPTURE_<NAME>`, never from the
 command line: argv is visible in `ps` to every process on the box. It exists for
 values that must not survive the copy — staging and prod sharing a Mailgun
@@ -569,8 +582,10 @@ whose secrets were silently skipped looks complete and holds not one value.
 **2. Silent losses.** cast cannot express everything a Coolify holds:
 destinations (which Docker network a resource sits on — no API at all in 4.1.2),
 service hostnames (they live per-container on `service.applications[].fqdn`),
-Basic Auth and custom Traefik labels, the *Include Source Commit in Build*
-toggle, whole database kinds (a MySQL is invisible to cast's manifest), backup
+Basic Auth on a *service* and custom Traefik labels anywhere (an application's
+Basic Auth is expressible — see below — but its **password** is not readable, so
+a draft reports it instead of emitting a block a rebuild could not honour), the
+*Include Source Commit in Build* toggle, whole database kinds (a MySQL is invisible to cast's manifest), backup
 schedules, and anything else configured in the UI with no manifest field.
 
 A blueprint that omits these **without saying so** is worse than no blueprint,

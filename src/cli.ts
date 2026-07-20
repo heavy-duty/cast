@@ -391,6 +391,53 @@ export function projectLiveFields(
       ...(raw.is_static == null
         ? {}
         : { is_static: raw.is_static === true || raw.is_static === 1 }),
+      // Basic auth, read back as far as the read path will say (cast#76).
+      //
+      // `is_http_basic_auth_enabled` and `http_basic_auth_username` are ordinary
+      // `applications` columns and come back on this route; they are projected
+      // whenever they are actually THERE, and omitted when they are not, so a
+      // Coolify (or a token) that hides them produces "not compared" rather than
+      // a phantom `undefined`. Same three-way discipline as `is_static` above,
+      // and note that "absent" and "false" are different answers: a real `false`
+      // is projected and diffs normally, which is what catches somebody turning
+      // basic auth off in the UI.
+      //
+      // `http_basic_auth_password` is NEVER projected, whatever the read
+      // returned, and that is a deliberate policy rather than a limitation:
+      //
+      //   - It is gated. `ApplicationsController@removeSensitiveData` hides it
+      //     from a token without sensitive-data reads at 4.1.2, and on `next`
+      //     the hiding moves to the model behind the `read:sensitive` ability
+      //     (cast#72, #77) — so whether it arrives depends on the token AND the
+      //     route AND the release, and a diff must not silently mean different
+      //     things on different boxes.
+      //   - Even where it DOES arrive, putting a plaintext password into
+      //     `fields` puts it into the diff report, and cast prints no secret,
+      //     anywhere. (renderDiff redacts the field name as a backstop; not
+      //     projecting it is the actual guarantee.)
+      //
+      // The consequence is stated rather than hidden: `fetchLive` flags the app
+      // `basicAuthNotCompared`, computeDiff skips the password, and every diff of
+      // an app declaring basic auth prints a line saying the password was not
+      // compared. A store-side password rotation therefore needs an apply that
+      // has some other reason to write — see completeBasicAuth in apply.ts, and
+      // the caveat in semantics.md.
+      // The username rides on the toggle's readability rather than on its own
+      // presence: the two are plain columns on the same row, serialized (or
+      // hidden) together, so a readable toggle means the username was readable
+      // too — and a NULL one then means "no username is set", a real value worth
+      // diffing against, not an unreadable one. Projecting it as absent instead
+      // would turn "somebody cleared the username" into "cast could not look".
+      ...(raw.is_http_basic_auth_enabled == null
+        ? {}
+        : {
+            is_http_basic_auth_enabled:
+              raw.is_http_basic_auth_enabled === true ||
+              raw.is_http_basic_auth_enabled === 1,
+            http_basic_auth_username: String(
+              raw.http_basic_auth_username ?? "",
+            ),
+          }),
       ...(raw.install_command ? { install_command: raw.install_command } : {}),
       ...(raw.build_command ? { build_command: raw.build_command } : {}),
       ...(raw.start_command ? { start_command: raw.start_command } : {}),
@@ -658,6 +705,20 @@ export async function fetchLive(
       // into `fields` above and diffed normally.
       ...(kind === "application" && i.is_static == null
         ? { staticNotCompared: true }
+        : {}),
+      // Why this application's basic auth could not be fully verified (cast#76).
+      // Set on EVERY application, not only the ones a manifest protects —
+      // computeDiff decides whether it is relevant, because only it knows what
+      // the desired side declared. The password half is unconditional at 4.1.2
+      // (projectLiveFields never projects it, on purpose); the whole-block half
+      // fires when the read returned no toggle at all.
+      ...(kind === "application"
+        ? {
+            basicAuthNotCompared:
+              i.is_http_basic_auth_enabled == null
+                ? "this read returned no is_http_basic_auth_enabled for this application, so cast saw none of its basic-auth state — a Coolify or a token that does not serve these columns on GET /projects/{uuid}/{env}"
+                : "http_basic_auth_password is never read back: Coolify 4.1.2 hides it from a token without sensitive-data reads, v4.2 moves it behind the read:sensitive ability, and cast prints no secret — so the toggle and the username are compared and the password is written, not verified (cast#76)",
+          }
         : {}),
     }));
   const live = [
@@ -1175,7 +1236,17 @@ async function runProject(
   let secrets: Record<string, string>;
   if (existsSync(store)) {
     secrets = decryptSecrets(store, keyFileFor(ctx.envName));
-  } else if (requiredSecrets(checkout, ctx.envName).required.length > 0) {
+  } else if (
+    // `manifestRefs` alongside `required` (cast#76): a `basic_auth.password`
+    // ref is read from the store exactly like a template's, but it is not a
+    // RequiredSecret (see requiredSecrets). Asking only about `required` would
+    // let a manifest whose one secret is a basic-auth password proceed on `{}`
+    // — straight into desiredFromManifest's refusal, with a worse message.
+    (() => {
+      const s = requiredSecrets(checkout, ctx.envName);
+      return s.required.length > 0 || s.manifestRefs.length > 0;
+    })()
+  ) {
     throw new Error(
       [
         `no secret store for ${orgRepo} in ${ctx.envName}`,
@@ -2751,6 +2822,37 @@ export function applicationApiFields(
 ): Record<string, unknown> {
   const { port, healthcheck, domains, docker_compose_domains, ...rest } =
     fields;
+  // Coolify's presence rule, enforced at the wire (cast#76). PATCH
+  // /applications/{uuid} rejects an enable without both credentials
+  // (ApplicationsController.php:2446-2463 @ v4.1.2) and the create allowlist
+  // takes the same three keys (:914, :2368).
+  //
+  // The manifest schema already refuses a half-declared block, so this is the
+  // BELT, not the braces — and it is worth having because it guards the paths
+  // the schema cannot see: apply's own field completion, a hostname overlay, and
+  // any future caller assembling a payload by hand. Failing here costs one
+  // exception; failing at Coolify costs a 422 in the middle of a run that has
+  // already created a project, an environment and possibly a database.
+  if (rest.is_http_basic_auth_enabled === true) {
+    const missing = (
+      ["http_basic_auth_username", "http_basic_auth_password"] as const
+    ).filter((k) => {
+      const v = rest[k];
+      return typeof v !== "string" || v === "";
+    });
+    if (missing.length > 0) {
+      throw new Error(
+        [
+          `refusing to enable HTTP basic auth without ${missing.join(" and ")}`,
+          "",
+          "Coolify requires a username AND a password whenever basic auth is enabled, and",
+          "would answer 422 mid-run. Half-configured basic auth protects nothing anyway:",
+          "declare both under the application's `basic_auth:` (the password as a ${REF}",
+          "held by the environment's age store), or set `basic_auth.enabled: false`.",
+        ].join("\n"),
+      );
+    }
+  }
   return {
     // is_static/install_command/build_command/start_command ride through `rest`
     // unchanged: they are valid API params verbatim, accepted on both the create

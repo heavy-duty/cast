@@ -291,6 +291,105 @@ draft always loads) — they used to sit in its `NO_HOME` list of settings a
 rebuild silently dropped, and `is_static` was not even there, which is exactly
 how a rebuilt static site came back wrong.
 
+## HTTP Basic Auth on an application (`basic_auth:`)
+
+An application can declare HTTP basic auth, and `apply` sets it:
+
+```yaml
+admin:
+  source: { repo: acme/widget, branch: main }
+  build: { pack: nixpacks, base_directory: / }
+  domains: ["https://admin.widget.example.com"]
+  basic_auth:
+    enabled: true
+    username: ops
+    password: ${ADMIN_BASIC_AUTH_PROD}
+```
+
+This closes the hole `UNCAPTURED.md` used to describe as *"a rebuilt resource is
+UNPROTECTED where the original was not"* — for **applications**. It stays open
+for **services**, and that is an API gap rather than a vocabulary one:
+`ServicesController` carries no basic-auth fields and no `custom_labels`, on
+v4.1.2 or on the v4.2 train, so no manifest field could set them (cast#72
+finding 7). The `NO_API_COVERAGE` row now says *services* specifically.
+
+**The password is a `${REF}`, and only a `${REF}`.** The schema refuses a
+literal — not discourages it. A manifest is a reviewed, committed artifact, so a
+literal there is a live password in git forever, in the file everyone reads to
+understand the system. The value lives in the environment's age store under that
+name, resolved by the same mechanism every env-template `${REF}` uses, and a
+missing or empty entry fails the run **before** anything is written, naming the
+ref and the store.
+
+**Managing basic auth is opt-in**, exactly like `is_static`. An omitted
+`basic_auth:` block says *nothing* about basic auth, and that is deliberate: an
+unconditional `is_http_basic_auth_enabled: false` would make the first apply
+after this ships **strip the protection off every application somebody enabled by
+hand in the UI** whose manifest had not yet been migrated. So: `enabled: true` to
+protect, `enabled: false` to actively assert it is off, omit to leave it alone.
+Enabling requires both credentials and disabling forbids them — both are
+parse-time refusals, and the first is also Coolify's own rule
+(`ApplicationsController.php:2446-2463` @ v4.1.2 rejects an enable without them),
+enforced again at the wire so no path can reach a mid-run 422.
+
+### What the diff can and cannot see
+
+The three fields do not read back alike, and the report says which is which
+rather than averaging them into a single confident answer:
+
+| field | read back? | consequence |
+| --- | --- | --- |
+| `is_http_basic_auth_enabled` | ✅ a plain column | compared — a toggle flipped in the UI **is** caught |
+| `http_basic_auth_username` | ✅ a plain column | compared — a changed username **is** caught |
+| `http_basic_auth_password` | ❌ | never compared, always **written** on any basic-auth write |
+
+The password is gated behind a sensitive-data-enabled token at 4.1.2, and on
+v4.2 behind the `read:sensitive` token ability (cast#72, #77) — so whether it
+arrives depends on the token, the route *and* the release. cast therefore never
+projects it into the comparison vocabulary at all, on any box: a field that means
+different things on different instances is worse than a field that means one
+thing everywhere. (It would also have to be *printed* — `renderDiff` renders
+every field diff as `field: <live> → <desired>` — and cast prints no secret
+anywhere. The field name is redacted in the renderer as a backstop; not
+projecting it is the actual guarantee.)
+
+So `cast diff` prints, on every run against an application that declares
+`basic_auth:`:
+
+```
+basic_auth on application admin declared, http_basic_auth_password NOT compared — verify in the Coolify UI
+```
+
+Same disposition as an unverifiable backup schedule or a declared
+`destination_uuid`: reported, **not** counted as drift (an absence of evidence is
+not evidence of drift, and a run that fails on it is a run operators learn to
+force past). A read that returns *none* of the three — a Coolify or a token that
+does not serve those columns — names all three on that line instead, and cast
+claims nothing at all about that application's basic auth.
+
+**The honest limit that follows:** rotating *only* the password in the store
+produces no field diff, therefore no PATCH. The rotation lands on the next apply
+that writes basic auth for any other reason (the toggle or username drifting, or
+a create) — because Coolify requires both credentials on any write that enables
+basic auth, so cast completes the whole triple whenever it sends one of them.
+Until then the diff says the password was not compared rather than implying it
+matches. To force a rotation today, flip `enabled` off, apply, flip it back on,
+apply — or set it in the UI.
+
+### Why `custom_labels` is deliberately absent
+
+`custom_labels` **is** API-settable at 4.1.2 (base64-validated,
+`ApplicationsController.php:3836-3854`, in both allowlists), and cast still has
+no field for it. Enabling basic auth or changing domains makes Coolify regenerate
+an application's proxy labels via `generateLabelsApplication()`, which
+**overwrites `custom_labels`** unless `is_container_label_readonly_enabled` — and
+*that* flag is itself not API-settable until v4.2. A manifest that declared both
+`custom_labels` and domains or basic auth on one application would therefore have
+cast silently destroy the labels it was just told to write. Basic-auth-only is
+the safe slice until v4.2; raw labels wait for a real use and for the readonly
+flag (cast#76, #77). Hand-written labels on a live box stay reported per resource
+in `UNCAPTURED.md`, never silently dropped.
+
 ## Reserved env var names (`SOURCE_COMMIT`, `COOLIFY_*`)
 
 Coolify injects a set of values into an application's runtime environment
@@ -1063,8 +1162,11 @@ the per-service `GET /services/{uuid}` that `diff`/`apply` have made since
 projection the diff's read-back uses, so a drafted service diffs clean once
 applied; a service whose GET is unreachable or unrecognized is reported per
 resource instead — where a one-project diff fails closed, a whole-instance sweep
-reports and keeps going), Basic Auth / custom Traefik labels,
-build and deploy command overrides, what a backup schedule cannot fully say
+reports and keeps going), Basic Auth on a SERVICE and custom Traefik labels
+anywhere (an application's basic auth **is** expressible since #76 — what a draft
+still cannot carry is its PASSWORD, which no read returns, so an enabled app is
+reported per resource rather than emitted as a `basic_auth:` block a rebuild
+could not honour), build and deploy command overrides, what a backup schedule cannot fully say
 (the schedule itself **is captured** since #75 — the draft reads
 `GET /databases/{uuid}/backups`, the route `diff`/`apply` have used since #51,
 and a single enabled schedule becomes a real `backup: { frequency, retention }`

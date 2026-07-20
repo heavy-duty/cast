@@ -424,7 +424,10 @@ function applicationSpec(
   // for. Each one changes what the application IS, and each would be silently
   // absent from a rebuild.
   const NO_HOME: Array<[string, string]> = [
-    ["custom_labels", "custom Traefik/Docker labels (Basic Auth lives here)"],
+    [
+      "custom_labels",
+      "custom Traefik/Docker labels (basic auth has its own fields, and its own manifest block since cast#76 — these are the hand-written labels beside it)",
+    ],
     ["ports_mappings", "host port mappings"],
     ["pre_deployment_command", "a pre-deployment command"],
     ["post_deployment_command", "a post-deployment command"],
@@ -437,6 +440,26 @@ function applicationSpec(
     const v = r.raw[field];
     if (v === undefined || v === null || v === "") continue;
     flag(field, `${what} is set on the box. The manifest has no field for it.`);
+  }
+
+  // Basic auth is EXPRESSIBLE now (cast#76) and still not CAPTURABLE, and those
+  // are different sentences. The manifest has a `basic_auth:` block, so a draft
+  // could emit the toggle and the username — but the password reads back only to
+  // a token with sensitive-data reads (4.1.2; `read:sensitive` on v4.2) and a
+  // draft that emitted `enabled: true` with a password cast never saw would
+  // refuse to apply, or worse, apply with the wrong one.
+  //
+  // So the draft emits NOTHING here and says so per application, which is the
+  // same disposition as a generated secret: the name is reported, the value is
+  // the operator's to supply. Not emitting a half-block is the point — an
+  // `enabled: true` a rebuild cannot honour is the failure this whole file exists
+  // to prevent, and an unprotected admin panel is the one that costs most.
+  if (r.raw.is_http_basic_auth_enabled) {
+    const user = r.raw.http_basic_auth_username;
+    flag(
+      "basic_auth",
+      `HTTP basic auth is ENABLED on this application${typeof user === "string" && user !== "" ? ` (username ${user})` : ""}, and its PASSWORD cannot be read back — so no \`basic_auth:\` block was written and a rebuilt application would be PUBLIC. Add one by hand: \`basic_auth: { enabled: true, username: …, password: \${REF} }\`, with the value in the environment's age store.`,
+    );
   }
 
   // `port` is one number in a manifest and a comma-separated list on the wire.
@@ -876,9 +899,19 @@ const NO_API_COVERAGE: Array<[string, string]> = [
     "destinations",
     "Coolify 4.1.2 serves no destinations endpoint. A resource's `destination_id` comes back; the UUID that names it never does. Placement must be read from the UI (#21).",
   ],
+  // Narrowed to SERVICES (cast#76). Applications can now say `basic_auth:`, so
+  // the blanket row overstated the gap for half the resources it covered — and
+  // the half it still covers is a real API gap, not a cast vocabulary one:
+  // `ServicesController` has no basic-auth fields and no `custom_labels`, on
+  // v4.1.2 or on `next` (cast#72, finding 7). The row must not imply cast could
+  // express this for a service if only someone wrote the field.
   [
-    "Basic Auth / custom Traefik labels",
-    "carried as raw container labels. cast's manifest has no field for them, so a rebuilt resource is UNPROTECTED where the original was not.",
+    "Basic Auth / custom Traefik labels on SERVICES",
+    "no API surface at all — Coolify's ServicesController carries neither basic-auth fields nor custom_labels, on 4.1.2 or on the v4.2 train, so no manifest field could set them. A service that was protected on the source box comes back UNPROTECTED and must be re-protected by hand. (Applications are a different story: they take `basic_auth:` in the manifest since cast#76 — what is uncapturable there is the PASSWORD, reported per application above.)",
+  ],
+  [
+    "custom Traefik/Docker labels on applications",
+    "`custom_labels` IS writable at 4.1.2, but cast deliberately has no field for it: enabling basic auth or changing domains makes Coolify regenerate an application's labels and overwrite whatever was there, unless `is_container_label_readonly_enabled` — which is itself not API-settable until v4.2. Declaring both would be a footgun, so labels set by hand stay uncaptured and are reported per application above (cast#72, #76).",
   ],
   [
     '"Include Source Commit in Build"',

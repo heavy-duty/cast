@@ -34,6 +34,74 @@ const repoDirectoryPath = (field: string) =>
       `${field} must be an absolute path inside the repo checkout (Coolify 4.1.2 rejects the create otherwise) — write /apps/core, not apps/core; the checkout root is /`,
     );
 
+// A store REF — `${NAME}` and nothing else. The one syntax cast already uses for
+// a secret, in env templates (envtemplate.ts), reused verbatim rather than
+// invented a second time: the value lives in the environment's age store, keyed
+// by NAME, and the manifest carries only the name.
+//
+// This is a REFUSAL, not a preference. `http_basic_auth_password` is the first
+// secret cast writes that is a resource FIELD rather than an env var, and a
+// manifest is a reviewed, committed artifact — a literal here is a password in
+// git, permanently, in the file everyone reads to understand the system. There is
+// no ergonomic case that outweighs that, so the schema makes the mistake
+// unrepresentable rather than warning about it.
+const STORE_REF = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+
+// HTTP Basic Auth on an application, as Coolify 4.1.2 can actually set it:
+// `is_http_basic_auth_enabled`, `http_basic_auth_username` and
+// `http_basic_auth_password` are in the create allowlist
+// (`ApplicationsController.php:914`) and the PATCH allowlist (`:2368`), and PATCH
+// enforces username/password presence when enabling (`:2446-2463`).
+//
+// `enabled` is explicit rather than inferred from the block's presence, because
+// the two halves of the vocabulary are not symmetric: `enabled: true` needs
+// credentials, `enabled: false` must have none (a password ref standing over a
+// disabled auth is dead config that reads like a guard). Spelling it out is also
+// what lets the presence rule below fail with a message about the field the
+// operator got wrong, instead of a union mismatch about two shapes.
+//
+// OMITTING the block leaves basic auth alone entirely — the `is_static` rule
+// (see resolve.ts), for the same reason: emitting `is_http_basic_auth_enabled:
+// false` on every application would make the first apply after this ships strip
+// basic auth off every app protected by hand in the UI whose manifest has not yet
+// been migrated. Protection removed, silently, by an upgrade. So: declare
+// `enabled: true` to protect, `enabled: false` to actively assert it is off, omit
+// to say nothing.
+const BasicAuthSchema = z
+  .object({
+    enabled: z.boolean(),
+    username: z.string().optional(),
+    password: z
+      .string()
+      .regex(
+        STORE_REF,
+        "basic_auth.password must be a store ref (${NAME}) whose value lives in the environment's age store — never a literal, which would be a password committed to git",
+      )
+      .optional(),
+  })
+  .strict()
+  .superRefine((auth, ctx) => {
+    // Coolify's own rule, enforced HERE so it fails in the file rather than as a
+    // bare 422 from a PATCH that has already half-applied a run
+    // (ApplicationsController.php:2446-2463 @ v4.1.2 requires both when
+    // enabling). Same reasoning as the checkout-path patterns above.
+    if (auth.enabled) {
+      for (const k of ["username", "password"] as const)
+        if (auth[k] === undefined || auth[k] === "")
+          ctx.addIssue({
+            code: "custom",
+            message: `basic_auth.${k} is required when basic_auth.enabled is true (Coolify rejects the write otherwise, and half-protected basic auth protects nothing)`,
+          });
+    } else {
+      for (const k of ["username", "password"] as const)
+        if (auth[k] !== undefined)
+          ctx.addIssue({
+            code: "custom",
+            message: `basic_auth.${k} is not allowed when basic_auth.enabled is false — a credential declared for a disabled auth is dead config that reads like a guard`,
+          });
+    }
+  });
+
 const AppSpecSchema = z
   .object({
     source: z.object({ repo: z.string(), branch: z.string() }).strict(),
@@ -62,6 +130,7 @@ const AppSpecSchema = z
     healthcheck: z.string().optional(),
     domains: z.array(z.string()).optional(),
     service_domains: z.record(z.array(z.string())).optional(),
+    basic_auth: BasicAuthSchema.optional(),
     env_template: z.string().optional(),
   })
   .strict()
@@ -188,6 +257,13 @@ const ManifestSchema = z
     environments: z.record(EnvironmentSpecSchema),
   })
   .strict();
+
+// The NAME inside a `${NAME}` store ref, or undefined if this is not one. The
+// single reader of STORE_REF outside the schema, so the syntax the manifest
+// ACCEPTS and the syntax resolution UNDERSTANDS cannot drift apart.
+export function storeRefName(value: string): string | undefined {
+  return STORE_REF.exec(value)?.[1];
+}
 
 export type AppSpec = z.infer<typeof AppSpecSchema>;
 export type DatabaseSpec = z.infer<typeof DatabaseSpecSchema>;

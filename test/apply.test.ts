@@ -4,6 +4,7 @@ import {
   KIND_ORDER,
   applyHostnameOverlay,
   applyPlan,
+  completeBasicAuth,
 } from "../src/apply.js";
 import { GENERATED_PLACEHOLDER } from "../src/capture.js";
 import { type Desired, type Live, computeDiff } from "../src/diff.js";
@@ -537,5 +538,105 @@ describe("applyHostnameOverlay", () => {
       "core-api": ["http://plain.example.net"],
     });
     expect(out[0].fields.domains).toEqual(["http://plain.example.net"]);
+  });
+});
+
+// cast#76. An update body is built from the fields that CHANGED, and basic auth
+// cannot be written that way: Coolify requires both credentials on any write
+// that enables it, and the password never shows up as a change because it is
+// never read back. So the payload is completed from the declared spec — and
+// only when a write was already happening.
+describe("completeBasicAuth", () => {
+  const spec: Desired = {
+    kind: "application",
+    name: "admin",
+    fields: {
+      build_pack: "nixpacks",
+      is_http_basic_auth_enabled: true,
+      http_basic_auth_username: "ops",
+      http_basic_auth_password: "s3cret",
+    },
+  };
+
+  it("fills in the credentials when only the toggle drifted", () => {
+    expect(
+      completeBasicAuth({ is_http_basic_auth_enabled: true }, spec),
+    ).toEqual({
+      is_http_basic_auth_enabled: true,
+      http_basic_auth_username: "ops",
+      http_basic_auth_password: "s3cret",
+    });
+  });
+
+  it("fills in the password when only the username drifted", () => {
+    expect(
+      completeBasicAuth(
+        { is_http_basic_auth_enabled: true, http_basic_auth_username: "ops" },
+        spec,
+      ).http_basic_auth_password,
+    ).toBe("s3cret");
+  });
+
+  it("leaves a payload that is not enabling basic auth completely alone", () => {
+    // The load-bearing half: this must not MANUFACTURE a write. A run where
+    // nothing about basic auth drifted sends nothing about basic auth.
+    expect(completeBasicAuth({ domains: ["https://a"] }, spec)).toEqual({
+      domains: ["https://a"],
+    });
+  });
+
+  it("adds no credentials to a disable", () => {
+    expect(
+      completeBasicAuth({ is_http_basic_auth_enabled: false }, spec),
+    ).toEqual({ is_http_basic_auth_enabled: false });
+  });
+
+  it("does not invent values the spec does not carry", () => {
+    // Then applicationApiFields refuses at the wire — one clear error, rather
+    // than a request Coolify 422s halfway through a run.
+    expect(
+      completeBasicAuth({ is_http_basic_auth_enabled: true }, undefined),
+    ).toEqual({ is_http_basic_auth_enabled: true });
+  });
+});
+
+// The honest limit, asserted rather than described: a password rotated in the
+// store with nothing else changed produces NO write, because there is no field
+// diff to carry it. `cast diff` prints "NOT compared" on that run — the failure
+// is visible, not silent — and this test exists so the day someone makes the
+// password diffable, it goes red and they read the comment.
+describe("applyPlan — a password-only rotation writes nothing (#76)", () => {
+  it("makes no call at all when the readable halves agree", async () => {
+    const { calls, exec } = recorder();
+    const declared: Desired[] = [
+      {
+        kind: "application",
+        name: "admin",
+        fields: {
+          build_pack: "nixpacks",
+          is_http_basic_auth_enabled: true,
+          http_basic_auth_username: "ops",
+          http_basic_auth_password: "the-NEW-password",
+        },
+      },
+    ];
+    const live: Live[] = [
+      {
+        kind: "application",
+        name: "admin",
+        uuid: "u1",
+        fields: {
+          build_pack: "nixpacks",
+          is_http_basic_auth_enabled: true,
+          http_basic_auth_username: "ops",
+        },
+        basicAuthNotCompared: "password is never read back",
+      },
+    ];
+    const report = computeDiff(declared, live, "full");
+    await applyPlan(report, declared, exec);
+    expect(calls).toEqual([]);
+    // …and the run says so, rather than reading as a verified match.
+    expect(report.basicAuthNotCompared).toHaveLength(1);
   });
 });

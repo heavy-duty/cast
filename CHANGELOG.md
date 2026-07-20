@@ -64,12 +64,18 @@ actually cutting it, and this file starts there.
   a replacement mid-flight read `SUCCESS` — the original bug restored, pointing
   a human at a disabled merge button — and a `CANCELLED` original whose
   replacement was still running read `FAILURE`, the flap the collapse exists to
-  prevent. So a run is dated by the newest timestamp it actually carries, with
-  both spellings of absent discarded (`null`, and the zero sentinel), and an
-  entry that carries no usable timestamp at all sorts **last** rather than
-  first: something undateable is most likely the thing just created, and every
-  ambiguity here resolves toward "not settled" rather than toward a stale
-  success.
+  prevent. So a run is dated by when it **began**, with both spellings of
+  absent discarded (`null`, and the zero sentinel) and a fallback only for a
+  run that never recorded a beginning — not by the newest stamp of any kind,
+  which compares the completion of a finished run against the start of a live
+  one. Those are different quantities, and a run cancelled by the concurrency
+  group does not stop the instant its replacement starts: the runner winds
+  down, so a predecessor routinely finishes *after* its successor began, and
+  dating by "newest stamp" let the dead run out-rank the live one that
+  replaced it. An entry carrying no usable timestamp at all sorts **last**
+  rather than first: something undateable is most likely the thing just
+  created, and every ambiguity here resolves toward "not settled" rather than
+  toward a stale success.
 
   `UNKNOWN` mergeability is deliberately not treated as unmergeable: GitHub
   reports it for about a minute after every merge while it recomputes, and
@@ -83,9 +89,9 @@ actually cutting it, and this file starts there.
   **clears** it once the PR stops being mergeable-by-a-human. Ported from
   heavy-duty/box#137 so the three repos' reconcilers stay byte-identical; both
   live shapes, the mixed round, the in-flight run superseding a finished one —
-  in both spellings of an absent completion, and in both directions — and the
-  whole check-outcome enum are pinned in `test/labels-reconcile.sh`
-  (fixtures 19 → 49).
+  in both spellings of an absent completion, in both directions, and across the
+  wind-down window where the two overlap — and the whole check-outcome enum are
+  pinned in `test/labels-reconcile.sh` (fixtures 19 → 51).
 
 ## 0.1.1 — 2026-07-19
 

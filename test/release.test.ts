@@ -705,11 +705,16 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
       /^ {6}- name: no shipped changelog heading/.test(l),
     );
     const after = ciLines.slice(monoStart + 1);
-    const monoEnd = after.findIndex((l) => /^ {6}- /.test(l) || /^ {2}\S/.test(l));
+    const monoEnd = after.findIndex(
+      (l) => /^ {6}- /.test(l) || /^ {2}\S/.test(l),
+    );
     const monoBlock =
       monoStart < 0
         ? undefined
-        : [ciLines[monoStart], ...after.slice(0, monoEnd < 0 ? after.length : monoEnd)].join("\n");
+        : [
+            ciLines[monoStart],
+            ...after.slice(0, monoEnd < 0 ? after.length : monoEnd),
+          ].join("\n");
     expect(monoBlock).toBeDefined();
     expect(monoBlock).toContain("changelog-monotonic.sh");
     // Anchored: an `if:` inside a `run:` line is not a step condition.

@@ -435,9 +435,53 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
   ) => run("bash", [MONOTONIC, base], env, repo);
 
   it("a branch that touches nothing passes, and says how many headings it checked", async () => {
+    // A branch that touches nothing has HEAD as its own merge base, which is
+    // now the VACUOUS-containment path (#133), so the count this asserts moved
+    // to uniqueness's — which serves the stated intent better anyway: it says
+    // the parser read the file and found real headings in it, rather than that
+    // a comparison of the file against itself came out equal.
     const r = await check(repoWith());
     expect(r.code).toBe(0);
+    expect(r.output).toContain(
+      "uniqueness on HEAD checked 2 release heading(s)",
+    );
+  });
+
+  // --- the push-to-main shape: containment vacuous, uniqueness real --------
+  // With the pull_request gate gone (#133), merge_base == HEAD is a ROUTINE
+  // path, not a degradation. Containment compares the file against itself and
+  // asserts nothing, so a line reading "all N still present" would claim a
+  // check that did no work — the same dishonesty the skip messages were fixed
+  // for. The success line therefore has two forms, and these pin which one
+  // each event shape gets, including that they do not collapse into one.
+
+  it("HEAD as its own base reports containment VACUOUS, not verified", async () => {
+    const r = await check(repoWith(), {}, "HEAD");
+    expect(r.code).toBe(0);
+    expect(r.output).toContain("containment vacuous");
+  });
+
+  it("...and names uniqueness as the half that actually ran", async () => {
+    const r = await check(repoWith(), {}, "HEAD");
+    expect(r.output).toContain("uniqueness on HEAD checked");
+  });
+
+  it("...and does NOT claim the headings were still present", async () => {
+    const r = await check(repoWith(), {}, "HEAD");
+    expect(r.output).not.toContain("are still present");
+  });
+
+  it("...while a REAL base still reports containment, naming the count", async () => {
+    // The PR shape. The two wordings must not collapse into one.
+    const good = BASE.replace(
+      "## Unreleased\n",
+      "## Unreleased\n\n### Fixed\n\n- **A new entry**\n",
+    );
+    const r = await check(repoWith(good));
+    expect(r.code).toBe(0);
     expect(r.output).toContain("all 2 release heading(s)");
+    expect(r.output).toContain("are still present");
+    expect(r.output).not.toContain("containment vacuous");
   });
 
   it("adding an entry the CORRECT way — above the heading, never over it — passes", async () => {
@@ -645,7 +689,18 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
     // #133: NOT pull-request-only. Deletion is vacuous on a push to main, but
     // duplication is vacuous on no tree — gating the whole script left a
     // duplicate that reached main by any other route unasserted forever.
-    expect(CI).not.toContain("if: github.event_name == 'pull_request'");
+    //
+    // Scoped to the step's OWN block, deliberately. As a file-wide negative it
+    // would forbid any FUTURE step in ci.yml from being pull_request-gated and
+    // would fail citing #133 when one legitimately is — #133 constrains this
+    // step, not the file. The companion assert below keeps the extractor from
+    // silently matching nothing and turning the negative into a tautology.
+    const monoBlock = CI.split(/^ {6}- name: /m).find((b) =>
+      b.startsWith("no shipped changelog heading"),
+    );
+    expect(monoBlock).toBeDefined();
+    expect(monoBlock).toContain("changelog-monotonic.sh");
+    expect(monoBlock).not.toContain("if:");
     // ...and dropping that gate is only safe WITH the fallback: on a push
     // `github.base_ref` is empty, a bare `origin/` does not resolve, and
     // STRICT promotes that to a hard failure on every push to main.

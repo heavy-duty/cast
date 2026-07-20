@@ -55,6 +55,22 @@ actually cutting it, and this file starts there.
   `CANCELLED` blocks, judging every entry rather than the newest would strand
   every re-run PR in `needs-rebase`.
 
+  Dating a run turned out to be the subtle half, and getting it wrong restored
+  the bug. A run still in flight has no completion, but `gh` does not omit the
+  field — its Go struct marshals the zero time as `"0001-01-01T00:00:00Z"`, a
+  string, which jq's `//` will not fall through. Ordering on completion
+  therefore sorted the *live* re-run below every finished one and let the
+  collapse discard it, judging the very run it superseded: a green context with
+  a replacement mid-flight read `SUCCESS` — the original bug restored, pointing
+  a human at a disabled merge button — and a `CANCELLED` original whose
+  replacement was still running read `FAILURE`, the flap the collapse exists to
+  prevent. So a run is dated by the newest timestamp it actually carries, with
+  both spellings of absent discarded (`null`, and the zero sentinel), and an
+  entry that carries no usable timestamp at all sorts **last** rather than
+  first: something undateable is most likely the thing just created, and every
+  ambiguity here resolves toward "not settled" rather than toward a stale
+  success.
+
   `UNKNOWN` mergeability is deliberately not treated as unmergeable: GitHub
   reports it for about a minute after every merge while it recomputes, and
   flapping every open PR through `needs-rebase` on each merge would be worse
@@ -66,8 +82,9 @@ actually cutting it, and this file starts there.
   first. Queue order is intent, so the reconciler never sets it; it only
   **clears** it once the PR stops being mergeable-by-a-human. Ported from
   heavy-duty/box#137 so the three repos' reconcilers stay byte-identical; both
-  live shapes, the mixed round, and the whole check-outcome enum are pinned in
-  `test/labels-reconcile.sh` (fixtures 19 → 44).
+  live shapes, the mixed round, the in-flight run superseding a finished one —
+  in both spellings of an absent completion — and the whole check-outcome enum
+  are pinned in `test/labels-reconcile.sh` (fixtures 19 → 48).
 
 ## 0.1.1 — 2026-07-19
 

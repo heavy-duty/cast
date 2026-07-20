@@ -33,7 +33,27 @@ actually cutting it, and this file starts there.
   re-request. An *unfinished* round still yields to an explicit human request —
   a maintainer pulling a PR to themselves early is deliberate, and `MISSING`
   (nobody has reviewed yet) is a different fact from `STALE` (everyone reviewed
-  something else).
+  something else). Precedence is applied to the round as a whole, after every
+  verdict is collected: deciding inside the loop let the order of `BOTS` pick
+  the answer, so a round that was *both* unfinished and staled returned on the
+  `MISSING` before any later bot's `STALE` was read — and came out
+  `needs-human` over a head nobody had reviewed, the original bug wearing a
+  different hat.
+
+  Whether a check blocks is judged by listing the outcomes that *don't* —
+  `SUCCESS`, `NEUTRAL`, `SKIPPED`, and the pending set — rather than the
+  outcomes that do. The rollup mixes two closed enums (`CheckRun.conclusion`
+  and `StatusContext.state`), and an outcome the list forgets is one the label
+  cannot certify as mergeable: `ERROR`, `CANCELLED` and `STALE` all read as
+  green under an allow-list of failures. The costs are not symmetric — a false
+  failure parks the PR on the agent, who looks; a false success invites a human
+  to merge a tree that will not merge. Superseded runs are dropped first, each
+  context collapsing to its newest entry: a re-run does not evict the run it
+  replaced, and the rollup keeps both. That shape is live on this board — this
+  PR's own tip carried two `scope` and two `reconcile` entries — and on
+  heavy-duty/box#137's tip the superseded half was `CANCELLED`, so once
+  `CANCELLED` blocks, judging every entry rather than the newest would strand
+  every re-run PR in `needs-rebase`.
 
   `UNKNOWN` mergeability is deliberately not treated as unmergeable: GitHub
   reports it for about a minute after every merge while it recomputes, and
@@ -45,8 +65,9 @@ actually cutting it, and this file starts there.
   correct `needs-human` still does not say *which* of three ready PRs to merge
   first. Queue order is intent, so the reconciler never sets it; it only
   **clears** it once the PR stops being mergeable-by-a-human. Ported from
-  heavy-duty/box#137 so the three repos' reconcilers stay byte-identical;
-  fixtures 19 → 29.
+  heavy-duty/box#137 so the three repos' reconcilers stay byte-identical; both
+  live shapes, the mixed round, and the whole check-outcome enum are pinned in
+  `test/labels-reconcile.sh` (fixtures 19 → 44).
 
 ## 0.1.1 — 2026-07-19
 

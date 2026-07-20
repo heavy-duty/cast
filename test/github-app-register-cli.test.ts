@@ -56,6 +56,10 @@ async function stubCoolify(opts: { repositories: unknown }): Promise<Stub> {
       if (path === "/security/keys") return json({ uuid: "key-uuid-1" });
       if (path === "/github-apps" && req.method === "POST")
         return json({ id: 7, uuid: "app-uuid" });
+      // A clean instance: nothing registered under this name yet, so register
+      // goes on to create. (The list read is how it avoids a duplicate Source
+      // on a re-run — Coolify does not enforce unique names.)
+      if (path === "/github-apps" && req.method === "GET") return json([]);
       if (path === "/github-apps/7/repositories")
         return json({ repositories: opts.repositories });
       res.writeHead(404);

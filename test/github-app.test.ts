@@ -13,16 +13,20 @@ import { loadBindings } from "../src/bindings.js";
 import { CoolifyClient } from "../src/coolify.js";
 import {
   type AppCredentials,
+  type PendingAppCredentials,
   awaitInstallationId,
   buildManifest,
   convertManifestCode,
   createGithubApp,
   detectOwnerType,
   findInstallationId,
+  findRegisteredApp,
+  githubUserAgent,
   manifestFormPage,
   mintAppJwt,
   newAppFormAction,
   persistCredentials,
+  preflightCredentialSlot,
   preflightOrgAdmin,
   readAppRepositories,
   registerGithubApp,
@@ -658,6 +662,7 @@ describe("registering with Coolify, and the post-condition that matters", () => 
 
   it("uploads the key, creates the App, and PROVES it can reach the repo", async () => {
     const c = coolify({
+      "GET /github-apps": ok([{ id: 4, name: "something-else" }]),
       "POST /security/keys": ok({ uuid: "key-uuid-1" }),
       "POST /github-apps": ok({ id: 7, uuid: "app-uuid" }),
       "GET /github-apps/7/repositories": ok({
@@ -678,6 +683,7 @@ describe("registering with Coolify, and the post-condition that matters", () => 
     });
 
     expect(c.hits).toEqual([
+      "GET /github-apps",
       "POST /security/keys",
       "POST /github-apps",
       "GET /github-apps/7/repositories",
@@ -787,6 +793,214 @@ describe("registering with Coolify, and the post-condition that matters", () => 
   });
 });
 
+// grok #2, and the reason it is a real bug rather than a hypothetical: Coolify
+// does not enforce unique Source names. Its GithubController@create validates
+// `'name' => 'required|string|max:255'` — no `unique` — then calls a plain
+// `GithubApp::create()`. So the old "re-run register to re-check" advice
+// created a second Source every time it was followed.
+describe("re-running `register` re-verifies instead of registering twice", () => {
+  const ok = (payload: unknown) => () => [200, payload] as [number, unknown];
+
+  it("reuses an existing Source of the same name and POSTs NOTHING", async () => {
+    const c = coolify({
+      "GET /github-apps": ok([
+        { id: 4, name: "other-app", app_id: 1 },
+        { id: 7, name: "hdb-coolify-prod", app_id: 12345 },
+      ]),
+      "GET /github-apps/7/repositories": ok([
+        { full_name: "heavy-duty/incubator" },
+      ]),
+    });
+    const out = await registerGithubApp({
+      client: c.client,
+      name: "hdb-coolify-prod",
+      org: "heavy-duty",
+      orgRepo: "heavy-duty/incubator",
+      creds: creds(),
+      stateDir: tmp("cast-state-"),
+      log: () => {},
+    });
+    // The verify-only path: the list, then the check. No key upload, no App
+    // create — following the error message's own advice is now free.
+    expect(c.hits).toEqual([
+      "GET /github-apps",
+      "GET /github-apps/7/repositories",
+    ]);
+    expect(out.coolifyAppId).toBe(7);
+    expect(out.keyUuid).toBeNull();
+  });
+
+  it("refuses when the name is taken by a DIFFERENT App rather than shadowing it", async () => {
+    const c = coolify({
+      "GET /github-apps": ok([
+        { id: 7, name: "hdb-coolify-prod", app_id: 999999 },
+      ]),
+    });
+    await expect(
+      registerGithubApp({
+        client: c.client,
+        name: "hdb-coolify-prod",
+        org: "heavy-duty",
+        orgRepo: "heavy-duty/incubator",
+        creds: creds(),
+        stateDir: tmp("cast-state-"),
+        log: () => {},
+      }),
+    ).rejects.toThrow(/DIFFERENT App[\s\S]*github app id 999999/);
+    expect(c.hits).toEqual(["GET /github-apps"]);
+  });
+
+  it("refuses when duplicates ALREADY exist, because cast cannot pick one", async () => {
+    const c = coolify({
+      "GET /github-apps": ok([
+        { id: 7, name: "dup", app_id: 12345 },
+        { id: 8, name: "dup", app_id: 12345 },
+      ]),
+    });
+    await expect(
+      registerGithubApp({
+        client: c.client,
+        name: "dup",
+        org: "o",
+        orgRepo: "o/r",
+        creds: creds(),
+        stateDir: tmp("cast-state-"),
+        log: () => {},
+      }),
+    ).rejects.toThrow(/2 GitHub App records named dup[\s\S]*coolify ids: 7, 8/);
+  });
+
+  it("warns and proceeds when the list is unreadable — a bootstrap must not be blocked by a check", async () => {
+    const lines: string[] = [];
+    const c = coolify({
+      // No "GET /github-apps" route: the list 404s.
+      "POST /security/keys": ok({ uuid: "k" }),
+      "POST /github-apps": ok({ id: 3 }),
+      "GET /github-apps/3/repositories": ok([{ full_name: "o/r" }]),
+    });
+    const out = await registerGithubApp({
+      client: c.client,
+      name: "n",
+      org: "o",
+      orgRepo: "o/r",
+      creds: creds(),
+      stateDir: tmp("cast-state-"),
+      log: (l) => lines.push(l),
+    });
+    expect(out.coolifyAppId).toBe(3);
+    // Unreadable is not "empty" — it is said out loud, not assumed away.
+    expect(lines.join("\n")).toContain("could not list existing Coolify");
+  });
+
+  it("reads names off the list and ignores everything else", async () => {
+    const c = coolify({
+      "GET /github-apps": ok([
+        { id: 1, name: "a" },
+        "not an object",
+        { name: "wanted-but-no-id" },
+        { id: 2, name: "wanted", app_id: 5 },
+      ]),
+    });
+    expect(await findRegisteredApp(c.client, "wanted")).toEqual([
+      { id: 2, appId: 5 },
+    ]);
+    expect(await findRegisteredApp(c.client, "absent")).toEqual([]);
+  });
+});
+
+// grok #3. Not a security boundary — the name is the operator's own — but a
+// slash in it silently nests the credentials somewhere nobody will look, and
+// `..` walks clean out of the state directory.
+describe("the App name has to be usable as a filename", () => {
+  it("rejects separators, dot-references and empties before they become paths", () => {
+    for (const bad of ["", "a/b", "a\\b", "..", ".", "../escape", ".hidden"]) {
+      expect(() =>
+        persistCredentials({
+          stateDir: tmp("cast-state-"),
+          name: bad,
+          creds: creds(),
+          org: "o",
+          orgRepo: "o/r",
+        }),
+      ).toThrow(/github app name/);
+    }
+    expect(() =>
+      preflightCredentialSlot({ stateDir: tmp("cast-state-"), name: "a/b" }),
+    ).toThrow(/contains a path separator/);
+    // Ordinary names stay ordinary.
+    expect(() =>
+      persistCredentials({
+        stateDir: tmp("cast-state-"),
+        name: "hdb-coolify-prod",
+        creds: creds(),
+        org: "o",
+        orgRepo: "o/r",
+      }),
+    ).not.toThrow();
+  });
+
+  it("catches it at name resolution too, so a bad --name never reaches a network", () => {
+    const empty = loadBindings("", {
+      overrideText: [
+        "environments:",
+        "  prod:",
+        "    server: box",
+        "    team: { id: 0, name: Root Team }",
+        "github_apps: {}",
+        "",
+      ].join("\n"),
+    });
+    expect(() =>
+      resolveAppName({
+        bindings: empty,
+        orgRepo: "heavy-duty/incubator",
+        nameFlag: "../oops",
+      }),
+    ).toThrow(/github app name/);
+    // And a hand-edited environments.yaml entry gets the same treatment: it
+    // becomes a filename by exactly the same route.
+    const bad = loadBindings("", {
+      overrideText: [
+        "environments:",
+        "  prod:",
+        "    server: box",
+        "    team: { id: 0, name: Root Team }",
+        'github_apps: { "heavy-duty/incubator": "../oops" }',
+        "",
+      ].join("\n"),
+    });
+    expect(() =>
+      resolveAppName({ bindings: bad, orgRepo: "heavy-duty/incubator" }),
+    ).toThrow(/github app name/);
+  });
+});
+
+// grok #4.
+describe("cast identifies itself to GitHub", () => {
+  it("sends a User-Agent, because GitHub asks for one and 403s look like nothing else", async () => {
+    expect(githubUserAgent()).toMatch(/^cast\//);
+    const seen: Record<string, string>[] = [];
+    const fetchImpl = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      seen.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response(JSON.stringify({ type: "Organization" }), {
+        status: 200,
+      });
+    }) as unknown as typeof fetch;
+    await detectOwnerType("heavy-duty", fetchImpl);
+    await findInstallationId({
+      owner: "heavy-duty",
+      ownerType: "Organization",
+      jwt: "jwt",
+      fetchImpl,
+    }).catch(() => {});
+    await convertManifestCode("code", fetchImpl).catch(() => {});
+    expect(seen.length).toBe(3);
+    for (const headers of seen) {
+      expect(headers["User-Agent"]).toBe(githubUserAgent());
+    }
+  });
+});
+
 describe("the optional org-admin preflight", () => {
   it("passes on admin and refuses on anything else", () => {
     expect(preflightOrgAdmin("heavy-duty", () => '{"role":"admin"}')).toEqual({
@@ -845,6 +1059,7 @@ describe("`create` falls through into `register` — one implementation, not two
     }) as unknown as typeof fetch;
 
     const c = coolify({
+      "GET /github-apps": () => [200, []],
       "POST /security/keys": () => [200, { uuid: "key-uuid-1" }],
       "POST /github-apps": () => [200, { id: 11 }],
       "GET /github-apps/11/repositories": () => [
@@ -887,9 +1102,10 @@ describe("`create` falls through into `register` — one implementation, not two
     });
 
     const out = await flow;
-    // The fall-through, asserted as an identity of behaviour: the same three
+    // The fall-through, asserted as an identity of behaviour: the same four
     // calls, in the same order, that the `register`-only test above pins.
     expect(c.hits).toEqual([
+      "GET /github-apps",
       "POST /security/keys",
       "POST /github-apps",
       "GET /github-apps/11/repositories",
@@ -906,6 +1122,181 @@ describe("`create` falls through into `register` — one implementation, not two
     expect(
       readFileSync(join(state, "github-apps", "hdb-coolify-prod.pem"), "utf8"),
     ).toBe(privateKeyPem);
+  });
+
+  // The blocker all three reviewers raised on #124, pinned. Conversion
+  // SUCCEEDS — GitHub has minted the App and shown the private key for the only
+  // time it ever will — and then the install poll fails for every attempt. The
+  // old order held that payload in memory across the whole poll and wrote it
+  // only inside registerGithubApp, so this scenario destroyed it.
+  it("keeps the one-shot PEM and client secret when the install NEVER lands", async () => {
+    const conversion = {
+      id: 424242,
+      slug: "hdb-coolify-prod",
+      client_id: "Iv23liXYZ",
+      client_secret: "github-issued-secret",
+      webhook_secret: "github-issued-webhook",
+      pem: privateKeyPem,
+      owner: { login: "heavy-duty", type: "Organization" },
+    };
+    const githubFetch = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.endsWith("/conversions"))
+        return new Response(JSON.stringify(conversion), { status: 200 });
+      // Never installed. 404 on every single attempt, which is the state the
+      // poll is designed to wait out and eventually give up on.
+      if (u.includes("/installation"))
+        return new Response("{}", { status: 404 });
+      return new Response(JSON.stringify({ type: "Organization" }), {
+        status: 200,
+      });
+    }) as unknown as typeof fetch;
+
+    const c = coolify({});
+    const state = tmp("cast-state-");
+    const err = await createGithubApp({
+      client: c.client,
+      orgRepo: "heavy-duty/incubator",
+      name: "hdb-coolify-prod",
+      stateDir: state,
+      port: 0,
+      deps: {
+        fetchImpl: githubFetch,
+        openUrl: (url) => {
+          if (url.startsWith("http://127.0.0.1")) {
+            const u = new URL(url);
+            fetch(url)
+              .then((r) => r.text())
+              .then((page) => {
+                const s = /state=([^"&]+)/.exec(page)?.[1] ?? "";
+                return fetch(`${u.origin}/callback?code=the-code&state=${s}`);
+              });
+          }
+          return false;
+        },
+        sleep: async () => {},
+        runGh: () => '{"role":"admin"}',
+        log: () => {},
+        installAttempts: 3,
+        installIntervalMs: 1,
+      },
+    }).then(
+      () => undefined,
+      (e: Error) => e,
+    );
+
+    expect(err).toBeDefined();
+    // 1. The secrets GitHub shows exactly once are ON DISK.
+    const pem = join(state, "github-apps", "hdb-coolify-prod.pem");
+    const json = join(state, "github-apps", "hdb-coolify-prod.json");
+    expect(readFileSync(pem, "utf8")).toBe(privateKeyPem);
+    const saved = JSON.parse(readFileSync(json, "utf8"));
+    expect(saved.client_secret).toBe("github-issued-secret");
+    expect(saved.webhook_secret).toBe("github-issued-webhook");
+    expect(saved.app_id).toBe(424242);
+    // The one field that is legitimately unknown, and the only one GitHub will
+    // answer again as many times as it is asked.
+    expect(saved.installation_id).toBeNull();
+
+    // 2. The remedy MATCHES REALITY — it names the files that exist and the
+    // command that finishes the job, and it does not claim credentials are
+    // saved somewhere they are not.
+    const message = (err as Error).message;
+    expect(message).toContain("Nothing is lost");
+    expect(message).toContain(pem);
+    expect(message).toContain(json);
+    expect(message).toContain("cast github-app register");
+    expect(message).toContain("--app-id 424242");
+    expect(message).toContain("Do NOT re-run `create`");
+
+    // 3. Nothing was registered with Coolify, so there is no half-record to
+    // reconcile — only an App on GitHub awaiting its install.
+    expect(c.hits).toEqual([]);
+  });
+
+  it("backfills the installation id onto the pending record rather than refusing itself", async () => {
+    const state = tmp("cast-state-");
+    const pending: PendingAppCredentials = {
+      appId: 12345,
+      clientId: "Iv23liABCDEF",
+      clientSecret: "cs-secret",
+      webhookSecret: "wh-secret",
+      privateKeyPem: privateKeyPem ?? "PEM",
+    };
+    const args = { stateDir: state, name: "app", org: "o", orgRepo: "o/r" };
+    const { secretsPath } = persistCredentials({ ...args, creds: pending });
+    expect(JSON.parse(readFileSync(secretsPath, "utf8")).installation_id).toBe(
+      null,
+    );
+
+    // The completion `create` performs once the install lands. This is the ONE
+    // transition allowed without --force, because nothing irreplaceable moves.
+    persistCredentials({
+      ...args,
+      creds: { ...pending, installationId: 5150 },
+    });
+    expect(JSON.parse(readFileSync(secretsPath, "utf8")).installation_id).toBe(
+      5150,
+    );
+
+    // And it really is only that one field: a different client secret arriving
+    // alongside a filled-in installation id is still a refusal.
+    expect(() =>
+      persistCredentials({
+        ...args,
+        creds: { ...pending, installationId: 5150, clientSecret: "other" },
+      }),
+    ).toThrow(/refusing to overwrite/);
+    // Nor does a KNOWN installation id get quietly replaced by a different one.
+    expect(() =>
+      persistCredentials({
+        ...args,
+        creds: { ...pending, installationId: 6000 },
+      }),
+    ).toThrow(/refusing to overwrite/);
+  });
+
+  // claude-bot's addition: the post-conversion persist must never be the thing
+  // that throws, because at that moment it is holding the only copy of the key.
+  it("refuses a name collision BEFORE the browser flow, when nothing can be lost", async () => {
+    const state = tmp("cast-state-");
+    persistCredentials({
+      stateDir: state,
+      name: "hdb-coolify-prod",
+      creds: creds({ privateKeyPem: "an older App's key" }),
+      org: "heavy-duty",
+      orgRepo: "heavy-duty/incubator",
+    });
+
+    const c = coolify({});
+    const githubFetch = vi.fn(async () => {
+      throw new Error("GitHub must not be reached");
+    }) as unknown as typeof fetch;
+
+    await expect(
+      createGithubApp({
+        client: c.client,
+        orgRepo: "heavy-duty/incubator",
+        name: "hdb-coolify-prod",
+        stateDir: state,
+        port: 0,
+        ownerType: "Organization",
+        deps: {
+          fetchImpl: githubFetch,
+          runGh: () => '{"role":"admin"}',
+          log: () => {},
+          openUrl: () => false,
+        },
+      }),
+    ).rejects.toThrow(/already has credentials on disk[\s\S]*register/);
+
+    // No browser flow, no App minted, no Coolify call — the whole point of
+    // checking now instead of after the conversion.
+    expect(c.hits).toEqual([]);
+    // And the older key is untouched.
+    expect(
+      readFileSync(join(state, "github-apps", "hdb-coolify-prod.pem"), "utf8"),
+    ).toBe("an older App's key");
   });
 
   it("refuses before the browser dance when gh says you are not an org admin", async () => {

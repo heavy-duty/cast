@@ -103,10 +103,22 @@ actually cutting it, and this file starts there.
   `--webhook-secret` is optional: a webhook-inactive App is the correct shape
   for a tailnet-only Coolify, and nobody has to invent a placeholder.
 
+  The one-shot secrets are written the instant GitHub yields them, *before*
+  `create` waits ~5 minutes for you to install the App — so a timeout, a
+  dropped connection or a `Ctrl-C` during that wait cannot destroy a private
+  key GitHub will never re-show. Until the install lands the record carries
+  `"installation_id": null`, the single field GitHub will answer again, and
+  it is backfilled on success. A name collision is refused *before* the
+  browser flow starts, when no App exists yet and nothing can be lost.
+
   Both verbs end at the step that matters most: `GET
   /github-apps/{id}/repositories`, asserting the repo is actually reachable.
   Until now a misconfigured App failed silently and surfaced hours later, in
-  a different command, as an unresolvable source at `cast apply` time.
+  a different command, as an unresolvable source at `cast apply` time. When
+  that check fails its advice is to re-run `register` — which now re-verifies
+  the existing Coolify Source instead of registering a second one, because
+  Coolify does not enforce unique Source names (`GithubController@create`
+  validates `name` without `unique` and calls a plain `GithubApp::create`).
 
   No new dependencies — `node:http` serves the callback, `node:crypto`'s
   `createSign("RSA-SHA256")` mints the App JWT that recovers the installation

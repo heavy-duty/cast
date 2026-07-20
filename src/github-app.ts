@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseDocument } from "yaml";
 import type { Bindings } from "./bindings.js";
 import type { CoolifyClient } from "./coolify.js";
@@ -76,15 +77,57 @@ export type AppCredentials = {
   privateKeyPem: string;
 };
 
+// What `create` has in hand the instant the conversion returns, and what it
+// persists BEFORE going anywhere near the install poll. It is an AppCredentials
+// missing exactly one field, and that field is the only one recoverable later:
+// GitHub will re-answer "which installation" forever, and will never re-show
+// the private key or the client secret.
+export type PendingAppCredentials = Omit<AppCredentials, "installationId"> & {
+  installationId?: number;
+};
+
 export type RegisterResult = {
   // Coolify's OWN integer id for the App record, not GitHub's app id. It is
   // what GET /github-apps/{id}/repositories takes.
   coolifyAppId: number;
-  keyUuid: string;
+  // null when the App was already registered under this name and cast verified
+  // the existing record instead of creating a second one.
+  keyUuid: string | null;
   repositories: string[];
   pemPath: string;
   secretsPath: string;
 };
+
+// grok #4: GitHub asks every client to identify itself, and an absent
+// User-Agent is a documented cause of 403s that look like nothing else.
+// Resolved from package.json the same way `cast --version` does, and never
+// fatal — a User-Agent is not worth failing a bootstrap over.
+let userAgentCache: string | undefined;
+export function githubUserAgent(): string {
+  if (userAgentCache !== undefined) return userAgentCache;
+  let version = "unknown";
+  try {
+    const pkgPath = fileURLToPath(new URL("../package.json", import.meta.url));
+    const raw: unknown = JSON.parse(readFileSync(pkgPath, "utf8")).version;
+    if (typeof raw === "string") version = raw;
+  } catch {
+    // A missing or unreadable package.json means an odd install tree, not a
+    // reason to refuse to talk to GitHub.
+  }
+  userAgentCache = `cast/${version}`;
+  return userAgentCache;
+}
+
+// Every GitHub request in this module goes out with these.
+function githubHeaders(
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  return {
+    Accept: "application/vnd.github+json",
+    "User-Agent": githubUserAgent(),
+    ...extra,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Step 2 — the name comes from state, not from a flag
@@ -106,6 +149,7 @@ export function resolveAppName(opts: {
   nameFlag?: string;
 }): { name: string; seed: boolean } {
   const repoShort = opts.orgRepo.split("/")[1] ?? opts.orgRepo;
+  if (opts.nameFlag !== undefined) assertUsableAppName(opts.nameFlag);
   const bound =
     opts.bindings.github_apps[opts.orgRepo] ??
     opts.bindings.github_apps[repoShort];
@@ -125,6 +169,9 @@ export function resolveAppName(opts: {
         ].join("\n"),
       );
     }
+    // Applies to a value that came from state too: environments.yaml is
+    // hand-edited, and `github_apps` entries become filenames just the same.
+    assertUsableAppName(bound);
     return { name: bound, seed: false };
   }
   if (opts.nameFlag === undefined) {
@@ -364,10 +411,7 @@ export async function convertManifestCode(
     `https://api.github.com/app-manifests/${encodeURIComponent(code)}/conversions`,
     {
       method: "POST",
-      headers: {
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
+      headers: githubHeaders({ "X-GitHub-Api-Version": "2022-11-28" }),
     },
   );
   if (!res.ok) {
@@ -509,11 +553,10 @@ export async function findInstallationId(opts: {
       ? `/users/${encodeURIComponent(opts.owner)}/installation`
       : `/orgs/${encodeURIComponent(opts.owner)}/installation`;
   const res = await (opts.fetchImpl ?? fetch)(`https://api.github.com${path}`, {
-    headers: {
-      Accept: "application/vnd.github+json",
+    headers: githubHeaders({
       Authorization: `Bearer ${opts.jwt}`,
       "X-GitHub-Api-Version": "2022-11-28",
-    },
+    }),
   });
   if (res.status === 404) return undefined;
   if (!res.ok) {
@@ -526,6 +569,15 @@ export async function findInstallationId(opts: {
     );
   }
   return raw.id;
+}
+
+// Distinguishable so `create` can attach the remedy it alone can write — the
+// real paths it just persisted to — without string-matching a message.
+export class InstallationNeverArrivedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InstallationNeverArrivedError";
+  }
 }
 
 // Poll while the operator clicks through the install screen in a browser.
@@ -565,18 +617,19 @@ export async function awaitInstallationId(opts: {
     }
     await sleep(intervalMs);
   }
-  throw new Error(
+  // Only the FACT belongs here. This function does not know where — or
+  // whether — anything was persisted, and the previous version of this message
+  // asserted that credentials were "already there" on exactly the path where
+  // they were not (all three reviewers, #124). The caller that owns the files
+  // owns the remedy: see createGithubApp.
+  throw new InstallationNeverArrivedError(
     [
       `the App was never installed on ${opts.owner}`,
       "",
       `cast polled GET /${opts.ownerType === "User" ? "users" : "orgs"}/${opts.owner}/installation`,
       `for ${Math.round((attempts * intervalMs) / 1000)}s and it stayed 404.`,
       "",
-      "The App exists on GitHub — only the install step is missing. Open the",
-      "install URL printed above, choose the target repository, and then re-run",
-      "`cast github-app register` with the credentials cast saved under",
-      "<state>/github-apps/ (the private key and client secret are already there;",
-      "nothing has to be recreated).",
+      "The App exists on GitHub — only the install step is missing.",
     ].join("\n"),
   );
 }
@@ -606,14 +659,88 @@ export function githubAppDir(stateDir: string): string {
   return join(stateDir, "github-apps");
 }
 
+// grok #3: `name` becomes a path segment (`<name>.pem`, `<name>.json`). It is
+// operator-controlled and therefore not a security boundary — but a typo with a
+// slash in it silently nests credentials under a subdirectory nobody will think
+// to look in, and `..` walks out of the state directory entirely. Neither is
+// worth diagnosing later, so both are refused here, at the one point where the
+// name becomes a filename.
+export function assertUsableAppName(name: string): void {
+  const bad =
+    name === ""
+      ? "is empty"
+      : name === "." || name === ".."
+        ? "is a directory reference"
+        : /[/\\]/.test(name)
+          ? "contains a path separator"
+          : name.includes("..")
+            ? "contains `..`"
+            : name.startsWith(".")
+              ? "starts with a dot"
+              : // biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting them is the point
+                /[\x00-\x1f]/.test(name)
+                ? "contains a control character"
+                : undefined;
+  if (bad === undefined) return;
+  throw new Error(
+    [
+      `github app name ${JSON.stringify(name)} ${bad}`,
+      "",
+      "The name is used verbatim as a filename under <state>/github-apps/ and as",
+      "the Coolify Source label that environments.yaml binds. Use a plain name",
+      "like `hdb-coolify-prod`.",
+    ].join("\n"),
+  );
+}
+
+// Refuse a name collision BEFORE the browser flow, when nothing has been
+// created and nothing can be lost (claude-bot, #124).
+//
+// On the `create` path a stale `<name>.pem` is a trap: the freshly minted App's
+// key differs from it by construction, so the post-conversion persist would hit
+// writeExclusive's refusal holding the one and only copy of a key GitHub has
+// already stopped showing — and that refusal's remedy ("pass --force and
+// re-run") would mean minting a SECOND App. Checked here, the answer costs
+// nothing: no App exists yet.
+export function preflightCredentialSlot(opts: {
+  stateDir: string;
+  name: string;
+  force?: boolean;
+}): void {
+  assertUsableAppName(opts.name);
+  if (opts.force === true) return;
+  const dir = githubAppDir(opts.stateDir);
+  const occupied = [`${opts.name}.pem`, `${opts.name}.json`]
+    .map((f) => join(dir, f))
+    .filter((p) => existsSync(p));
+  if (occupied.length === 0) return;
+  throw new Error(
+    [
+      `${opts.name} already has credentials on disk`,
+      "",
+      ...occupied.map((p) => `  ${p}`),
+      "",
+      "`create` mints a NEW App, whose private key cannot match the one already",
+      "saved here — so this is checked now, before the browser flow, rather than",
+      "after GitHub has handed over a key that would have nowhere to go.",
+      "",
+      "If those files are the App you want, you do not need `create`: install it",
+      "on the repository and run `cast github-app register` against them.",
+      "If they are a stale half-run whose App you have since deleted, move them",
+      "aside or pass --force.",
+    ].join("\n"),
+  );
+}
+
 export function persistCredentials(opts: {
   stateDir: string;
   name: string;
-  creds: AppCredentials;
+  creds: PendingAppCredentials;
   org: string;
   orgRepo: string;
   force?: boolean;
 }): { pemPath: string; secretsPath: string } {
+  assertUsableAppName(opts.name);
   const dir = githubAppDir(opts.stateDir);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const ignore = join(dir, ".gitignore");
@@ -639,26 +766,65 @@ export function persistCredentials(opts: {
   const pemPath = join(dir, `${opts.name}.pem`);
   const secretsPath = join(dir, `${opts.name}.json`);
   writeExclusive(pemPath, opts.creds.privateKeyPem, opts.force === true);
-  writeExclusive(
-    secretsPath,
-    `${JSON.stringify(
-      {
-        name: opts.name,
-        org: opts.org,
-        repo: opts.orgRepo,
-        app_id: opts.creds.appId,
-        installation_id: opts.creds.installationId,
-        client_id: opts.creds.clientId,
-        client_secret: opts.creds.clientSecret,
-        webhook_secret: opts.creds.webhookSecret,
-        private_key_file: `${opts.name}.pem`,
-      },
-      null,
-      2,
-    )}\n`,
-    opts.force === true,
-  );
+  // `installation_id: null` is the honest representation of a record written
+  // between the conversion and the install: everything GitHub shows once is
+  // here, and the one missing field is the one GitHub will answer again.
+  const record = {
+    name: opts.name,
+    org: opts.org,
+    repo: opts.orgRepo,
+    app_id: opts.creds.appId,
+    installation_id: opts.creds.installationId ?? null,
+    client_id: opts.creds.clientId,
+    client_secret: opts.creds.clientSecret,
+    webhook_secret: opts.creds.webhookSecret,
+    private_key_file: `${opts.name}.pem`,
+  };
+  writeCredentialsRecord(secretsPath, record, opts.force === true);
   return { pemPath, secretsPath };
+}
+
+// Same refusal as writeExclusive, with ONE transition carved out: a record
+// whose only difference from the incoming one is that its `installation_id` was
+// null. That is the backfill `create` performs once the install lands, and it
+// is not the loss writeExclusive exists to prevent — nothing irreplaceable
+// changes. Anything else still refuses.
+function writeCredentialsRecord(
+  path: string,
+  record: Record<string, unknown>,
+  force: boolean,
+): void {
+  const next = `${JSON.stringify(record, null, 2)}\n`;
+  if (existsSync(path) && !force) {
+    const raw = readFileSync(path, "utf8");
+    if (raw === next) return;
+    if (!isInstallationBackfill(raw, record)) {
+      throw refusalToOverwrite(path);
+    }
+  }
+  writeFileSync(path, next, { mode: 0o600 });
+}
+
+function isInstallationBackfill(
+  existing: string,
+  next: Record<string, unknown>,
+): boolean {
+  let prev: Record<string, unknown>;
+  try {
+    prev = JSON.parse(existing) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  if (prev === null || typeof prev !== "object") return false;
+  // Only ever fills a null in; never overwrites an id with a different one.
+  if (prev.installation_id !== null) return false;
+  if (typeof next.installation_id !== "number") return false;
+  const keys = new Set([...Object.keys(prev), ...Object.keys(next)]);
+  for (const key of keys) {
+    if (key === "installation_id") continue;
+    if (prev[key] !== next[key]) return false;
+  }
+  return true;
 }
 
 // Idempotent when the content matches, a refusal when it does not. Overwriting
@@ -666,20 +832,28 @@ export function persistCredentials(opts: {
 function writeExclusive(path: string, content: string, force: boolean): void {
   if (existsSync(path) && !force) {
     if (readFileSync(path, "utf8") === content) return;
-    throw new Error(
-      [
-        `refusing to overwrite ${path}`,
-        "",
-        "It already holds different content. For a GitHub App private key that is",
-        "the only copy in existence — GitHub will not show it again — so cast will",
-        "not replace it without being told to.",
-        "",
-        "Move it aside, or pass --force if the existing file is stale (e.g. a",
-        "previous `create` attempt whose App you have since deleted).",
-      ].join("\n"),
-    );
+    throw refusalToOverwrite(path);
   }
   writeFileSync(path, content, { mode: 0o600 });
+}
+
+// The remedy here is honest for `register`, where re-running is cheap and
+// nothing is minted. `create` can no longer reach this refusal: it is
+// pre-flighted before the browser flow (preflightCredentialSlot), so by the
+// time a create-path persist runs, the slot is either clean or an exact match.
+function refusalToOverwrite(path: string): Error {
+  return new Error(
+    [
+      `refusing to overwrite ${path}`,
+      "",
+      "It already holds different content. For a GitHub App private key that is",
+      "the only copy in existence — GitHub will not show it again — so cast will",
+      "not replace it without being told to.",
+      "",
+      "Move it aside, or pass --force if the existing file is stale (e.g. a",
+      "previous `create` attempt whose App you have since deleted).",
+    ].join("\n"),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +896,48 @@ export async function readAppRepositories(
   return names;
 }
 
+// grok #2: the repo-visibility failure tells the operator to re-run `register`
+// to re-check — and re-running used to re-POST the key and the App first. That
+// is only harmless if Coolify de-dupes by name, and it does not. Coolify's own
+// GithubController@create validates `'name' => 'required|string|max:255'` —
+// no `unique` rule — and then calls a plain `GithubApp::create($payload)`. The
+// vendored OpenAPI agrees by omission: the create response documents 201/400/
+// 401/422 and no conflict at all. So a second `register` under the same name
+// yields a second Source, and the remedy printed by a failed post-condition
+// quietly multiplies the thing it is asking the operator to fix.
+//
+// Fixed by looking first. This turns "re-run register to re-check" into what
+// its own wording already promised — a re-check — and leaves the create path
+// unchanged, since a clean instance has nothing to find.
+export type ExistingApp = { id: number; appId: number | undefined };
+
+// `undefined` means "cast could not read the list", which is NOT the same as
+// "there is nothing there" — see the caller for why that distinction does not
+// become a refusal here.
+export async function findRegisteredApp(
+  client: CoolifyClient,
+  name: string,
+): Promise<ExistingApp[] | undefined> {
+  let raw: unknown;
+  try {
+    raw = await client.get("/github-apps");
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(raw)) return undefined;
+  const found: ExistingApp[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const row = item as Record<string, unknown>;
+    if (row.name !== name || typeof row.id !== "number") continue;
+    found.push({
+      id: row.id,
+      appId: typeof row.app_id === "number" ? row.app_id : undefined,
+    });
+  }
+  return found;
+}
+
 // Register the App with Coolify and PROVE it works.
 //
 // The two POSTs are the script's, unchanged in effect. The GET is the step that
@@ -755,6 +971,121 @@ export async function registerGithubApp(opts: {
   log(`private key  → ${pemPath}`);
   log(`credentials  → ${secretsPath}`);
 
+  // Look before creating (grok #2). Both verbs do this, so `create`'s
+  // fall-through remains an identity of behaviour: the same call sequence,
+  // in the same order, whichever verb produced the credentials.
+  const existing = await findRegisteredApp(opts.client, opts.name);
+  if (existing === undefined) {
+    // Deliberately a warning and not a refusal. An unreadable list leaves cast
+    // exactly where it was before this check existed — it might create a
+    // duplicate — whereas refusing would block the bootstrap command outright
+    // on an instance whose list endpoint is restricted. The failure mode of
+    // proceeding is a spare Source the operator can delete; the failure mode of
+    // refusing is no Source at all. Said out loud rather than assumed away.
+    log(
+      "warning: could not list existing Coolify Sources; cannot check whether",
+    );
+    log(`         ${opts.name} is already registered. Proceeding to create.`);
+  }
+  if (existing !== undefined && existing.length > 1) {
+    throw new Error(
+      [
+        `Coolify already has ${existing.length} GitHub App records named ${opts.name}`,
+        "",
+        `  coolify ids: ${existing.map((e) => e.id).join(", ")}`,
+        "",
+        "Coolify does not enforce unique Source names, so cast cannot tell which",
+        "of these `cast apply` would resolve. Delete the duplicates from Coolify's",
+        "Sources page, leaving the one that is correctly installed, then re-run.",
+      ].join("\n"),
+    );
+  }
+  const reuse = existing?.[0];
+  if (
+    reuse !== undefined &&
+    reuse.appId !== undefined &&
+    reuse.appId !== opts.creds.appId
+  ) {
+    throw new Error(
+      [
+        `Coolify already has a GitHub App named ${opts.name}, and it is a DIFFERENT App`,
+        "",
+        `  registered: github app id ${reuse.appId} (coolify id ${reuse.id})`,
+        `  supplied:   github app id ${opts.creds.appId}`,
+        "",
+        "Registering these credentials would leave two Sources with one name and",
+        "no way for `cast apply` to tell them apart. Either delete the old record",
+        "from Coolify's Sources page, or bind this App to a different name in",
+        "environments.yaml.",
+      ].join("\n"),
+    );
+  }
+
+  let coolifyAppId: number;
+  let keyUuid: string | null = null;
+  if (reuse !== undefined) {
+    // The verify-only path. Nothing is POSTed, so a failed post-condition can
+    // be re-checked as many times as the operator needs.
+    coolifyAppId = reuse.id;
+    log(
+      `already registered as ${opts.name} (coolify id ${coolifyAppId}) — verifying, not re-creating`,
+    );
+  } else {
+    ({ coolifyAppId, keyUuid } = await createCoolifyApp(opts, log));
+  }
+
+  const repositories = await readAppRepositories(opts.client, coolifyAppId);
+  if (repositories === undefined) {
+    throw new Error(
+      [
+        `cannot verify that ${opts.name} can reach ${opts.orgRepo}`,
+        "",
+        `GET /github-apps/${coolifyAppId}/repositories did not return a repository`,
+        "list cast can read. The App IS registered — this is a failed check, not a",
+        "failed registration — but the check is the point: an App that cannot see",
+        "the repo fails at `cast apply` time instead, hours later and somewhere",
+        "else.",
+        "",
+        "Open Coolify's Sources page and confirm the App lists the repository, or",
+        "re-run this verification with `cast github-app register` once the install",
+        "is fixed. Re-running re-checks the existing record; it does not create a",
+        "second one.",
+      ].join("\n"),
+    );
+  }
+  if (!repositories.includes(opts.orgRepo)) {
+    throw new Error(
+      [
+        `${opts.name} is registered but cannot see ${opts.orgRepo}`,
+        "",
+        `  can see: ${repositories.join(", ") || "(no repositories at all)"}`,
+        "",
+        "The App exists on GitHub and in Coolify; it is INSTALLED on the wrong",
+        "repositories (or on none). Open",
+        "  https://github.com/settings/installations",
+        "or the org's Settings → GitHub Apps, grant the App access to",
+        `${opts.orgRepo}, and re-run \`cast github-app register\` to re-check.`,
+        "That re-check reuses the record above rather than registering a second.",
+        "",
+        "Left unfixed this surfaces at `cast apply` time as an unresolvable source.",
+      ].join("\n"),
+    );
+  }
+  log(`verified: ${opts.name} can clone ${opts.orgRepo} ✓`);
+
+  return { coolifyAppId, keyUuid, repositories, pemPath, secretsPath };
+}
+
+// The two POSTs, unchanged in effect from the script's.
+async function createCoolifyApp(
+  opts: {
+    client: CoolifyClient;
+    name: string;
+    org: string;
+    creds: AppCredentials;
+  },
+  log: (line: string) => void,
+): Promise<{ coolifyAppId: number; keyUuid: string }> {
   const key = (await opts.client.post("/security/keys", {
     name: `${opts.name}-key`,
     private_key: opts.creds.privateKeyPem,
@@ -790,45 +1121,7 @@ export async function registerGithubApp(opts: {
     );
   }
   log(`registered as ${opts.name} (coolify id ${coolifyAppId})`);
-
-  const repositories = await readAppRepositories(opts.client, coolifyAppId);
-  if (repositories === undefined) {
-    throw new Error(
-      [
-        `cannot verify that ${opts.name} can reach ${opts.orgRepo}`,
-        "",
-        `GET /github-apps/${coolifyAppId}/repositories did not return a repository`,
-        "list cast can read. The App IS registered — this is a failed check, not a",
-        "failed registration — but the check is the point: an App that cannot see",
-        "the repo fails at `cast apply` time instead, hours later and somewhere",
-        "else.",
-        "",
-        "Open Coolify's Sources page and confirm the App lists the repository, or",
-        "re-run this verification with `cast github-app register` once the install",
-        "is fixed.",
-      ].join("\n"),
-    );
-  }
-  if (!repositories.includes(opts.orgRepo)) {
-    throw new Error(
-      [
-        `${opts.name} is registered but cannot see ${opts.orgRepo}`,
-        "",
-        `  can see: ${repositories.join(", ") || "(no repositories at all)"}`,
-        "",
-        "The App exists on GitHub and in Coolify; it is INSTALLED on the wrong",
-        "repositories (or on none). Open",
-        "  https://github.com/settings/installations",
-        "or the org's Settings → GitHub Apps, grant the App access to",
-        `${opts.orgRepo}, and re-run \`cast github-app register\` to re-check.`,
-        "",
-        "Left unfixed this surfaces at `cast apply` time as an unresolvable source.",
-      ].join("\n"),
-    );
-  }
-  log(`verified: ${opts.name} can clone ${opts.orgRepo} ✓`);
-
-  return { coolifyAppId, keyUuid, repositories, pemPath, secretsPath };
+  return { coolifyAppId, keyUuid };
 }
 
 // ---------------------------------------------------------------------------
@@ -883,7 +1176,7 @@ export async function detectOwnerType(
   try {
     const res = await fetchImpl(
       `https://api.github.com/users/${encodeURIComponent(owner)}`,
-      { headers: { Accept: "application/vnd.github+json" } },
+      { headers: githubHeaders() },
     );
     if (!res.ok) return undefined;
     const raw = (await res.json()) as Record<string, unknown>;
@@ -949,6 +1242,15 @@ export async function createGithubApp(opts: {
   const deps = opts.deps ?? {};
   const log = deps.log ?? ((line: string) => console.log(line));
   const org = opts.orgRepo.split("/")[0] ?? opts.orgRepo;
+
+  // Before ANY of it — before the browser, before GitHub mints anything. A
+  // name collision discovered here costs nothing; discovered after the
+  // conversion it costs the private key of an App that now exists.
+  preflightCredentialSlot({
+    stateDir: opts.stateDir,
+    name: opts.name,
+    force: opts.force,
+  });
 
   const ownerType =
     opts.ownerType ??
@@ -1017,6 +1319,44 @@ export async function createGithubApp(opts: {
     `created GitHub App: ${conversion.slug} (github app id ${conversion.id})`,
   );
 
+  // PERSIST NOW — the blocker all three reviewers raised on #124.
+  //
+  // The conversion response is the only moment GitHub ever yields the private
+  // key, the client secret and the webhook secret. Everything after this line
+  // can fail for ordinary reasons and for a long time: the install poll runs
+  // ~5 minutes, the operator can wander off, the network can drop, Ctrl-C is
+  // one keystroke. Holding the one-shot payload in memory across all of that
+  // and only writing it inside registerGithubApp meant any of those events
+  // destroyed a credential GitHub will not reissue — and left the App itself
+  // orphaned on GitHub, needing manual deletion.
+  //
+  // So the record goes to disk here, complete but for the installation id,
+  // which is the ONE field GitHub will answer again as often as asked. It is
+  // backfilled below once the install lands.
+  const webhookSecret = conversion.webhookSecret ?? generateWebhookSecret();
+  if (conversion.webhookSecret === null) {
+    log(
+      "github returned no webhook secret; generated one (webhook is inactive)",
+    );
+  }
+  const pending: PendingAppCredentials = {
+    appId: conversion.id,
+    clientId: conversion.clientId,
+    clientSecret: conversion.clientSecret,
+    webhookSecret,
+    privateKeyPem: conversion.pem,
+  };
+  const saved = persistCredentials({
+    stateDir: opts.stateDir,
+    name: opts.name,
+    creds: pending,
+    org: conversion.ownerLogin,
+    orgRepo: opts.orgRepo,
+    force: opts.force,
+  });
+  log(`private key  → ${saved.pemPath}`);
+  log(`credentials  → ${saved.secretsPath}  (installation id pending)`);
+
   // Step 6 — install it. Always print the URL; never assume an opener.
   const installUrl = `https://github.com/apps/${conversion.slug}/installations/new`;
   log("");
@@ -1027,28 +1367,58 @@ export async function createGithubApp(opts: {
 
   // Step 7 — recover the installation id from the App's own key, never from a
   // redirect parameter.
-  const installationId = await awaitInstallationId({
-    owner: conversion.ownerLogin,
-    ownerType: conversion.ownerType,
-    privateKeyPem: conversion.pem,
-    clientId: conversion.clientId,
-    fetchImpl: deps.fetchImpl,
-    sleep: deps.sleep,
-    now: deps.now,
-    attempts: deps.installAttempts,
-    intervalMs: deps.installIntervalMs,
-    log,
-  });
+  let installationId: number;
+  try {
+    installationId = await awaitInstallationId({
+      owner: conversion.ownerLogin,
+      ownerType: conversion.ownerType,
+      privateKeyPem: conversion.pem,
+      clientId: conversion.clientId,
+      fetchImpl: deps.fetchImpl,
+      sleep: deps.sleep,
+      now: deps.now,
+      attempts: deps.installAttempts,
+      intervalMs: deps.installIntervalMs,
+      log,
+    });
+  } catch (err) {
+    // Now the "nothing has to be recreated" claim is TRUE, and it can name the
+    // actual files rather than a directory shape. Attached here because this is
+    // the only scope that knows where the persist above landed.
+    if (err instanceof InstallationNeverArrivedError) {
+      throw new Error(
+        [
+          err.message,
+          "",
+          "Nothing is lost. cast saved everything GitHub shows only once, before",
+          "it started waiting:",
+          "",
+          `  ${saved.pemPath}`,
+          `  ${saved.secretsPath}`,
+          "",
+          "Install the App from the URL above, then finish with:",
+          "",
+          `  cast github-app register ${opts.orgRepo} --env <env> \\`,
+          `      --app-id ${conversion.id} --installation-id <id> \\`,
+          `      --client-id ${conversion.clientId} \\`,
+          `      --private-key ${saved.pemPath} --client-secret-stdin`,
+          "",
+          `The client secret and webhook secret are in ${saved.secretsPath};`,
+          "the installation id is on the install's own URL, or read it from",
+          "https://github.com/settings/installations.",
+          "",
+          "Do NOT re-run `create`: the App already exists on GitHub, and creating",
+          "a second one is the thing this message exists to prevent.",
+        ].join("\n"),
+      );
+    }
+    throw err;
+  }
   log(`installation id ${installationId} (recovered via the App JWT) ✓`);
 
-  const webhookSecret = conversion.webhookSecret ?? generateWebhookSecret();
-  if (conversion.webhookSecret === null) {
-    log(
-      "github returned no webhook secret; generated one (webhook is inactive)",
-    );
-  }
-
-  // Steps 8 + 9 — the fall-through. Identical to what `register` calls.
+  // Steps 8 + 9 — the fall-through. Identical to what `register` calls; the
+  // persist inside it backfills the installation id onto the record written
+  // above rather than writing a second one.
   return registerGithubApp({
     client: opts.client,
     name: opts.name,
@@ -1057,13 +1427,6 @@ export async function createGithubApp(opts: {
     stateDir: opts.stateDir,
     force: opts.force,
     log,
-    creds: {
-      appId: conversion.id,
-      installationId,
-      clientId: conversion.clientId,
-      clientSecret: conversion.clientSecret,
-      webhookSecret,
-      privateKeyPem: conversion.pem,
-    },
+    creds: { ...pending, installationId },
   });
 }

@@ -254,17 +254,30 @@ What `create` does:
    which checks the CSRF `state` and shuts down.
 5. Exchanges the code. **This response is the only moment GitHub ever hands over
    the private key, the client secret and the webhook secret together.**
-6. Prints (and tries to open) the install URL; you pick the repository.
-7. Recovers the installation id by minting an RS256 JWT with the App's own key —
+6. **Writes all three to disk immediately**, before waiting on anything —
+   see [Where the credentials land](#where-the-credentials-land). Everything
+   after this point can fail for ordinary reasons (a slow install screen, a
+   dropped network, `Ctrl-C`), and none of those may cost you a key GitHub will
+   not reissue.
+7. Prints (and tries to open) the install URL; you pick the repository.
+8. Recovers the installation id by minting an RS256 JWT with the App's own key —
    never from the `installation_id` GitHub appends to a redirect, which GitHub
-   documents as a spoofable hint.
-8. Uploads the key to Coolify and creates the App record.
-9. **Asks Coolify which repositories the App can actually see, and fails if
-   `<org>/<repo>` is not among them.** This is the step that matters most:
-   without it a misconfigured App fails silently and surfaces hours later, in a
-   different command, as an unresolvable source at `cast apply` time.
+   documents as a spoofable hint — then fills it into the record from step 6.
+9. Uploads the key to Coolify and creates the App record — unless a Source of
+   that name already exists, in which case it verifies that one rather than
+   registering a second (Coolify does not enforce unique Source names).
+10. **Asks Coolify which repositories the App can actually see, and fails if
+    `<org>/<repo>` is not among them.** This is the step that matters most:
+    without it a misconfigured App fails silently and surfaces hours later, in a
+    different command, as an unresolvable source at `cast apply` time.
 
-`register` is the same command from step 8 onwards, for an App you already hold —
+If the install never lands, `create` stops at step 8 and tells you the exact
+`register` command that finishes the job against the files from step 6. Nothing
+is lost and nothing has to be recreated — in particular, do **not** re-run
+`create`, which would mint a second App. For that same reason `create` refuses
+up front, before the browser flow, when `<name>.pem` already exists.
+
+`register` is the same command from step 9 onwards, for an App you already hold —
 one made by hand, or a disaster-recovery restore from a stored PEM:
 
 ```sh
@@ -289,6 +302,13 @@ Into the state directory you point cast at — cast itself stores nothing:
 ├── <name>.pem          # 0600, the private key
 └── <name>.json         # 0600, app id, installation id, client id + secret, webhook secret
 ```
+
+Both are written the instant GitHub yields them, which is *before* `create`
+waits for you to install the App. Until the install lands, `<name>.json` carries
+`"installation_id": null` — that is the one field GitHub will answer again as
+often as it is asked, and it is filled in on success. Re-running against an
+existing file is idempotent on identical content and a **refusal** otherwise;
+`--force` is the deliberate escape hatch for a stale half-run.
 
 All three secrets, because GitHub shows them once and `register` needs the client
 secret to be re-runnable at all — a disaster-recovery restore that is missing it

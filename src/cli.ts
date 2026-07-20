@@ -196,6 +196,11 @@ github-app (the credential Coolify clones private repos with):
             serves a one-shot page on 127.0.0.1, your browser session authenticates
             the form, and the conversion response hands over the private key, the
             client secret and the webhook secret in one body. Nothing is transcribed.
+            All three are written to disk the instant they arrive — BEFORE the wait
+            for you to install the App — so a timeout or a Ctrl-C during that wait
+            cannot lose a key GitHub shows exactly once. If the install never lands,
+            cast prints the \`register\` command that finishes the job; do not re-run
+            \`create\`, which would mint a second App.
   register  adopts credentials you already hold: an App created by hand, or a
             disaster-recovery restore from a stored PEM. The client secret is read
             from STDIN (never argv); --webhook-secret is optional, because a
@@ -207,7 +212,9 @@ github-app (the credential Coolify clones private repos with):
   --force   overwrite an existing PEM/credentials file under <state>/github-apps/.
   Both verbs end by asking Coolify which repositories the App can actually see
   and failing if <org>/<repo> is not among them — the check that turns a silent
-  misconfiguration into an error next to the thing that caused it.
+  misconfiguration into an error next to the thing that caused it. Re-running
+  \`register\` after that failure RE-VERIFIES an existing Coolify Source of the
+  same name rather than registering a second one.
 
 capture (adopt a hand-built instance into the age secret store):
   --generated <NAME>   force NAME to the \`pending-coolify-generated\` placeholder,

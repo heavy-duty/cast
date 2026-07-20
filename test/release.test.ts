@@ -695,12 +695,25 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
     // would fail citing #133 when one legitimately is — #133 constrains this
     // step, not the file. The companion assert below keeps the extractor from
     // silently matching nothing and turning the negative into a tautology.
-    const monoBlock = CI.split(/^ {6}- name: /m).find((b) =>
-      b.startsWith("no shipped changelog heading"),
+    // Bounded by the next STEP *or* the next JOB. The job boundary is not
+    // optional: the monotonic step is the LAST step of its job, so splitting on
+    // steps alone runs the block into the job below and swallows that job's
+    // level `if:` — reintroducing the bug this scoping fixed, moved from "any
+    // step in the file" to "this step plus the head of the next job".
+    const ciLines = CI.split("\n");
+    const monoStart = ciLines.findIndex((l) =>
+      /^ {6}- name: no shipped changelog heading/.test(l),
     );
+    const after = ciLines.slice(monoStart + 1);
+    const monoEnd = after.findIndex((l) => /^ {6}- /.test(l) || /^ {2}\S/.test(l));
+    const monoBlock =
+      monoStart < 0
+        ? undefined
+        : [ciLines[monoStart], ...after.slice(0, monoEnd < 0 ? after.length : monoEnd)].join("\n");
     expect(monoBlock).toBeDefined();
     expect(monoBlock).toContain("changelog-monotonic.sh");
-    expect(monoBlock).not.toContain("if:");
+    // Anchored: an `if:` inside a `run:` line is not a step condition.
+    expect(monoBlock).not.toMatch(/^ {8}if:/m);
     // ...and dropping that gate is only safe WITH the fallback: on a push
     // `github.base_ref` is empty, a bare `origin/` does not resolve, and
     // STRICT promotes that to a hard failure on every push to main.

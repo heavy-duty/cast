@@ -7,6 +7,44 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Changed
+
+- **PR labels split into two axes: `state:*` (whose ball) and `blocker:*`
+  (what is in the way)** (heavy-duty/box#138) — `state:needs-rebase` is
+  retired, replaced by `blocker:conflict`, `blocker:ci-red` and
+  `blocker:unrequested`. One rule joins the axes: `state:needs-human` requires
+  zero blockers.
+
+  The entry below this one, added a day ago, closed by noting that cast had
+  not yet been bitten only because nothing had conflicted — that three PRs sat
+  at `state:needs-human` at once and would conflict through this very file the
+  moment one landed. #128 landed. A dry sweep now finds #119, #120 and #122
+  all still wearing `state:needs-human` over branches GitHub calls
+  `CONFLICTING`, which is the predicted failure arriving on schedule.
+
+  Fixing *that* is what the previous entry did. What this one fixes is the
+  shape that kept regrowing it. The single-label design projected independent
+  facts — mergeability, check status, where the review round stands — onto one
+  totally-ordered value, and a total order must pick a winner, so the rest
+  silently vanish. Every precedence bug this machine has had lived on that
+  ordering: `needs-human` surviving a conflict, `MISSING` swallowing `STALE`,
+  and `state:needs-rebase` firing on both a conflict and a red check when
+  those need opposite work — telling an agent to rebase when what it owed was
+  a bug fix. Blockers are a set. A set has no precedence between its members
+  to get wrong, and what remains on the ordered axis is purely about reviews,
+  the one place an ordering actually means something.
+
+  `state:bots-reviewing` tightens with it, to mean strictly *a request is live
+  and an answer is coming*. A ready PR nobody was asked to review used to read
+  "waiting on the reviewers" for the 48 hours it took the stale sweep to
+  notice; it is now `state:addressing` + `blocker:unrequested`, because the
+  ask is the agent's to make. Drafts are exempt, and so is an explicit human
+  request — a maintainer claiming a PR early is deliberate, not a dropped ball.
+
+  The reconciler carries a `RETIRED` array and strips `state:needs-rebase` on
+  sight, so retiring a label heals the board instead of stranding one that
+  nothing recomputes. Fixtures 51 → 64.
+
 ### Fixed
 
 - **`state:needs-human` no longer appears on PRs a human cannot merge**

@@ -52,11 +52,45 @@ actually cutting it, and this file starts there.
 - **A PR that deletes a shipped release heading is now CI-red** (#133,
   heavy-duty/box#122) — `.github/scripts/changelog-monotonic.sh` asserts that
   the set of `## X.Y.Z` headings on HEAD is a superset of the set at the merge
-  base, and that no version heading appears twice. Wired into `ci.yml` on pull
-  requests only (on a push to main the merge base *is* HEAD, so the assert is
-  vacuous), with `CHANGELOG_MONOTONIC_STRICT=1` and `fetch-depth: 0` so a
+  base, and that no version heading appears twice. Wired into `ci.yml` on
+  every event, with `CHANGELOG_MONOTONIC_STRICT=1` and `fetch-depth: 0` so a
   checkout that cannot reach the base ref fails loudly rather than skipping
   quietly forever.
+
+- **...and a duplicate heading no longer slips through on the paths where the
+  guard cannot see the base** (#133, heavy-duty/box#143) — the uniqueness half
+  is a property of HEAD alone, but it sat downstream of the base-ref,
+  merge-base and base-blob conditions, so each of those degradations returned
+  success on a tree with a duplicate in plain sight.
+
+  The base-blob case was the worst of the three because it was not a skip at
+  all: a branch that *introduces* `CHANGELOG.md` exited 0 through a bare
+  `exit 0`, on a message that was true about deletion and silent about the
+  duplicate in front of it. `STRICT=1` could not reach it — STRICT guards the
+  two `skip()` calls, and that path is not one of them. Off CI the two skips
+  had the same shape, so a shallow clone or an unpacked tarball would not look
+  at a duplicate the author was about to push.
+
+  That inverted the two halves, and it inverted them hardest here. Deletion is
+  the failure that needs a diff to see; duplication is the one cast's
+  `release-notes.sh` actually mis-renders, and cast has the ABSORBING
+  extractor — no `exit`, so `grab` re-arms on the second heading and the
+  published body swallows whatever sits between the copies (heavy-duty/box#118).
+  The half with the live extraction bug behind it was the half with the most
+  ways to silently not run.
+
+  Fixed by moving, not rewriting: uniqueness now runs directly after the file
+  exists, before any git access. The skip messages say *containment* skipped
+  and that uniqueness already passed, so a skip no longer claims nothing was
+  checked. The guard is also no longer gated to `pull_request` — deletion is
+  vacuous on a push to main, but duplication is vacuous on no tree, so a
+  duplicate reaching main by any other route went unasserted. That gate could
+  not simply be dropped: `github.base_ref` is empty on a push, and a bare
+  `origin/` under `STRICT=1` is a hard failure on every push to main, so the
+  base ref falls back to `github.ref_name`.
+
+  Found by `claude-bot-andresmgsl` and `codex-bot-andresmgsl` reviewing #134;
+  cast inherited the ordering from box, fixed there in heavy-duty/box#144.
 
   The failure it catches leaves no trace. An author adding an entry under
   `## Unreleased` types *over* the heading below it instead of inserting above

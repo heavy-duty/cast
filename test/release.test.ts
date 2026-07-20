@@ -514,7 +514,12 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
     expect((await check(repoWith(disarmed))).code).toBe(0);
   });
 
-  it("a changelog absent at the merge base is nothing-to-have-deleted, not a failure", async () => {
+  /**
+   * A repo whose `base` has NO changelog at all — the PR INTRODUCES the file.
+   * The merge-base blob is absent, which is the degradation path that used to
+   * `exit 0` before uniqueness had run (#133, box#143).
+   */
+  function repoIntroducing(head: string): string {
     const repo = mkdtempSync(join(tmpdir(), "cast-monotonic-new-"));
     git(repo, "init", "-q");
     git(repo, "config", "user.email", "test@example.com");
@@ -524,12 +529,80 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
     git(repo, "add", "README.md");
     git(repo, "commit", "-qm", "base");
     git(repo, "checkout", "-q", "-b", "pr");
-    writeFileSync(join(repo, "CHANGELOG.md"), BASE);
+    writeFileSync(join(repo, "CHANGELOG.md"), head);
     git(repo, "add", "CHANGELOG.md");
     git(repo, "commit", "-qm", "add the changelog");
-    const r = await check(repo);
+    return repo;
+  }
+
+  it("a changelog absent at the merge base is nothing-to-have-deleted, not a failure", async () => {
+    const r = await check(repoIntroducing(BASE));
     expect(r.code).toBe(0);
     expect(r.output).toContain("does not exist at the merge base");
+  });
+
+  // --- #133: uniqueness is a property of HEAD, so nothing base-side may gate
+  // it. Containment needs the merge base; uniqueness needs only the file in
+  // front of it. Before this fix the duplicate check sat DOWNSTREAM of the
+  // base-ref, merge-base and base-blob conditions, so each of the degradation
+  // paths below exited 0 on a tree carrying a duplicate in plain sight — the
+  // base-blob one not even via skip(), but a bare `exit 0` that STRICT could
+  // not reach. These cases pin the ORDER, which is the actual invariant;
+  // asserting the exit code alone is what let the original ship (the
+  // base-absent case above was green before and after).
+  //
+  // The inversion mattered most here: cast's release-notes.sh re-arms `grab`
+  // on every '## ' line, so duplication is the half with a LIVE extraction bug
+  // behind it — and it was the half with the most ways to silently not run.
+
+  it("a duplicate introduced where the base had NO changelog is caught (#133)", async () => {
+    const dup = `# Changelog\n\n## Unreleased\n\n${dated("0.1.1")}${body}\n- **A stranded entry**\n\n${dated("0.1.1")}${body}`;
+    const r = await check(repoIntroducing(dup));
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("DUPLICATE release heading(s)");
+    expect(r.output).toContain("## 0.1.1");
+    // The old message must NOT be what this tree gets.
+    expect(r.output).not.toContain("nothing could have been deleted");
+  });
+
+  it("...and STRICT does not change that — it was never a skip", async () => {
+    const dup = `# Changelog\n\n## Unreleased\n\n${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`;
+    const r = await check(repoIntroducing(dup), {
+      CHANGELOG_MONOTONIC_STRICT: "1",
+    });
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("DUPLICATE release heading(s)");
+  });
+
+  it("...while a CLEAN introduced changelog still passes, SAYING uniqueness ran", async () => {
+    const r = await check(repoIntroducing(BASE));
+    expect(r.code).toBe(0);
+    expect(r.output).toContain("nothing could have been deleted");
+    expect(r.output).toContain("uniqueness on HEAD already passed");
+  });
+
+  it("a duplicate OUTSIDE a git work tree is caught (#133)", async () => {
+    // No git at all — a tarball, an unpacked release. Uniqueness still has
+    // everything it needs; only containment does not.
+    const dir = mkdtempSync(join(tmpdir(), "cast-monotonic-nogit-"));
+    writeFileSync(
+      join(dir, "CHANGELOG.md"),
+      `# Changelog\n\n${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`,
+    );
+    const r = await run("bash", [MONOTONIC, "base"], {}, dir);
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("DUPLICATE release heading(s)");
+  });
+
+  it("a duplicate is caught even when the base ref will not resolve (#133)", async () => {
+    const twice = BASE.replace(
+      `${dated("0.1.1")}${body}`,
+      `${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`,
+    );
+    const r = await check(repoWith(twice), {}, "origin/no-such-branch");
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("DUPLICATE release heading(s)");
+    expect(r.output).not.toContain("containment SKIPPED");
   });
 
   it("a missing changelog refuses by path — never a silent pass", async () => {
@@ -541,11 +614,13 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
   // The fail-closed switch, both directions. A guard that can quietly stop
   // guarding is the failure shape this whole family of checks refuses, so the
   // degradation that is sensible locally must be RED in CI.
-  it("an unresolvable base ref is a SKIP locally", async () => {
+  it("an unresolvable base ref SKIPS CONTAINMENT locally — not everything (#133)", async () => {
     const r = await check(repoWith(), {}, "origin/no-such-branch");
     expect(r.code).toBe(0);
-    expect(r.output).toContain("SKIPPED");
-    expect(r.output).toContain("Nothing was checked");
+    expect(r.output).toContain("containment SKIPPED");
+    // ...and it must not claim nothing was checked: uniqueness already ran.
+    expect(r.output).toContain("already ran and passed");
+    expect(r.output).not.toContain("Nothing was checked");
   });
 
   it("...and the SAME condition is a hard FAILURE under STRICT=1, naming fetch-depth", async () => {
@@ -558,16 +633,23 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
     expect(r.output).toContain("CHANGELOG_MONOTONIC_STRICT=1");
     expect(r.output).toContain("fetch-depth: 0");
     expect(r.output).not.toContain("SKIPPED");
+    // Even here the message must scope itself to containment (#133).
+    expect(r.output).toContain("it is containment that cannot run");
   });
 
   // The wiring, pinned the same way release.yml's is — the script existing is
   // no use if CI stops running it, and every clause here is load-bearing.
-  it("ci.yml runs it on pull requests only, STRICT, against the base ref, with full history", () => {
+  it("ci.yml runs it on EVERY event, STRICT, against the base ref, with full history", () => {
     const CI = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
     expect(CI).toContain(".github/scripts/changelog-monotonic.sh");
-    expect(CI).toContain('"origin/${{ github.base_ref }}"');
-    // Pull requests only: on a push to main the merge base IS HEAD.
-    expect(CI).toContain("if: github.event_name == 'pull_request'");
+    // #133: NOT pull-request-only. Deletion is vacuous on a push to main, but
+    // duplication is vacuous on no tree — gating the whole script left a
+    // duplicate that reached main by any other route unasserted forever.
+    expect(CI).not.toContain("if: github.event_name == 'pull_request'");
+    // ...and dropping that gate is only safe WITH the fallback: on a push
+    // `github.base_ref` is empty, a bare `origin/` does not resolve, and
+    // STRICT promotes that to a hard failure on every push to main.
+    expect(CI).toContain('"origin/${{ github.base_ref || github.ref_name }}"');
     expect(CI).toContain("CHANGELOG_MONOTONIC_STRICT");
     // ...which is only reachable because the checkout has the base history.
     expect(CI).toContain("fetch-depth: 0");

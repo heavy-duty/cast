@@ -341,6 +341,52 @@ describe("cast github-app register", () => {
     expect(readdirSync(f.state).sort()).toEqual(before);
   });
 
+  // `--port` belongs to the CREATE path, and had the same defect the ids did:
+  // `Number("abc")` is NaN, which reaches server.listen(NaN) and dies as an
+  // uncaught ERR_SOCKET_BAD_PORT stack trace — after detectOwnerType and the
+  // org-admin preflight have already gone out. Nothing is lost when it fails
+  // (no App and no secret exist yet), so this is about the command honouring
+  // its own rule — reject before any write or network call — and failing with
+  // a sentence rather than a stack trace.
+  //
+  // Driven through `create` because that is the path that reads the flag. The
+  // validation sits in the shared preamble, above openCoolify, so the run ends
+  // before the browser flow this command would otherwise need.
+  for (const [what, port] of [
+    ["a non-numeric --port", "abc"],
+    ["an out-of-range --port", "99999"],
+    ["a zero --port", "0"],
+    ["a decimal --port", "80.5"],
+  ] as const) {
+    it(`refuses ${what} before touching disk or Coolify`, async () => {
+      const stub = await stubCoolify({ repositories: [] });
+      const f = fixture(
+        stub.url,
+        "github_apps:\n  heavy-duty/incubator: hdb-coolify-prod",
+      );
+      const before = readdirSync(f.state).sort();
+
+      const r = await run(
+        [
+          "github-app",
+          "create",
+          "heavy-duty/incubator",
+          "--env",
+          "prod",
+          "--state",
+          f.state,
+          "--port",
+          port,
+        ],
+        null,
+      );
+      expect(r.code).toBe(2);
+      expect(r.output).toContain("--port must be a port number");
+      expect(stub.hits).toEqual([]);
+      expect(readdirSync(f.state).sort()).toEqual(before);
+    });
+  }
+
   it("prints usage for an unknown subcommand", async () => {
     const r = await run(["github-app", "wat"], null);
     expect(r.code).toBe(2);

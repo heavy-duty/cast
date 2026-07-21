@@ -1535,6 +1535,26 @@ async function githubAppCommand(rest: string[]): Promise<number> {
       }
     }
   }
+  // `--port` on the create path has the same defect the ids had, and the same
+  // rule applies: `Number("abc")` is NaN, which reaches `server.listen(NaN)` in
+  // github-app.ts and dies as an uncaught ERR_SOCKET_BAD_PORT stack trace —
+  // after `detectOwnerType` and the org-admin preflight have already gone out.
+  // Nothing is lost when it fails (no App and no secret exist yet), so this is
+  // about the command honouring its own stated rule rather than about damage:
+  // reject before any write or network call, and fail with a sentence instead
+  // of a stack trace.
+  //
+  // Range-checked as well as digits-only, because `--port 99999` is accepted by
+  // every check the ids need and still cannot be listened on.
+  if (values.port !== undefined) {
+    const p = Number(values.port);
+    if (!/^\d+$/.test(values.port) || p < 1 || p > 65535) {
+      console.error(
+        `--port must be a port number between 1 and 65535 (got ${JSON.stringify(values.port)})`,
+      );
+      return 2;
+    }
+  }
   const stateDir = stateDirFrom(values.state);
   const bindingsPath = join(stateDir, "environments.yaml");
   const bindings = loadBindings(bindingsPath);

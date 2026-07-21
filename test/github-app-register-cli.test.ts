@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -273,6 +273,72 @@ describe("cast github-app register", () => {
     expect(r.code).toBe(1);
     expect(r.output).toContain("refusing to github-app register");
     expect(stub.hits).toEqual([]);
+  });
+
+  // Invalid ids must be refused before ANYTHING happens (cast#7 review).
+  // `register` persists the credential record before it calls Coolify, and
+  // `Number("nope")` is NaN which `JSON.stringify` writes as `null` — so
+  // without this gate a typo produces a credential file with a null app_id AND
+  // a security key uploaded to a live Coolify, from a run that then fails.
+  // Both halves are asserted: no stub hit, and no file written.
+  for (const [what, argv] of [
+    ["a non-numeric --app-id", ["--app-id", "nope"]],
+    ["a non-numeric --installation-id", ["--installation-id", "nope"]],
+    ["a zero --app-id", ["--app-id", "0"]],
+    ["a decimal --app-id", ["--app-id", "12.5"]],
+    // Integers to JavaScript, but not how an id is written — and silently
+    // storing 1000 for "1e3" is the quiet wrong answer, not a convenience.
+    ["an exponent --app-id", ["--app-id", "1e3"]],
+    ["a hex --app-id", ["--app-id", "0x10"]],
+  ] as const) {
+    it(`refuses ${what} before touching disk or Coolify`, async () => {
+      const stub = await stubCoolify({
+        repositories: [{ full_name: "heavy-duty/incubator" }],
+      });
+      const f = fixture(
+        stub.url,
+        "github_apps:\n  heavy-duty/incubator: hdb-coolify-prod",
+      );
+      const before = readdirSync(f.state).sort();
+
+      const base = REGISTER(f.state, f.pem);
+      const i = base.indexOf(argv[0]);
+      const args = [...base];
+      args[i + 1] = argv[1];
+
+      const r = await run(args, "s\n");
+      expect(r.code).toBe(2);
+      expect(r.output).toContain("must be a positive integer");
+      // Nothing reached the network...
+      expect(stub.hits).toEqual([]);
+      // ...and nothing was created or rewritten in the state dir.
+      expect(readdirSync(f.state).sort()).toEqual(before);
+    });
+  }
+
+  // A NEGATIVE id never reaches the check above: parseArgs reads a leading dash
+  // as an option and rejects `-5` as unknown, exiting 1 rather than 2. That is
+  // still a refusal before any write or request, which is the property that
+  // matters — but it is a different code path with a different exit code, so it
+  // gets its own case rather than a loosened assertion hiding the difference.
+  it("refuses a negative --app-id before touching disk or Coolify", async () => {
+    const stub = await stubCoolify({
+      repositories: [{ full_name: "heavy-duty/incubator" }],
+    });
+    const f = fixture(
+      stub.url,
+      "github_apps:\n  heavy-duty/incubator: hdb-coolify-prod",
+    );
+    const before = readdirSync(f.state).sort();
+
+    const base = REGISTER(f.state, f.pem);
+    const args = [...base];
+    args[base.indexOf("--app-id") + 1] = "-5";
+
+    const r = await run(args, "s\n");
+    expect(r.code).not.toBe(0);
+    expect(stub.hits).toEqual([]);
+    expect(readdirSync(f.state).sort()).toEqual(before);
   });
 
   it("prints usage for an unknown subcommand", async () => {

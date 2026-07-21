@@ -1507,6 +1507,34 @@ async function githubAppCommand(rest: string[]): Promise<number> {
     console.error(USAGE);
     return 2;
   }
+  // `register`'s two ids reach `Number()` far below, and a non-numeric string
+  // becomes NaN silently. That matters more here than it usually would, because
+  // `register` deliberately persists BEFORE it talks to Coolify:
+  // `JSON.stringify(NaN)` is `null`, so `--app-id nope` would write a credential
+  // record whose app_id is null and could upload the security key before
+  // `POST /github-apps` rejects it — a half-run leaving a corrupt record on disk
+  // and a stray key on the server (cast#7 review).
+  //
+  // This sits with the other ARGV checks, above openCoolify/assertTeam, because
+  // "reject before any write or network call" has to mean the team read too. A
+  // typo should cost nothing, not one request.
+  //
+  // Digits-only rather than Number.isInteger: `1e3` and `0x10` are integers to
+  // JavaScript but are not how a GitHub App id is written, and quietly storing
+  // 1000 for `1e3` is the same class of wrong answer this check exists to stop.
+  if (verb === "register") {
+    for (const [flag, raw] of [
+      ["--app-id", values["app-id"]],
+      ["--installation-id", values["installation-id"]],
+    ] as const) {
+      if (raw !== undefined && (!/^\d+$/.test(raw) || Number(raw) <= 0)) {
+        console.error(
+          `${flag} must be a positive integer (got ${JSON.stringify(raw)})`,
+        );
+        return 2;
+      }
+    }
+  }
   const stateDir = stateDirFrom(values.state);
   const bindingsPath = join(stateDir, "environments.yaml");
   const bindings = loadBindings(bindingsPath);

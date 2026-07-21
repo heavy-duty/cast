@@ -92,6 +92,73 @@ export function applyHostnameOverlay(
   });
 }
 
+// Put the whole basic-auth triple back into an UPDATE payload that carries only
+// part of it.
+//
+// An update body is assembled from the field DIFFS — the fields that actually
+// changed — and that is wrong for basic auth in both directions:
+//
+//   - Coolify requires username AND password on any write that enables basic
+//     auth (ApplicationsController.php:2446-2463 @ v4.1.2). So a drift in the
+//     toggle alone, or in the username alone, would PATCH an enable with a
+//     missing credential and 422 mid-run.
+//   - The password is never read back (see projectLiveFields), so it never
+//     appears as a diff on its own. Sending it alongside every basic-auth write
+//     is what makes a store-side rotation land at all: it rides on the next
+//     apply that touches basic auth for any reason.
+//
+// What it deliberately does NOT do is manufacture a write. A run where nothing
+// about basic auth drifted still sends nothing — this only completes a payload
+// that was already going to be sent. So the honest limit stands and is printed
+// on every diff: rotating ONLY the password in the store produces no field diff,
+// therefore no PATCH, and `cast diff` says the password was not compared rather
+// than implying it matches.
+const BASIC_AUTH_KEYS = [
+  "is_http_basic_auth_enabled",
+  "http_basic_auth_username",
+  "http_basic_auth_password",
+] as const;
+
+export function completeBasicAuth(
+  fields: Record<string, unknown>,
+  spec: Desired | undefined,
+): Record<string, unknown> {
+  const declared = spec?.fields ?? {};
+
+  // Only complete a payload that is ALREADY touching basic auth. This is what
+  // keeps the function from manufacturing a write, and it is the reason the
+  // honest limit above still holds.
+  if (!BASIC_AUTH_KEYS.some((k) => fields[k] !== undefined)) return fields;
+
+  // Read the INTENT from the declared spec, not from the payload. Keying on
+  // `fields.is_http_basic_auth_enabled === true` was the bug (cast#76 review):
+  // the toggle is absent from an update body exactly when it already MATCHES,
+  // so on username-only drift — auth on at both ends, username edited in the
+  // UI — computeDiff emits `http_basic_auth_username` alone, the guard returned
+  // early, and the PATCH went out as a lone username. Coolify requires the
+  // whole triple on any write that enables basic auth, so that is a 422
+  // mid-run: the failure this function exists to prevent, on the one path it
+  // was not looking at.
+  //
+  // A payload that explicitly DISABLES (toggle === false) is left alone —
+  // completing it with credentials would be manufacturing the opposite write.
+  const enabled =
+    fields.is_http_basic_auth_enabled === true ||
+    (fields.is_http_basic_auth_enabled === undefined &&
+      declared.is_http_basic_auth_enabled === true);
+  if (!enabled) return fields;
+
+  const completed = { ...fields };
+  // The toggle is completed too, not just the credentials: Coolify's presence
+  // rule is about the write as a whole, and a username+password PATCH with no
+  // toggle asks it to infer what cast can simply state.
+  for (const k of BASIC_AUTH_KEYS) {
+    if (completed[k] === undefined && declared[k] !== undefined)
+      completed[k] = declared[k];
+  }
+  return completed;
+}
+
 export async function applyPlan(
   report: DiffReport,
   desired: Desired[],
@@ -181,8 +248,9 @@ export async function applyPlan(
       uuid = await exec.createResource(c);
     } else {
       uuid = c.uuid as string;
-      const fields = Object.fromEntries(
-        c.fieldDiffs.map((f) => [f.field, f.desired]),
+      const fields = completeBasicAuth(
+        Object.fromEntries(c.fieldDiffs.map((f) => [f.field, f.desired])),
+        spec,
       );
       if (Object.keys(fields).length > 0) {
         await exec.updateFields(uuid, c.kind, fields);

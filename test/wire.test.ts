@@ -46,6 +46,82 @@ describe("applicationApiFields", () => {
   });
 });
 
+// cast#76. The three basic-auth keys are already Coolify's own names, so the
+// wire layer's job here is not translation — it is the presence rule, enforced
+// before the request rather than discovered as a 422 halfway through a run.
+describe("applicationApiFields — basic auth (#76)", () => {
+  it("passes the three basic-auth keys through untranslated", () => {
+    const out = applicationApiFields({
+      is_http_basic_auth_enabled: true,
+      http_basic_auth_username: "ops",
+      http_basic_auth_password: "s3cret",
+    });
+    expect(out).toEqual({
+      is_http_basic_auth_enabled: true,
+      http_basic_auth_username: "ops",
+      http_basic_auth_password: "s3cret",
+    });
+  });
+
+  it("passes a bare disable through — no credentials needed to turn it off", () => {
+    expect(applicationApiFields({ is_http_basic_auth_enabled: false })).toEqual(
+      {
+        is_http_basic_auth_enabled: false,
+      },
+    );
+  });
+
+  for (const [what, fields] of [
+    ["no password", { http_basic_auth_username: "ops" }],
+    ["no username", { http_basic_auth_password: "s3cret" }],
+    [
+      "an empty password",
+      {
+        http_basic_auth_username: "ops",
+        http_basic_auth_password: "",
+      },
+    ],
+    ["neither", {}],
+  ] as const) {
+    it(`refuses to enable basic auth with ${what}`, () => {
+      expect(() =>
+        applicationApiFields({ is_http_basic_auth_enabled: true, ...fields }),
+      ).toThrow(/refusing a partial HTTP basic auth write/);
+    });
+  }
+
+  // The hole the #76 review found, at the wire: a username-only drift produces
+  // a PATCH with no toggle at all, so a guard keyed on `=== true` never looked
+  // at it. These are the shapes apply must never hand over uncompleted.
+  for (const [what, fields] of [
+    ["a lone username", { http_basic_auth_username: "ops" }],
+    ["a lone password", { http_basic_auth_password: "s3cret" }],
+    [
+      "credentials with no toggle",
+      { http_basic_auth_username: "ops", http_basic_auth_password: "s3cret" },
+    ],
+  ] as const) {
+    it(`refuses ${what} — no toggle is not an exemption`, () => {
+      expect(() => applicationApiFields({ ...fields })).toThrow(
+        /refusing a partial HTTP basic auth write/,
+      );
+    });
+  }
+
+  // A disable is a legitimate one-key write: it needs no credentials, and
+  // demanding them would make turning basic auth off impossible.
+  it("allows an explicit disable to travel alone", () => {
+    expect(() =>
+      applicationApiFields({ is_http_basic_auth_enabled: false }),
+    ).not.toThrow();
+  });
+
+  // And a payload that says nothing about basic auth is not a basic-auth write.
+  it("ignores a payload that does not mention basic auth at all", () => {
+    expect(() => applicationApiFields({ is_static: true })).not.toThrow();
+  });
+});
+
 describe("databaseApiFields", () => {
   it("maps type+version to an image and drops the type/version keys", () => {
     const out = databaseApiFields({ type: "postgresql", version: "17" });
@@ -143,6 +219,55 @@ describe("projectLiveFields", () => {
     ]);
     expect(out.port).toBe(3000);
     expect(out.healthcheck).toBe("/health");
+  });
+
+  // cast#76 — the read side of basic auth, and the rule that the password never
+  // enters the comparison vocabulary at all.
+  it("projects the basic-auth toggle and username, and NEVER the password", () => {
+    const out = projectLiveFields("application", {
+      git_repository: "org/repo",
+      git_branch: "main",
+      build_pack: "nixpacks",
+      base_directory: "/",
+      fqdn: "https://admin.example.com",
+      is_http_basic_auth_enabled: true,
+      http_basic_auth_username: "ops",
+      // Even when the read DOES carry it — a sensitive-data-enabled token — it
+      // must not reach `fields`, because a field in `fields` is a field
+      // renderDiff prints.
+      http_basic_auth_password: "s3cret",
+    });
+    expect(out.is_http_basic_auth_enabled).toBe(true);
+    expect(out.http_basic_auth_username).toBe("ops");
+    expect(out).not.toHaveProperty("http_basic_auth_password");
+    expect(JSON.stringify(out)).not.toContain("s3cret");
+  });
+
+  it("projects a real `false` toggle — off is an answer, not an absence", () => {
+    const out = projectLiveFields("application", {
+      git_repository: "org/repo",
+      git_branch: "main",
+      build_pack: "nixpacks",
+      base_directory: "/",
+      fqdn: "https://admin.example.com",
+      is_http_basic_auth_enabled: 0,
+    });
+    expect(out.is_http_basic_auth_enabled).toBe(false);
+    // No username on the row means no username IS set — a value to diff against,
+    // not a field cast failed to read.
+    expect(out.http_basic_auth_username).toBe("");
+  });
+
+  it("omits both when the read carries no toggle at all", () => {
+    const out = projectLiveFields("application", {
+      git_repository: "org/repo",
+      git_branch: "main",
+      build_pack: "nixpacks",
+      base_directory: "/",
+      fqdn: "https://admin.example.com",
+    });
+    expect(out).not.toHaveProperty("is_http_basic_auth_enabled");
+    expect(out).not.toHaveProperty("http_basic_auth_username");
   });
 
   it("normalizes a live database's database_type to the manifest vocabulary", () => {

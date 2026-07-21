@@ -7,6 +7,72 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Added
+
+- **An application can declare HTTP basic auth, and `apply` sets it**
+  (#76) — `UNCAPTURED.md` has said for as long as it has existed that
+  Basic Auth is "carried as raw container labels. cast's manifest has no
+  field for them, so a rebuilt resource is UNPROTECTED where the original
+  was not." The #72 audit found that half of that is a **cast vocabulary
+  gap, not a Coolify one**: `is_http_basic_auth_enabled`,
+  `http_basic_auth_username` and `http_basic_auth_password` are in both
+  the create and the PATCH allowlists at v4.1.2
+  (`ApplicationsController.php:914`, `:2368`). So an application now
+  declares it:
+
+  ```yaml
+  admin:
+    basic_auth:
+      enabled: true
+      username: ops
+      password: ${ADMIN_BASIC_AUTH_PROD}
+  ```
+
+  The password is a **store ref and only a store ref** — the schema
+  refuses a literal rather than warning about one, because a manifest is
+  a reviewed, committed artifact and a literal there is a live password
+  in git forever. It resolves out of the environment's age store through
+  the same mechanism every env-template `${REF}` uses, and a missing or
+  empty entry fails the run before anything is written.
+
+  Managing it is **opt-in**, the `is_static` rule for the same reason one
+  notch sharper: an unconditional `is_http_basic_auth_enabled: false`
+  would make the first apply after this ships strip the protection off
+  every app somebody enabled by hand in the UI. Omit the block to say
+  nothing, `enabled: false` to assert it is off. Enabling without both
+  credentials is refused at parse time *and* at the wire — Coolify's own
+  rule (`:2446-2463`), enforced before the request rather than discovered
+  as a 422 halfway through a run.
+
+  **The read side is fail-honest, because the three fields do not read
+  back alike.** The toggle and the username are plain columns and are
+  compared like anything else — somebody turning basic auth off in the UI
+  *is* caught, which is most of the value. The password is gated behind a
+  sensitive-data-enabled token at 4.1.2 and behind the `read:sensitive`
+  ability on v4.2 (#77), so whether it arrives depends on the token, the
+  route and the release — and it would have to be *printed*, since a
+  field diff renders as `field: <live> → <desired>`. So cast never
+  projects it into the comparison vocabulary on any box, and every diff
+  of an app declaring `basic_auth:` prints `http_basic_auth_password NOT
+  compared — verify in the Coolify UI`. Same disposition as an
+  unverifiable backup schedule: reported, not counted as drift. A read
+  returning none of the three names all three on that line instead, and
+  claims nothing at all.
+
+  The limit that follows is stated rather than hidden: rotating *only*
+  the password in the store produces no field diff and therefore no
+  write. It lands on the next apply that touches basic auth for any other
+  reason — Coolify requires both credentials on any write that enables
+  it, so cast completes the whole triple whenever it sends one.
+
+  `custom_labels` is **deliberately still absent**, though it is equally
+  settable: enabling basic auth or changing domains makes Coolify
+  regenerate an application's labels and overwrite `custom_labels` unless
+  `is_container_label_readonly_enabled`, which is itself not API-settable
+  until v4.2. Declaring both on one app would have cast silently destroy
+  what it was told to write. Basic-auth-only is the safe slice until
+  then.
+
 ### Changed
 
 - **`state:needs-human` no longer waits on the cron to become true** (#131)
@@ -80,6 +146,20 @@ actually cutting it, and this file starts there.
   nothing recomputes. A verdict is owed in two shapes and both raise
   `blocker:unrequested`: `MISSING` (nobody reviewed) and `STALE` (everybody
   reviewed an older head). Fixtures 51 → 72.
+
+- **The `NO_API_COVERAGE` row for Basic Auth now says *services*** (#76)
+  — the blanket row covered applications and services alike, and became
+  wrong for half of them the moment applications could say `basic_auth:`.
+  What survives is a real API gap rather than a vocabulary one:
+  `ServicesController` carries no basic-auth fields and no
+  `custom_labels`, on v4.1.2 or on the v4.2 train, so no manifest field
+  could ever set them. A separate row now covers `custom_labels` on
+  applications — writable, deliberately unwired, with the overwrite
+  caveat spelled out — so neither row implies cast can express something
+  it cannot. `inventory --emit-draft` also reports, per application, an
+  app whose basic auth is enabled on the box: it emits no `basic_auth:`
+  block, because the password cannot be read and a block a rebuild cannot
+  honour is exactly the failure `UNCAPTURED.md` exists to prevent.
 
 ### Fixed
 

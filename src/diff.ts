@@ -79,6 +79,27 @@ export type Live = {
   // a create-time setting; a real boolean from a future Coolify (staticNotCompared
   // unset) is projected and diffed normally.
   staticNotCompared?: boolean;
+  // Why one or more of this application's basic-auth fields could not be read
+  // back this run — printed verbatim. Third of the same family as
+  // backupNotCompared and staticNotCompared, and the one whose absence would be
+  // most dangerous, because the field it hides is a protection.
+  //
+  // Which fields it covers is not fixed: it is exactly the BASIC_AUTH_FIELDS
+  // that are ABSENT from `fields` (projectLiveFields omits what it could not
+  // read). Two shapes occur at 4.1.2, and the reason string says which:
+  //
+  //   - the password alone is unreadable — the usual case. `enabled` and
+  //     `username` are ordinary columns and diff normally, so a UI flip of the
+  //     toggle or a changed username IS still caught; only a store-side password
+  //     rotation is invisible.
+  //   - nothing is readable — a read path or a token that returns none of the
+  //     three. Then all three are skipped, and cast claims nothing at all about
+  //     this app's basic auth.
+  //
+  // As with the other two, leaving the fields merely absent from `fields` is NOT
+  // equivalent: computeDiff would diff `true` against `undefined` and report
+  // confident drift, and apply would rewrite a protection it never read.
+  basicAuthNotCompared?: string;
 };
 export type FieldDiff = {
   field: string;
@@ -161,8 +182,37 @@ export type DiffReport = {
   // against `clean` — but printed on every run that has any, because the whole
   // point is that the assumption goes on screen at the moment it is made.
   backupsNotCompared: { name: string; reason: string }[];
+  // Applications whose declared `basic_auth:` cast could not fully verify this
+  // run, with the fields it had to skip. Same disposition as
+  // backupsNotCompared — a finding, printed always, NOT counted against `clean`:
+  // it is an absence of evidence, not evidence of drift, and a run that failed
+  // because a read failed is a run operators learn to force past.
+  basicAuthNotCompared: { name: string; fields: string[]; reason: string }[];
   clean: boolean;
 };
+
+// The three Coolify fields an application's `basic_auth:` block becomes. Named
+// once, here, because three separate places have to agree on the set: the
+// not-compared skip below, the redaction in renderDiff, and apply's
+// completeBasicAuth.
+export const BASIC_AUTH_FIELDS = [
+  "is_http_basic_auth_enabled",
+  "http_basic_auth_username",
+  "http_basic_auth_password",
+] as const;
+
+// Field names whose VALUES never reach the terminal, on either side of a diff.
+//
+// renderDiff prints every field diff as `field: <live> → <desired>`, so an
+// ordinary field carrying a password would print it twice — into a scrollback
+// buffer, and into the CI log of every run. That is the same rule cast already
+// holds for env vars (`secret X differs`, never the value) and for capture's
+// disposition table; this is it, extended to the first RESOURCE FIELD that is a
+// secret. The diff still says the field changed — what is withheld is only what
+// it changed from and to.
+export const REDACTED_FIELDS: ReadonlySet<string> = new Set([
+  "http_basic_auth_password",
+]);
 
 export const NON_UPDATABLE: Record<ResourceKind, string[]> = {
   application: ["build_pack"],
@@ -311,6 +361,7 @@ export function computeDiff(
 ): DiffReport {
   const changes: Change[] = [];
   const backupsNotCompared: { name: string; reason: string }[] = [];
+  const basicAuthNotCompared: DiffReport["basicAuthNotCompared"] = [];
   // is_static is unreadable on Coolify 4.1.2's read path (cast#68); warn once
   // per run when the degradation actually bites (a manifest declares `static:`
   // on an app whose live value cast could not read), not per application.
@@ -350,8 +401,32 @@ export function computeDiff(
       backupsNotCompared.push({ name: d.name, reason: l.backupNotCompared });
     }
     const skipBackup = l.backupNotCompared !== undefined;
+    // The basic-auth escape hatch, third sibling of the backup and is_static
+    // ones. A field is skipped when the live read could not supply it (it is
+    // absent from `l.fields`) AND the read said why (`basicAuthNotCompared`) —
+    // never merely because it is absent, which would silently swallow a real
+    // "this app has no basic auth" into "cast could not tell".
+    //
+    // Recorded per APPLICATION, once, with the fields it covers, and only when
+    // the desired side declares basic auth at all: an app whose manifest is
+    // silent about it must not produce a line about something it never asked
+    // for.
+    const skippedBasicAuth =
+      l.basicAuthNotCompared === undefined
+        ? []
+        : BASIC_AUTH_FIELDS.filter(
+            (f) => f in d.fields && !(f in l.fields),
+          ).map(String);
+    if (skippedBasicAuth.length > 0) {
+      basicAuthNotCompared.push({
+        name: d.name,
+        fields: skippedBasicAuth,
+        reason: l.basicAuthNotCompared as string,
+      });
+    }
     const fieldDiffs: FieldDiff[] = Object.entries(d.fields)
       .filter(([field]) => !(skipBackup && field === "backup"))
+      .filter(([field]) => !skippedBasicAuth.includes(field))
       .filter(([field]) => {
         // The unreadable-is_static escape hatch (cast#68), sibling to the
         // backup one above. is_static lives on the ApplicationSetting relation,
@@ -404,6 +479,7 @@ export function computeDiff(
     reserved,
     placement,
     backupsNotCompared,
+    basicAuthNotCompared,
     // A split project is drift, and drift is not clean — the same disposition
     // as an orphan: reported, counted, and NOT repaired (apply moves nothing
     // between networks; see renderDiff).
@@ -454,6 +530,16 @@ export function renderDiff(report: DiffReport): string {
   for (const c of report.changes) {
     lines.push(`${c.op} ${c.kind} ${c.name}`);
     for (const f of c.fieldDiffs) {
+      // A redacted field says THAT it changes and never what to or from — see
+      // REDACTED_FIELDS. `f.live` is undefined here whenever the read could not
+      // see it, which is the common case, so even the shape of the old value
+      // would be a claim cast cannot make.
+      if (REDACTED_FIELDS.has(f.field)) {
+        lines.push(
+          `  ${f.field}: differs — apply will set it (secret; value not printed)`,
+        );
+        continue;
+      }
       lines.push(
         `  ${f.field}: ${JSON.stringify(f.live)} → ${JSON.stringify(f.desired)}${f.updatable ? "" : "  [NOT UPDATABLE IN PLACE]"}`,
       );
@@ -513,6 +599,18 @@ export function renderDiff(report: DiffReport): string {
   for (const b of report.backupsNotCompared) {
     lines.push(
       `backup schedule for database ${b.name} declared, NOT compared — verify in the Coolify UI`,
+      `  (${b.reason})`,
+    );
+  }
+  // The same honest fallback as the backup line above, for the field where
+  // silence is most expensive: a diff that said "clean" over an unreadable basic
+  // auth would be a tool reporting an admin panel as protected without having
+  // looked. It names the fields it skipped so the line distinguishes "only the
+  // password" (the routine 4.1.2 case, where the toggle and username ARE
+  // compared) from "all of it" (a read that told cast nothing).
+  for (const b of report.basicAuthNotCompared) {
+    lines.push(
+      `basic_auth on application ${b.name} declared, ${b.fields.join(", ")} NOT compared — verify in the Coolify UI`,
       `  (${b.reason})`,
     );
   }

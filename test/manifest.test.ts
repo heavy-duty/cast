@@ -285,6 +285,124 @@ environments:
   });
 });
 
+// HTTP basic auth on an application (cast#76). The schema carries three rules,
+// and each is here because breaking it is expensive somewhere else: the password
+// must be a store ref (a literal is a password in git, forever), enabling needs
+// both credentials (Coolify 422s mid-run otherwise, and half-configured basic
+// auth protects nothing), and a disabled block must carry none (a credential
+// standing over a disabled auth reads like a guard and is not one).
+describe("loadManifest — basic_auth (#76)", () => {
+  const app = (basicAuth: string) => `
+project: x
+environments:
+  prod:
+    applications:
+      admin:
+        source: { repo: o/r, branch: main }
+        build: { pack: nixpacks, base_directory: / }
+        domains: ["https://admin.example.com"]
+        basic_auth: ${basicAuth}
+`;
+
+  it("accepts an enabled block whose password is a ${REF}", () => {
+    const m = loadManifest(`${FIX}manifest.yaml`, {
+      overrideText: app(
+        "{ enabled: true, username: ops, password: '${ADMIN_PW}' }",
+      ),
+    });
+    expect(m.environments.prod.applications.admin.basic_auth).toEqual({
+      enabled: true,
+      username: "ops",
+      password: "${ADMIN_PW}",
+    });
+  });
+
+  it("accepts a bare `enabled: false` — the way to assert basic auth is OFF", () => {
+    const m = loadManifest(`${FIX}manifest.yaml`, {
+      overrideText: app("{ enabled: false }"),
+    });
+    expect(m.environments.prod.applications.admin.basic_auth).toEqual({
+      enabled: false,
+    });
+  });
+
+  it("treats an omitted block as saying nothing at all", () => {
+    const m = loadManifest(`${FIX}manifest.yaml`, {
+      overrideText: `
+project: x
+environments:
+  prod:
+    applications:
+      admin:
+        source: { repo: o/r, branch: main }
+        build: { pack: nixpacks, base_directory: / }
+        domains: ["https://admin.example.com"]
+`,
+    });
+    expect(m.environments.prod.applications.admin.basic_auth).toBeUndefined();
+  });
+
+  // The non-negotiable. A literal here would be a live password in a reviewed,
+  // committed file — so it is unrepresentable, not discouraged.
+  it("REFUSES a literal password", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: app(
+          "{ enabled: true, username: ops, password: hunter2 }",
+        ),
+      }),
+    ).toThrow(/must be a store ref/);
+  });
+
+  it("refuses a password that is a ref with anything around it", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: app(
+          "{ enabled: true, username: ops, password: 'pre-${ADMIN_PW}' }",
+        ),
+      }),
+    ).toThrow(/must be a store ref/);
+  });
+
+  // Coolify's own presence rule, failing in the FILE rather than as a 422 from a
+  // PATCH in the middle of a run.
+  it("refuses enabling without a password", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: app("{ enabled: true, username: ops }"),
+      }),
+    ).toThrow(
+      /basic_auth.password is required when basic_auth.enabled is true/,
+    );
+  });
+
+  it("refuses enabling without a username", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: app("{ enabled: true, password: '${ADMIN_PW}' }"),
+      }),
+    ).toThrow(
+      /basic_auth.username is required when basic_auth.enabled is true/,
+    );
+  });
+
+  it("refuses credentials declared alongside `enabled: false`", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: app("{ enabled: false, username: ops }"),
+      }),
+    ).toThrow(/not allowed when basic_auth.enabled is false/);
+  });
+
+  it("refuses a block with no `enabled` at all — the toggle is never inferred", () => {
+    expect(() =>
+      loadManifest(`${FIX}manifest.yaml`, {
+        overrideText: app("{ username: ops, password: '${ADMIN_PW}' }"),
+      }),
+    ).toThrow(/enabled/);
+  });
+});
+
 describe("loadBindings", () => {
   it("parses bindings", () => {
     const b = loadBindings(`${FIX}environments.yaml`);

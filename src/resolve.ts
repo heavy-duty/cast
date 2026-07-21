@@ -13,8 +13,8 @@ import {
   templateRefs,
   templateResourceRefs,
 } from "./envtemplate.js";
-import type { EnvironmentSpec } from "./manifest.js";
-import { loadManifest } from "./manifest.js";
+import type { AppSpec, EnvironmentSpec } from "./manifest.js";
+import { loadManifest, storeRefName } from "./manifest.js";
 import {
   type ReservedHit,
   assertNoReservedEnvNames,
@@ -376,7 +376,11 @@ function assertDomainRefs(
 export function requiredSecrets(
   checkoutDir: string,
   envName: string,
-): { required: RequiredSecret[]; generated: string[] } {
+): {
+  required: RequiredSecret[];
+  generated: string[];
+  manifestRefs: string[];
+} {
   const manifest = loadManifest(join(checkoutDir, ".infra", "manifest.yaml"));
   const envSpec = manifest.environments[envName];
   if (!envSpec) {
@@ -452,7 +456,26 @@ export function requiredSecrets(
       ].join("\n"),
     );
   }
-  return { required, generated };
+  // Store refs the MANIFEST itself carries, as opposed to the ones its env
+  // templates carry. Today that is exactly `basic_auth.password`.
+  //
+  // Kept OUT of `required`, deliberately. A RequiredSecret is `{ref, resource,
+  // key}` where `key` is a live ENV VAR name — that triple is what `capture`
+  // reads the source box's value from — and a basic-auth password is not an env
+  // var on any resource. Putting it in `required` would have capture look for an
+  // env var named after a field, fail to find it, and refuse the whole run as
+  // "missing". It is returned separately so the one caller that asks a different
+  // question — "would anything at all be read from the store?", the gate on
+  // whether a missing store is fatal (cli.ts, #104) — gets the right answer for
+  // a manifest whose only secret is a basic-auth password.
+  const manifestRefs = Object.values(envSpec.applications).flatMap((app) => {
+    const ref =
+      app.basic_auth?.enabled && app.basic_auth.password
+        ? storeRefName(app.basic_auth.password)
+        : undefined;
+    return ref ? [ref] : [];
+  });
+  return { required, generated, manifestRefs };
 }
 
 // What the manifest declares for an environment, as names only — no secrets, no
@@ -525,6 +548,65 @@ export function canonicalizeServiceDomains(
       .sort()
       .map((k) => [k, [...map[k]].sort()]),
   );
+}
+
+// The Coolify fields an application's `basic_auth:` block becomes, with the
+// password resolved out of the age store.
+//
+// Empty when the manifest declares nothing: managing basic auth is OPT-IN, the
+// same rule as `is_static` (see the comment on that field below) and for a
+// sharper reason — an unconditional `is_http_basic_auth_enabled: false` would
+// have the first apply after this ships REMOVE the protection from every
+// application somebody enabled by hand in the UI. A tool that silently
+// unprotects an admin panel during a routine apply is worse than one that cannot
+// protect it at all.
+//
+// The password is resolved HERE, at plan time, from the same store every
+// `${REF}` in an env template resolves against — so a missing ref fails before
+// anything is written, naming the ref and the store, rather than 422ing
+// mid-apply or (worse) writing an empty password over a working one.
+export function basicAuthFields(
+  envName: string,
+  appName: string,
+  app: Pick<AppSpec, "basic_auth">,
+  secrets: Record<string, string>,
+): Record<string, unknown> {
+  const auth = app.basic_auth;
+  if (!auth) return {};
+  if (!auth.enabled) return { is_http_basic_auth_enabled: false };
+  // Both are guaranteed present by the schema's superRefine; the checks are
+  // repeated at the value level because THIS is where an empty store entry
+  // becomes an empty password, which the schema cannot see.
+  const ref = storeRefName(String(auth.password));
+  if (ref === undefined) {
+    throw new Error(
+      `manifest environment ${envName}: application ${appName} basic_auth.password is not a store ref (\${NAME})`,
+    );
+  }
+  const value = secrets[ref];
+  if (value === undefined || value === "") {
+    throw new Error(
+      [
+        `manifest environment ${envName}: application ${appName} declares basic_auth.password \${${ref}}, and the age store ${value === "" ? "holds an EMPTY value for it" : "does not hold it"}`,
+        "",
+        "  the store is the environment's `secrets/<repo>.<env>.env.age` — the same one",
+        "  every env-template ${REF} resolves against. Add the name to it (a store is a",
+        "  KEY=value file, encrypted to the environment's age recipient) and re-run.",
+        "",
+        "Writing an empty password would enable basic auth on a public URL and protect",
+        "nothing, and Coolify would accept it — so cast refuses before it writes anything.",
+      ].join("\n"),
+    );
+  }
+  return {
+    is_http_basic_auth_enabled: true,
+    http_basic_auth_username: auth.username,
+    // The PLAINTEXT, in the desired field bag — the only place it exists in this
+    // process besides the decrypted store. It is never printed: renderDiff
+    // redacts this field name by name (see REDACTED_FIELDS in diff.ts), which is
+    // the same contract every secret env var already has.
+    http_basic_auth_password: value,
+  };
 }
 
 export function desiredFromManifest(
@@ -644,6 +726,12 @@ export function desiredFromManifest(
                 ? { start_command: app.build.start_command }
                 : {}),
             }),
+        // Outside the pack branch: basic auth is a property of the APPLICATION
+        // (Coolify sets it on the app's proxy labels, not on anything the build
+        // pack decides), so it is equally declarable on a compose app and a
+        // nixpacks one. The three keys are already Coolify's own names, so
+        // applicationApiFields passes them through untranslated.
+        ...basicAuthFields(envName, name, app, secrets),
       },
       env: resolveEnvFile(name, app.env_template),
     });

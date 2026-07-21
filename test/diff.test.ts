@@ -690,3 +690,250 @@ describe("backup schedules", () => {
     expect(out).toMatch(/^clean$/m);
   });
 });
+
+// Basic auth, read-side (cast#76). The password is a field cast WRITES and
+// cannot READ, and the three ways that could go wrong are all worse than saying
+// so: reporting a false "no change", reporting drift cast has no evidence for,
+// or printing the value it does have.
+describe("computeDiff — basic auth is fail-honest about what it could read", () => {
+  const wantAuth = {
+    kind: "application" as const,
+    name: "admin",
+    fields: {
+      build_pack: "nixpacks",
+      is_http_basic_auth_enabled: true,
+      http_basic_auth_username: "ops",
+      http_basic_auth_password: "s3cret",
+    },
+  };
+  // What projectLiveFields produces at 4.1.2: the toggle and the username, never
+  // the password — plus the reason, which fetchLive attaches.
+  const liveApp = (
+    fields: Record<string, unknown>,
+    over: Record<string, unknown> = {},
+  ) => ({
+    kind: "application" as const,
+    name: "admin",
+    uuid: "app-1",
+    fields: { build_pack: "nixpacks", ...fields },
+    ...over,
+  });
+  const PW_REASON = "http_basic_auth_password is never read back";
+
+  it("compares the toggle and the username, and skips only the password", () => {
+    const r = computeDiff(
+      [wantAuth],
+      [
+        liveApp(
+          { is_http_basic_auth_enabled: true, http_basic_auth_username: "ops" },
+          { basicAuthNotCompared: PW_REASON },
+        ),
+      ],
+      "full",
+    );
+    // The two readable halves agree, so there is no drift to report — and the
+    // password does NOT become a phantom change against `undefined`.
+    expect(r.changes).toEqual([]);
+    expect(r.basicAuthNotCompared).toEqual([
+      {
+        name: "admin",
+        fields: ["http_basic_auth_password"],
+        reason: PW_REASON,
+      },
+    ]);
+  });
+
+  // The case the whole feature exists for: somebody turned basic auth off in the
+  // UI. The password being unreadable must not make cast blind to that.
+  it("still catches a toggle flipped off on the box", () => {
+    const r = computeDiff(
+      [wantAuth],
+      [
+        liveApp(
+          {
+            is_http_basic_auth_enabled: false,
+            http_basic_auth_username: "ops",
+          },
+          { basicAuthNotCompared: PW_REASON },
+        ),
+      ],
+      "full",
+    );
+    expect(r.changes).toHaveLength(1);
+    expect(r.changes[0].fieldDiffs.map((f) => f.field)).toEqual([
+      "is_http_basic_auth_enabled",
+    ]);
+    expect(r.clean).toBe(false);
+  });
+
+  it("catches a username changed on the box", () => {
+    const r = computeDiff(
+      [wantAuth],
+      [
+        liveApp(
+          {
+            is_http_basic_auth_enabled: true,
+            http_basic_auth_username: "someone-else",
+          },
+          { basicAuthNotCompared: PW_REASON },
+        ),
+      ],
+      "full",
+    );
+    expect(r.changes[0].fieldDiffs.map((f) => f.field)).toEqual([
+      "http_basic_auth_username",
+    ]);
+  });
+
+  // The other shape: a read that returned none of it. Then cast claims nothing
+  // about any of the three — not "clean", not "drifted".
+  it("skips all three when the read returned no basic-auth state at all", () => {
+    const r = computeDiff(
+      [wantAuth],
+      [liveApp({}, { basicAuthNotCompared: "no toggle on this read" })],
+      "full",
+    );
+    expect(r.changes).toEqual([]);
+    expect(r.basicAuthNotCompared[0].fields).toEqual([
+      "is_http_basic_auth_enabled",
+      "http_basic_auth_username",
+      "http_basic_auth_password",
+    ]);
+  });
+
+  it("says so on screen, on a run it still calls clean", () => {
+    const out = renderDiff(
+      computeDiff(
+        [wantAuth],
+        [
+          liveApp(
+            {
+              is_http_basic_auth_enabled: true,
+              http_basic_auth_username: "ops",
+            },
+            { basicAuthNotCompared: PW_REASON },
+          ),
+        ],
+        "full",
+      ),
+    );
+    expect(out).toContain(
+      "basic_auth on application admin declared, http_basic_auth_password NOT compared — verify in the Coolify UI",
+    );
+    // Absence of evidence, not evidence of drift — the backup precedent.
+    expect(out).toMatch(/^clean$/m);
+  });
+
+  it("says nothing about basic auth for an application that declares none", () => {
+    const out = renderDiff(
+      computeDiff(
+        [
+          {
+            kind: "application" as const,
+            name: "admin",
+            fields: { build_pack: "nixpacks" },
+          },
+        ],
+        [liveApp({}, { basicAuthNotCompared: PW_REASON })],
+        "full",
+      ),
+    );
+    expect(out).not.toContain("basic_auth");
+    expect(out).toMatch(/^clean$/m);
+  });
+
+  // A live resource that reports the fields fine (a future Coolify, or a
+  // sensitive-token read path) must NOT be told it was uncompared.
+  it("reports nothing uncompared when the read supplied everything it needed", () => {
+    const r = computeDiff(
+      [
+        {
+          kind: "application" as const,
+          name: "admin",
+          fields: { build_pack: "nixpacks", is_http_basic_auth_enabled: false },
+        },
+      ],
+      [
+        liveApp(
+          { is_http_basic_auth_enabled: false },
+          { basicAuthNotCompared: PW_REASON },
+        ),
+      ],
+      "full",
+    );
+    expect(r.basicAuthNotCompared).toEqual([]);
+  });
+});
+
+// The password must not reach a terminal, on either side of the arrow, on any
+// path — including a CREATE, where every desired field becomes a field diff.
+describe("renderDiff — the basic-auth password is redacted (#76)", () => {
+  const create = () =>
+    renderDiff(
+      computeDiff(
+        [
+          {
+            kind: "application" as const,
+            name: "admin",
+            fields: {
+              build_pack: "nixpacks",
+              is_http_basic_auth_enabled: true,
+              http_basic_auth_username: "ops",
+              http_basic_auth_password: "s3cret-value",
+            },
+          },
+        ],
+        [],
+        "full",
+      ),
+    );
+
+  it("never prints the value, on a create plan", () => {
+    expect(create()).not.toContain("s3cret-value");
+  });
+
+  it("still says the field is being set — redacted is not silent", () => {
+    expect(create()).toContain(
+      "http_basic_auth_password: differs — apply will set it (secret; value not printed)",
+    );
+  });
+
+  it("prints the username in the clear — it is not a secret", () => {
+    expect(create()).toContain("http_basic_auth_username");
+    expect(create()).toContain("ops");
+  });
+
+  it("never prints the value on an update plan either", () => {
+    const out = renderDiff(
+      computeDiff(
+        [
+          {
+            kind: "application" as const,
+            name: "admin",
+            fields: {
+              build_pack: "nixpacks",
+              http_basic_auth_password: "s3cret-value",
+            },
+          },
+        ],
+        // No basicAuthNotCompared: this live side CAN see the password (a future
+        // Coolify), so it is compared — and still not printed.
+        [
+          {
+            kind: "application" as const,
+            name: "admin",
+            uuid: "app-1",
+            fields: {
+              build_pack: "nixpacks",
+              http_basic_auth_password: "the-old-one",
+            },
+          },
+        ],
+        "full",
+      ),
+    );
+    expect(out).not.toContain("s3cret-value");
+    expect(out).not.toContain("the-old-one");
+    expect(out).toContain("http_basic_auth_password: differs");
+  });
+});

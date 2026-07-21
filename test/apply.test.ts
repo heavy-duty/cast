@@ -586,13 +586,13 @@ describe("completeBasicAuth", () => {
   // incomplete: a 422 mid-run, which is the exact failure this function exists
   // to prevent.
   it("completes the whole triple from a lone username — no toggle in the payload", () => {
-    expect(completeBasicAuth({ http_basic_auth_username: "ops" }, spec)).toEqual(
-      {
-        is_http_basic_auth_enabled: true,
-        http_basic_auth_username: "ops",
-        http_basic_auth_password: "s3cret",
-      },
-    );
+    expect(
+      completeBasicAuth({ http_basic_auth_username: "ops" }, spec),
+    ).toEqual({
+      is_http_basic_auth_enabled: true,
+      http_basic_auth_username: "ops",
+      http_basic_auth_password: "s3cret",
+    });
   });
 
   // Same shape, other credential: a stored-password rotation riding along.
@@ -615,9 +615,11 @@ describe("completeBasicAuth", () => {
       name: "admin",
       fields: { is_http_basic_auth_enabled: false },
     };
-    expect(completeBasicAuth({ http_basic_auth_username: "ops" }, off)).toEqual({
-      http_basic_auth_username: "ops",
-    });
+    expect(completeBasicAuth({ http_basic_auth_username: "ops" }, off)).toEqual(
+      {
+        http_basic_auth_username: "ops",
+      },
+    );
   });
 
   it("leaves a payload that is not enabling basic auth completely alone", () => {

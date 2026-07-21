@@ -4,16 +4,15 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readlinkSync,
   realpathSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 // The release flow (#96), proven offline. Two surfaces: the changelog-section
 // extraction release.yml publishes (.github/scripts/release-notes.sh), and
@@ -84,7 +83,7 @@ Intro prose that belongs to no section.
 `;
 
 describe("release-notes.sh", () => {
-  const work = mkdtempSync(join(tmpdir(), "cast-relnotes-"));
+  const work = tmp("cast-relnotes-");
   const fix = join(work, "CHANGELOG.md");
   writeFileSync(fix, FIXTURE);
   const notes = (ver: string, file = fix) => run("bash", [NOTES, ver, file]);
@@ -277,7 +276,7 @@ function disarmedBecause(version: string, changelog: string): string | null {
 }
 
 describe("the changelog is armed for the next entry (rig#66)", () => {
-  const work = mkdtempSync(join(tmpdir(), "cast-arming-"));
+  const work = tmp("cast-arming-");
   const dated = (v: string) => `## ${v} — 2026-07-19`;
   const body = "\n\n- **An entry** — prose.\n";
   const armed = `# Changelog\n\n## Unreleased${body}\n${dated("0.2.0")}${body}`;
@@ -411,7 +410,7 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
    * whose CHANGELOG.md is `head` (unchanged when omitted).
    */
   function repoWith(head?: string): string {
-    const repo = mkdtempSync(join(tmpdir(), "cast-monotonic-"));
+    const repo = tmp("cast-monotonic-");
     git(repo, "init", "-q");
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "test");
@@ -564,7 +563,7 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
    * `exit 0` before uniqueness had run (#133, box#143).
    */
   function repoIntroducing(head: string): string {
-    const repo = mkdtempSync(join(tmpdir(), "cast-monotonic-new-"));
+    const repo = tmp("cast-monotonic-new-");
     git(repo, "init", "-q");
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "test");
@@ -628,7 +627,7 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
   it("a duplicate OUTSIDE a git work tree is caught (#133)", async () => {
     // No git at all — a tarball, an unpacked release. Uniqueness still has
     // everything it needs; only containment does not.
-    const dir = mkdtempSync(join(tmpdir(), "cast-monotonic-nogit-"));
+    const dir = tmp("cast-monotonic-nogit-");
     writeFileSync(
       join(dir, "CHANGELOG.md"),
       `# Changelog\n\n${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`,
@@ -859,7 +858,7 @@ describe("release.yml", () => {
 // test opts into the stub build — so any release-channel install that
 // touches npm fails its assertion by failing the install.
 
-const STUB = mkdtempSync(join(tmpdir(), "cast-stub-"));
+const STUB = tmp("cast-stub-");
 writeFileSync(
   join(STUB, "curl"),
   `#!/usr/bin/env bash
@@ -943,7 +942,7 @@ async function runInstall(
   env: Record<string, string>,
   opts: { preexistingDest?: boolean } = {},
 ): Promise<Install> {
-  const work = mkdtempSync(join(tmpdir(), "cast-inst-"));
+  const work = tmp("cast-inst-");
   const dest = join(work, "dest");
   const bin = join(work, "bin");
   const curlLog = join(work, "curl.log");
@@ -976,7 +975,7 @@ async function runInstall(
 }
 
 describe("install.sh — the three channels", () => {
-  const work = mkdtempSync(join(tmpdir(), "cast-tarballs-"));
+  const work = tmp("cast-tarballs-");
   const asset = makeTarball(work, "9.9.9");
   const mainSrc = makeTarball(work, "main");
   const brokenAsset = makeTarball(join(work, "broken"), "9.9.9", {

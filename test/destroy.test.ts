@@ -1,8 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -14,6 +13,7 @@ import {
   readBackupState,
   renderDestroyPlan,
 } from "../src/destroy.js";
+import { tmp } from "./helpers/tmp.js";
 
 // The refusals ARE the product. `destroy` is the only verb in cast that removes
 // something a manifest declared, and the difference between it and a hand
@@ -460,11 +460,11 @@ function fixture(
   url: string,
   opts: { destroyAllowed?: boolean | undefined; readOnly?: boolean } = {},
 ) {
-  const checkout = mkdtempSync(join(tmpdir(), "cast-co-"));
+  const checkout = tmp("cast-co-");
   mkdirSync(join(checkout, ".infra"), { recursive: true });
   writeFileSync(join(checkout, ".infra", "manifest.yaml"), MANIFEST);
 
-  const state = mkdtempSync(join(tmpdir(), "cast-state-"));
+  const state = tmp("cast-state-");
   writeFileSync(
     join(state, ".coolify.env"),
     [

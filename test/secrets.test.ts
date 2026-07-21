@@ -1,19 +1,13 @@
 import { execFileSync, spawn } from "node:child_process";
-import {
-  closeSync,
-  mkdirSync,
-  mkdtempSync,
-  openSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, mkdirSync, openSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { decryptSecrets, keyFileFor, secretsFileFor } from "../src/secrets.js";
+import { tmp } from "./helpers/tmp.js";
 
 // A key file and a store encrypted to it, for the decrypt tests.
 function ageFixture(): { keyFile: string; enc: string } {
-  const dir = mkdtempSync(join(tmpdir(), "infra-age-"));
+  const dir = tmp("infra-age-");
   const keyFile = join(dir, "key.txt");
   execFileSync("age-keygen", ["-o", keyFile]);
   const recipient = execFileSync("age-keygen", ["-y", keyFile], {
@@ -70,7 +64,7 @@ describe("secretsFileFor", () => {
 describe("decryptSecrets identity caching", () => {
   it("a read-once pipe key survives two decrypts — the --all loop shape", () => {
     const { keyFile, enc } = ageFixture();
-    const dir = mkdtempSync(join(tmpdir(), "infra-fifo-"));
+    const dir = tmp("infra-fifo-");
     const fifo = join(dir, "key.fifo");
     execFileSync("mkfifo", [fifo]);
     // One writer, one serving of the key: exactly what a process substitution
@@ -124,7 +118,7 @@ describe("keyFileFor", () => {
     // Isolate $HOME: a standing age-drill-b.key on the dev machine must not
     // turn the refusal into a hit (os.homedir() reads $HOME on POSIX).
     const home = process.env.HOME;
-    process.env.HOME = mkdtempSync(join(tmpdir(), "cast-home-"));
+    process.env.HOME = tmp("cast-home-");
     try {
       expect(() => keyFileFor("drill-b")).toThrow(
         /no age key for drill-b.*CAST_AGE_KEY_FILE_DRILL_B.*age-drill-b\.key/s,
@@ -135,7 +129,7 @@ describe("keyFileFor", () => {
   });
   it("falls back to a standing key on disk when one exists", () => {
     const home = process.env.HOME;
-    const dir = mkdtempSync(join(tmpdir(), "cast-home-"));
+    const dir = tmp("cast-home-");
     const cfg = join(dir, ".config", "cast");
     mkdirSync(cfg, { recursive: true });
     writeFileSync(join(cfg, "age-staging.key"), "AGE-SECRET-KEY-1\n");

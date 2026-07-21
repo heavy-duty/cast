@@ -1,10 +1,10 @@
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 // The read side, end to end, against a stub Coolify shaped like a box nobody
 // declared: its project is `Incubator` (capital I), its environment is
@@ -31,7 +31,7 @@ const LIVE_ENV = {
 let recipient: string;
 
 beforeAll(() => {
-  const dir = mkdtempSync(join(tmpdir(), "cast-age-"));
+  const dir = tmp("cast-age-");
   const keyFile = join(dir, "age.key");
   execFileSync("age-keygen", ["-o", keyFile], { stdio: "pipe" });
   recipient = execFileSync("age-keygen", ["-y", keyFile], {
@@ -103,14 +103,14 @@ ADMIN_EMAIL=\${ADMIN_EMAIL}
 `;
 
 function fixture(url: string) {
-  const checkout = mkdtempSync(join(tmpdir(), "cast-co-"));
+  const checkout = tmp("cast-co-");
   mkdirSync(join(checkout, ".infra", "env"), { recursive: true });
   writeFileSync(join(checkout, ".infra", "manifest.yaml"), MANIFEST);
   writeFileSync(
     join(checkout, ".infra", "env", "core.staging.env.template"),
     TEMPLATE,
   );
-  const state = mkdtempSync(join(tmpdir(), "cast-state-"));
+  const state = tmp("cast-state-");
   mkdirSync(join(state, "secrets"));
   writeFileSync(
     join(state, ".coolify.env"),

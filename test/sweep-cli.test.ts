@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 // The sweep, against a stub shaped like the box that made it necessary.
 //
@@ -91,10 +91,10 @@ environments:
 `;
 
 function fixture(url: string) {
-  const checkout = mkdtempSync(join(tmpdir(), "cast-co-"));
+  const checkout = tmp("cast-co-");
   mkdirSync(join(checkout, ".infra", "env"), { recursive: true });
   writeFileSync(join(checkout, ".infra", "manifest.yaml"), MANIFEST);
-  const state = mkdtempSync(join(tmpdir(), "cast-state-"));
+  const state = tmp("cast-state-");
   mkdirSync(join(state, "secrets"));
   writeFileSync(
     join(state, ".coolify.env"),

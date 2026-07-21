@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -14,6 +13,7 @@ import {
   resolveGeneratedSources,
 } from "../src/capture.js";
 import { requiredSecrets } from "../src/resolve.js";
+import { tmp } from "./helpers/tmp.js";
 
 const CTX = {
   orgRepo: "heavy-duty/incubator",
@@ -241,7 +241,7 @@ describe("renderCapturePlan", () => {
 // the manifest's own templates, read by the same parser apply uses.
 describe("requiredSecrets", () => {
   function checkout(manifest: string, templates: Record<string, string>) {
-    const dir = mkdtempSync(join(tmpdir(), "cast-cap-"));
+    const dir = tmp("cast-cap-");
     mkdirSync(join(dir, ".infra", "env"), { recursive: true });
     writeFileSync(join(dir, ".infra", "manifest.yaml"), manifest);
     for (const [name, body] of Object.entries(templates)) {

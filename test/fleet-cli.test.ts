@@ -1,10 +1,10 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 // `cast diff --all` / `cast apply --all` (#26), end to end against a stub
 // Coolify carrying three projects.
@@ -26,7 +26,7 @@ let recipient: string;
 let keyFile: string;
 
 beforeAll(() => {
-  const dir = mkdtempSync(join(tmpdir(), "cast-age-"));
+  const dir = tmp("cast-age-");
   keyFile = join(dir, "age.key");
   execFileSync("age-keygen", ["-o", keyFile], { stdio: "pipe" });
   recipient = execFileSync("age-keygen", ["-y", keyFile], {
@@ -134,7 +134,7 @@ function fixture(
   url: string,
   opts: { registry?: string[]; registryEnv?: string; refIn?: string } = {},
 ) {
-  const root = mkdtempSync(join(tmpdir(), "cast-fleet-"));
+  const root = tmp("cast-fleet-");
   for (const repo of REPOS) {
     const dir = join(root, "repos", "heavy-duty", `${repo}.git`);
     mkdirSync(join(dir, ".infra"), { recursive: true });

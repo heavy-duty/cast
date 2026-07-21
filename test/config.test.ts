@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -8,13 +7,14 @@ import {
   knownInstances,
   loadInstance,
 } from "../src/config.js";
+import { tmp } from "./helpers/tmp.js";
 
 // A state dir with a default .coolify.env and any number of named instances.
 function stateDir(
   named: Record<string, string> = {},
   defaultEnv?: string,
 ): string {
-  const dir = mkdtempSync(join(tmpdir(), "cast-state-"));
+  const dir = tmp("cast-state-");
   if (defaultEnv !== undefined) {
     writeFileSync(join(dir, ".coolify.env"), defaultEnv);
   }

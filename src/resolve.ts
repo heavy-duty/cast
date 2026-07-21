@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Desired } from "./diff.js";
@@ -162,6 +162,42 @@ export function refusesPathInProd(opts: {
   return opts.path !== undefined && opts.env === "prod";
 }
 
+// Checkouts this process cloned, to be removed when it exits.
+const ephemeralCheckouts: string[] = [];
+let reaperArmed = false;
+
+// A checkout resolved WITHOUT `--path` is ours: we made the directory, we cloned
+// into it, and nothing outside this process refers to it. It has to outlive
+// resolveCheckout's return — every caller reads the tree afterwards — so the
+// lifetime that actually fits is the process, not the call. Hence an exit hook
+// rather than a `finally`, which would delete the checkout out from under the
+// command that just asked for it.
+//
+// A `--path` checkout is the operator's own working tree and is never registered
+// here; deleting that would be catastrophic and is the reason this wraps the
+// mkdtemp result specifically, not the function's return value.
+//
+// Without this, every `cast apply` / `diff` / `capture` run without `--path`
+// left a full shallow clone in the temp dir forever (#117).
+function reapOnExit(dir: string): string {
+  ephemeralCheckouts.push(dir);
+  if (!reaperArmed) {
+    reaperArmed = true;
+    process.once("exit", () => {
+      for (const d of ephemeralCheckouts) {
+        // Best-effort: failing to clean up must never change a command's exit
+        // status. The work is already done by the time we get here.
+        try {
+          rmSync(d, { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+      }
+    });
+  }
+  return dir;
+}
+
 export function resolveCheckout(
   orgRepo: string,
   opts: { env: string; path?: string },
@@ -170,7 +206,7 @@ export function resolveCheckout(
     throw new Error(PATH_IN_PROD_REFUSAL);
   }
   if (opts.path) return opts.path;
-  const dir = mkdtempSync(join(tmpdir(), "infra-checkout-"));
+  const dir = reapOnExit(mkdtempSync(join(tmpdir(), "infra-checkout-")));
   const auth = resolveGitAuth();
   try {
     execFileSync(

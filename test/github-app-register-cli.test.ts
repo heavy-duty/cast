@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { tmp } from "./helpers/tmp.js";
 
 // `cast github-app register` through the real CLI: argv parsing, the stdin-only
 // client secret, the team assert, the name resolved from state, the
@@ -90,7 +90,7 @@ function fixture(
   url: string,
   githubApps: string,
 ): { state: string; pem: string } {
-  const state = mkdtempSync(join(tmpdir(), "cast-state-"));
+  const state = tmp("cast-state-");
   writeFileSync(
     join(state, ".coolify.env"),
     `COOLIFY_BASE_URL="${url}"\nCOOLIFY_ACCESS_TOKEN="t"\n`,

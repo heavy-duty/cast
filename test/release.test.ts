@@ -410,7 +410,7 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
    * whose CHANGELOG.md is `head` (unchanged when omitted).
    */
   function repoWith(head?: string): string {
-    const repo = mkdtempSync(join(tmpdir(), "cast-monotonic-"));
+    const repo = tmp("cast-monotonic-");
     git(repo, "init", "-q");
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "test");
@@ -563,7 +563,7 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
    * `exit 0` before uniqueness had run (#133, box#143).
    */
   function repoIntroducing(head: string): string {
-    const repo = mkdtempSync(join(tmpdir(), "cast-monotonic-new-"));
+    const repo = tmp("cast-monotonic-new-");
     git(repo, "init", "-q");
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "test");
@@ -627,7 +627,7 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
   it("a duplicate OUTSIDE a git work tree is caught (#133)", async () => {
     // No git at all — a tarball, an unpacked release. Uniqueness still has
     // everything it needs; only containment does not.
-    const dir = mkdtempSync(join(tmpdir(), "cast-monotonic-nogit-"));
+    const dir = tmp("cast-monotonic-nogit-");
     writeFileSync(
       join(dir, "CHANGELOG.md"),
       `# Changelog\n\n${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`,

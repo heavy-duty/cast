@@ -890,12 +890,34 @@ describe("drill-recorded.sh — a release version has a drill record", () => {
     expect(r.output).toContain("usage:");
   });
 
-  // The REAL tree, run with the REAL defaults — the same discipline as the
-  // arming rule's "the REAL tree is armed". Whatever state the ceremony is in,
-  // this repo must satisfy its own gate.
-  it("the real tree satisfies its own gate, with default arguments", async () => {
+  // The REAL tree, run with the REAL defaults. The property is that the
+  // guard's VERDICT IS CORRECT FOR THIS TREE — not that it always passes.
+  //
+  // The previous wording here claimed "whatever state the ceremony is in, this
+  // repo must satisfy its own gate", and that is exactly wrong: a ceremony tree
+  // CANNOT satisfy the gate until a human has run the drill and written the
+  // record, which is the entire point of the gate. Demanding exit 0 made this
+  // suite un-greenable on every release branch before its drill, and surfaced
+  // as a `build` failure rather than as the gate doing its job — the same
+  // misattribution shape as box#146. Caught when box#148 went red for the
+  // wrong-looking reason.
+  it("the guard's verdict on the real tree matches the tree's own state", async () => {
+    const version = realVersion();
     const r = await run("bash", [DRILL], {}, ROOT);
-    expect(r.code).toBe(0);
+
+    if (version.endsWith("-dev")) {
+      // Vacuous: nothing ships from a development tree.
+      expect(r.code).toBe(0);
+      expect(r.output).toContain("development tree");
+      return;
+    }
+
+    // A ceremony tree: green only once its record exists.
+    const recorded =
+      existsSync(join(ROOT, "drills", `${version}.md`)) &&
+      readFileSync(join(ROOT, "drills", `${version}.md`), "utf8").trim() !== "";
+    expect(r.code).toBe(recorded ? 0 : 1);
+    if (!recorded) expect(r.output).toContain("no drill record");
   });
 
   it("drills/README.md documents the naming rule and the waiver", () => {

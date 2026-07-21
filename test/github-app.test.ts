@@ -1,12 +1,5 @@
 import { createVerify, generateKeyPairSync } from "node:crypto";
-import {
-  existsSync,
-  mkdtempSync,
-  readFileSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { loadBindings } from "../src/bindings.js";
@@ -34,6 +27,7 @@ import {
   seedGithubAppBinding,
   startManifestServer,
 } from "../src/github-app.js";
+import { tmp } from "./helpers/tmp.js";
 
 // WHAT THIS FILE DOES NOT TEST, said out loud because the issue asks for it
 // (#7, "Testability boundary"):
@@ -63,10 +57,6 @@ beforeAll(() => {
     format: "pem",
   }) as string;
 });
-
-function tmp(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix));
-}
 
 function creds(over: Partial<AppCredentials> = {}): AppCredentials {
   return {

@@ -229,6 +229,8 @@ actually cutting it, and this file starts there.
 
 ### Fixed
 
+- `tmp-guard` is green again: three test files from #124/#125 used raw `mkdtempSync`
+
 - **A PR that deletes a shipped release heading is now CI-red** (#133,
   heavy-duty/box#122) — `.github/scripts/changelog-monotonic.sh` asserts that
   the set of `## X.Y.Z` headings on HEAD is a superset of the set at the merge

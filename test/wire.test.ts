@@ -86,9 +86,40 @@ describe("applicationApiFields — basic auth (#76)", () => {
     it(`refuses to enable basic auth with ${what}`, () => {
       expect(() =>
         applicationApiFields({ is_http_basic_auth_enabled: true, ...fields }),
-      ).toThrow(/refusing to enable HTTP basic auth without/);
+      ).toThrow(/refusing a partial HTTP basic auth write/);
     });
   }
+
+  // The hole the #76 review found, at the wire: a username-only drift produces
+  // a PATCH with no toggle at all, so a guard keyed on `=== true` never looked
+  // at it. These are the shapes apply must never hand over uncompleted.
+  for (const [what, fields] of [
+    ["a lone username", { http_basic_auth_username: "ops" }],
+    ["a lone password", { http_basic_auth_password: "s3cret" }],
+    [
+      "credentials with no toggle",
+      { http_basic_auth_username: "ops", http_basic_auth_password: "s3cret" },
+    ],
+  ] as const) {
+    it(`refuses ${what} — no toggle is not an exemption`, () => {
+      expect(() => applicationApiFields({ ...fields })).toThrow(
+        /refusing a partial HTTP basic auth write/,
+      );
+    });
+  }
+
+  // A disable is a legitimate one-key write: it needs no credentials, and
+  // demanding them would make turning basic auth off impossible.
+  it("allows an explicit disable to travel alone", () => {
+    expect(() =>
+      applicationApiFields({ is_http_basic_auth_enabled: false }),
+    ).not.toThrow();
+  });
+
+  // And a payload that says nothing about basic auth is not a basic-auth write.
+  it("ignores a payload that does not mention basic auth at all", () => {
+    expect(() => applicationApiFields({ is_static: true })).not.toThrow();
+  });
 });
 
 describe("databaseApiFields", () => {

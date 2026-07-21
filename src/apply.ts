@@ -113,14 +113,46 @@ export function applyHostnameOverlay(
 // on every diff: rotating ONLY the password in the store produces no field diff,
 // therefore no PATCH, and `cast diff` says the password was not compared rather
 // than implying it matches.
+const BASIC_AUTH_KEYS = [
+  "is_http_basic_auth_enabled",
+  "http_basic_auth_username",
+  "http_basic_auth_password",
+] as const;
+
 export function completeBasicAuth(
   fields: Record<string, unknown>,
   spec: Desired | undefined,
 ): Record<string, unknown> {
-  if (fields.is_http_basic_auth_enabled !== true) return fields;
   const declared = spec?.fields ?? {};
+
+  // Only complete a payload that is ALREADY touching basic auth. This is what
+  // keeps the function from manufacturing a write, and it is the reason the
+  // honest limit above still holds.
+  if (!BASIC_AUTH_KEYS.some((k) => fields[k] !== undefined)) return fields;
+
+  // Read the INTENT from the declared spec, not from the payload. Keying on
+  // `fields.is_http_basic_auth_enabled === true` was the bug (cast#76 review):
+  // the toggle is absent from an update body exactly when it already MATCHES,
+  // so on username-only drift — auth on at both ends, username edited in the
+  // UI — computeDiff emits `http_basic_auth_username` alone, the guard returned
+  // early, and the PATCH went out as a lone username. Coolify requires the
+  // whole triple on any write that enables basic auth, so that is a 422
+  // mid-run: the failure this function exists to prevent, on the one path it
+  // was not looking at.
+  //
+  // A payload that explicitly DISABLES (toggle === false) is left alone —
+  // completing it with credentials would be manufacturing the opposite write.
+  const enabled =
+    fields.is_http_basic_auth_enabled === true ||
+    (fields.is_http_basic_auth_enabled === undefined &&
+      declared.is_http_basic_auth_enabled === true);
+  if (!enabled) return fields;
+
   const completed = { ...fields };
-  for (const k of ["http_basic_auth_username", "http_basic_auth_password"]) {
+  // The toggle is completed too, not just the credentials: Coolify's presence
+  // rule is about the write as a whole, and a username+password PATCH with no
+  // toggle asks it to infer what cast can simply state.
+  for (const k of BASIC_AUTH_KEYS) {
     if (completed[k] === undefined && declared[k] !== undefined)
       completed[k] = declared[k];
   }

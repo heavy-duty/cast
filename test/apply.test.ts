@@ -577,6 +577,49 @@ describe("completeBasicAuth", () => {
     ).toBe("s3cret");
   });
 
+  // The case the #76 review found, and the one the test above only LOOKED like
+  // it covered: that payload carries the toggle, so it never exercised the
+  // guard. When basic auth is already on at both ends and only the username is
+  // edited in the UI, the toggle MATCHES — so computeDiff emits no fieldDiff
+  // for it and the payload arrives as a lone username. The old guard keyed on
+  // the toggle being present and returned early, and the PATCH went out
+  // incomplete: a 422 mid-run, which is the exact failure this function exists
+  // to prevent.
+  it("completes the whole triple from a lone username — no toggle in the payload", () => {
+    expect(completeBasicAuth({ http_basic_auth_username: "ops" }, spec)).toEqual(
+      {
+        is_http_basic_auth_enabled: true,
+        http_basic_auth_username: "ops",
+        http_basic_auth_password: "s3cret",
+      },
+    );
+  });
+
+  // Same shape, other credential: a stored-password rotation riding along.
+  it("completes from a lone password too", () => {
+    expect(
+      completeBasicAuth({ http_basic_auth_password: "rotated" }, spec),
+    ).toEqual({
+      is_http_basic_auth_enabled: true,
+      http_basic_auth_username: "ops",
+      http_basic_auth_password: "rotated",
+    });
+  });
+
+  // Intent comes from the SPEC, so a spec that does not enable basic auth must
+  // not have credentials completed into its payload — otherwise reading intent
+  // from the declaration would trade one silent wrong write for another.
+  it("does not complete when the spec does not enable basic auth", () => {
+    const off: Desired = {
+      kind: "application",
+      name: "admin",
+      fields: { is_http_basic_auth_enabled: false },
+    };
+    expect(completeBasicAuth({ http_basic_auth_username: "ops" }, off)).toEqual({
+      http_basic_auth_username: "ops",
+    });
+  });
+
   it("leaves a payload that is not enabling basic auth completely alone", () => {
     // The load-bearing half: this must not MANUFACTURE a write. A run where
     // nothing about basic auth drifted sends nothing about basic auth.

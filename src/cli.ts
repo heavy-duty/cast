@@ -2833,22 +2833,42 @@ export function applicationApiFields(
   // any future caller assembling a payload by hand. Failing here costs one
   // exception; failing at Coolify costs a 422 in the middle of a run that has
   // already created a project, an environment and possibly a database.
-  if (rest.is_http_basic_auth_enabled === true) {
+  // Any write that TOUCHES basic auth without disabling it must carry the whole
+  // triple. Keying this on `=== true` alone shared apply's blind spot: a PATCH
+  // body of `{http_basic_auth_username}` — the username-only drift — has no
+  // toggle to be true, so the belt never tightened either. An explicit
+  // `false` is a legitimate disable and needs no credentials.
+  const touchesBasicAuth = (
+    [
+      "is_http_basic_auth_enabled",
+      "http_basic_auth_username",
+      "http_basic_auth_password",
+    ] as const
+  ).some((k) => rest[k] !== undefined);
+  if (touchesBasicAuth && rest.is_http_basic_auth_enabled !== false) {
     const missing = (
-      ["http_basic_auth_username", "http_basic_auth_password"] as const
+      [
+        "is_http_basic_auth_enabled",
+        "http_basic_auth_username",
+        "http_basic_auth_password",
+      ] as const
     ).filter((k) => {
       const v = rest[k];
+      if (k === "is_http_basic_auth_enabled") return v !== true;
       return typeof v !== "string" || v === "";
     });
     if (missing.length > 0) {
       throw new Error(
         [
-          `refusing to enable HTTP basic auth without ${missing.join(" and ")}`,
+          `refusing a partial HTTP basic auth write — missing ${missing.join(" and ")}`,
           "",
-          "Coolify requires a username AND a password whenever basic auth is enabled, and",
-          "would answer 422 mid-run. Half-configured basic auth protects nothing anyway:",
-          "declare both under the application's `basic_auth:` (the password as a ${REF}",
-          "held by the environment's age store), or set `basic_auth.enabled: false`.",
+          "Coolify requires the toggle, a username AND a password on any write that",
+          "enables basic auth, and would answer 422 mid-run. A write carrying only some",
+          "of the three is that 422 waiting to happen — including a lone username, which",
+          "is what a username-only drift produces if nothing completes it. Half-configured",
+          "basic auth protects nothing anyway: declare the pair under the application's",
+          "`basic_auth:` (the password as a ${REF} held by the environment's age store),",
+          "or set `basic_auth.enabled: false`.",
         ].join("\n"),
       );
     }

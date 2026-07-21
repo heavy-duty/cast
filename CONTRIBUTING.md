@@ -117,10 +117,14 @@ on box#83's shape):
 2. **Drill, and record it.** Before the PR can be handed over, run the full
    real-hardware drill — two live Coolify instances, the whole A→B promotion:
    team, apply, an idempotent diff, smoke, inventory, emit-draft, fleet,
-   destroy, and the read-only guard — and record it in
-   [drill/RUNS.md](drill/RUNS.md) under a heading naming the version:
+   destroy, and the read-only guard — and record it in a file named for the
+   version, one record per version:
 
-       ## Release drill — X.Y.Z — YYYY-MM-DD
+       drills/X.Y.Z.md
+
+   The name matches `package.json`'s `version` exactly, and the file must hold
+   at least one non-whitespace character. See
+   [drills/README.md](drills/README.md) for what a record contains.
 
    [.github/scripts/drill-recorded.sh](.github/scripts/drill-recorded.sh)
    enforces this on every release PR (a `-dev` tree has no ship claim and
@@ -131,46 +135,56 @@ on box#83's shape):
    So the release flow is: **draft → ready → bot round → drill →
    `state:needs-human` → maintainer merge (which IS the release).**
 
-   **The drill is ONE orchestrated run over the whole stack**, not three
-   independent exercises. In order:
+   **The three repos' drills are independent.** Run them in any order, on any
+   schedule, in separate sittings. They are not three phases of one script.
 
-   1. `rig bootstrap … --host yes` on a bare Debian host — this installs box
-      and runs box's `setup-host`;
-   2. `box new` mints a creds-free seed;
-   3. the seed converges on first boot: its cloud-init curls rig's installer
-      and runs `rig bootstrap <tenant>-box`;
-   4. cast's legs on top of the converged result — two live Coolify
-      instances and the full A→B promotion.
+   What makes that safe is that every drill **pins the same fixed set of
+   candidate refs**, so each one exercises exactly the combination that will
+   ship rather than whatever `main` happens to be that afternoon. The run
+   drills **candidate refs, not released artifacts**: `RIG_REPO` and `RIG_REF`
+   are mint-time environment variables (default `heavy-duty/rig@main`), so a
+   run pins the exact commits under test.
 
-   Note that rig appears **twice**, below box and above it. box and rig are
-   mutually recursive, not linearly ordered: rig builds the host that runs
-   box, and box's seed calls rig back to converge the guest. cast sits on top
-   of whatever that produces. So there is no "previous repo" for a repo to
-   drill against, and **no fixed order in which the three releases must be
-   published.**
+   That pinning — **not sequencing** — is what dissolves the box↔rig
+   recursion. box and rig *are* mutually recursive: rig builds the host that
+   runs box, and box's seed calls rig back to converge the guest. But
+   candidate refs are static identifiers that exist as soon as the release
+   branches do, long before any drill runs, so a cycle at runtime becomes
+   independent tests against one fixed pair. No repo has to be released
+   before another can be drilled, and there is **no fixed order in which the
+   three releases must be published.**
 
-   The run drills **candidate refs, not released artifacts**. `RIG_REPO` and
-   `RIG_REF` are mint-time environment variables (default
-   `heavy-duty/rig@main`), so a run pins the exact commits under test. That
-   dissolves the chicken-and-egg the mutual recursion would otherwise create:
-   no repo has to be released before another can be drilled.
+   Each repo also drills a **different thing**: box asserts the isolation
+   contract (the VM trust boundary), rig asserts convergence (a machine
+   reaches its role, idempotently), cast asserts promotion (A→B reproduces,
+   and the diff is idempotent). Three different exercises sharing a
+   substrate — which is exactly why the records are per-repo.
+
+   cast's legs are the **least coupled** of the three: two Coolify instances
+   can be stood up by hand, as the July drill did for instance B via a
+   parameterised compose file. Within a single drill you of course bring the
+   substrate up before probing it — a host before a guest before Coolify —
+   but that is how you run *a* drill, not an ordering rule *between repos*.
 
    Drilling the candidate **is** drilling the release. A release PR's diff is
    the version file and `CHANGELOG.md` — nothing executable differs between
    the tree that was drilled and the tree that ships, so the evidence carries
    across the ceremony commit.
 
-   One run emits one shared **run ID**. Each repo records ITS OWN legs under
-   its own `## Release drill — X.Y.Z — DATE`, citing that run ID and the
-   other two repos' commit SHAs — which is what lets three separate records
-   be reassembled into the single run they came from. The guard still reads
-   only this repo's file: cast never queries box's or rig's drill log to
-   decide whether cast may ship, because a cross-repo lookup degrades to
-   "pass" the moment it fails to resolve — the unreadable-rollup bug wearing
-   a different hat.
+   Each repo records ITS OWN legs in its own `drills/X.Y.Z.md`, citing the
+   shared **run ID** that names the pinned set and the other two repos' commit
+   SHAs — which is what lets separate records be reassembled into one picture.
+   The guard still reads only this repo's files: cast never queries box's or
+   rig's drill records to decide whether cast may ship, because a cross-repo
+   lookup degrades to "pass" the moment it fails to resolve — the
+   unreadable-rollup bug wearing a different hat.
+
+   If a defect shows up only in the combination: patch, re-drill, re-record.
+   The three releases converge on a set that holds together; they are not
+   required to be right in one pass.
 
    A maintainer **waiver** is possible — but it must be RECORDED in
-   `drill/RUNS.md` for that version, saying who waived it and what is
+   `drills/X.Y.Z.md` for that version, saying who waived it and what is
    untested. The guard requires a *record*, not a passing result, so skipping
    the drill stays possible and stays visible and deliberate.
 3. **Merge. That's the ship decision — nothing else to do.**

@@ -85,8 +85,8 @@ jobs:
       # drill went missing in the first place.
       #
       # It requires a RECORD, not a PASS: a maintainer waiver is legal, and is
-      # itself a section in drill/RUNS.md. Skipping stays possible and stays
-      # visible.
+      # itself the content of drills/<version>.md. Skipping stays possible and
+      # stays visible.
       - name: a release version has a drill record
         run: bash .github/scripts/drill-recorded.sh
 

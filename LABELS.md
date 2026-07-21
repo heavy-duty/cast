@@ -36,7 +36,7 @@ PR carries as many as apply.
 | `blocker:conflict` | `#B60205` | GitHub says `CONFLICTING` — the agent owes a **rebase** | it merges cleanly |
 | `blocker:ci-red` | `#B60205` | a check failed — the agent owes a **fix**, which a rebase will not provide | checks are green |
 | `blocker:unrequested` | `#E99695` | this head has no verdict from somebody — never reviewed, or staled by a push — and **nobody was asked** for one | reviews are requested |
-| `blocker:drill-pending` | `#E99695` | a `release` PR whose version has **no drill record** in [drill/RUNS.md](drill/RUNS.md) — the ceremony is correct but *unevidenced* | the record (or a recorded maintainer waiver) lands for that version |
+| `blocker:drill-pending` | `#E99695` | a `release` PR whose version has **no drill record** at [`drills/<version>.md`](drills/README.md) — the ceremony is correct but *unevidenced* | the record (or a recorded maintainer waiver) lands for that version |
 
 `blocker:drill-pending` is the only blocker that says nothing is *wrong* with
 the code. The version bump, the stamp, the re-arm can all be perfect; what is
@@ -160,7 +160,7 @@ gh label create "blocker:ci-red"       --color B60205 --description "A check is 
 gh label create "blocker:unrequested"  --color E99695 --description "Somebody still owes a verdict and nobody was asked for one" --force
 # needs a MAINTAINER account — the bot 403s on label creation, and until this
 # runs the reconciler cannot apply it and `blocked` stands in.
-gh label create "blocker:drill-pending" --color E99695 --description "Release PR with no drill record in drill/RUNS.md — ceremony correct, unevidenced" --force
+gh label create "blocker:drill-pending" --color E99695 --description "Release PR with no drill record at drills/<version>.md — ceremony correct, unevidenced" --force
 # retired — the reconciler strips it; delete it once no PR carries it
 # gh label delete "state:needs-rebase"
 gh label create "state:needs-human"    --color 8250DF --description "No blockers, all bots approve — waiting on the human reviewer" --force

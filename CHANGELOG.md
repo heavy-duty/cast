@@ -7,6 +7,8 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+## 0.2.0 — 2026-07-21
+
 ### Added
 
 - CI refuses a release PR with no drill record at `drills/<version>.md`

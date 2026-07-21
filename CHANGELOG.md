@@ -372,6 +372,18 @@ actually cutting it, and this file starts there.
   with a class check in box#112's shape: the sweep asserts its own list
   covers `git ls-files '*.sh'` and fails naming the strays otherwise, so a
   future sweep that quietly narrows is red rather than green over nothing.
+- **The shellcheck sweep's own blind spot: extensionless scripts** (#121) —
+  the class check above asserts the swept set covers `git ls-files '*.sh'`,
+  which says nothing about scripts with no `.sh` extension. `bin/cast` is
+  one, and it enters the set only through the shebang scan — covered by the
+  derivation, not by the assertion. Break that scan and the shipped
+  entrypoint drops out of the lint while the check still exits 0: #118's
+  failure mode one level in. The sweep now also asserts a named floor of
+  known extensionless scripts, verified to go red when the shebang branch is
+  broken. Fixed alongside it: `IFS= read -r line <"$f" || continue` skipped
+  any file whose first line had no trailing newline, because `read` returns
+  1 at EOF even having populated `line` — a shebang-only file with no final
+  newline was silently unswept.
 
 - **`cast` no longer leaves a full repo clone in the temp dir on every run**
   (#117) — `resolveCheckout()` mkdtemps an `infra-checkout-` directory and

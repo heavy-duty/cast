@@ -38,7 +38,13 @@ mapfile -t files < <(
     git ls-files | while IFS= read -r f; do
       case "$f" in *.sh) continue ;; esac
       [ -f "$f" ] || continue
-      IFS= read -r line <"$f" || continue
+      # `read` returns 1 at EOF even when it populated `line` — which is what
+      # happens on a file whose FIRST line has no trailing newline (a
+      # shebang-only file with no final newline). A bare `|| continue` would
+      # skip exactly that file, silently. Fall through whenever `line` is
+      # non-empty; the empty case is a genuinely empty file, which has no
+      # shebang and is meant to be skipped.
+      IFS= read -r line <"$f" || [ -n "$line" ] || continue
       case "$line" in '#!'*) ;; *) continue ;; esac
       # reduce the shebang to a bare interpreter name: drop the '#!', drop any
       # flags, then keep the last path/word component — so both '#!/bin/sh -e'
@@ -46,6 +52,15 @@ mapfile -t files < <(
       interp="${line#\#!}"
       interp="${interp%% -*}"
       interp="${interp##*[ /]}"
+      # Two known limits of this reduction, both theoretical in this repo:
+      #   - `zsh` is on the allowlist, but shellcheck has no zsh support and
+      #     emits SC1071 for it. So a tracked zsh script makes the sweep fail
+      #     HARD rather than get linted. That is the right end state — a
+      #     script nobody can lint should be loud, not skipped — but the
+      #     outcome is "blocked", not "clean". Drop zsh here only if the repo
+      #     ever gains one and the answer is to exempt it on purpose.
+      #   - `#!/usr/bin/env -S bash` reduces to `env` and is not matched.
+      #     Nothing in the repo uses `-S`; see #121 for why that is left.
       case "$interp" in sh | bash | dash | ksh | zsh) printf '%s\n' "$f" ;; esac
     done
   } | sort -u
@@ -70,6 +85,34 @@ if [ -n "$unlinted" ]; then
   echo "the sweep must cover every tracked *.sh — see #118" >&2
   exit 1
 fi
+
+# --- the floor: extensionless scripts --------------------------------------
+#
+# The check above is derived from `git ls-files '*.sh'`, so it says nothing
+# about scripts that have no `.sh` extension — those enter the set only via
+# the shebang scan. `bin/cast` is one, and it is the shipped entrypoint. So
+# it is covered by the DERIVATION and not by the ASSERTION: break or delete
+# the shebang branch and bin/cast drops out of the sweep while this script
+# still exits 0. That is #118's failure mode — a lint quietly narrowing while
+# CI stays green — one level in from where the *.sh check closed it (#121).
+#
+# There is no non-circular way to re-derive "every extensionless shell
+# script" here; any second derivation would be the same shebang scan, and
+# would break with it. So the floor is named rather than computed: the known
+# extensionless scripts are listed, and the sweep must contain them. A rename
+# turns this red, which is correct — the floor is the thing that has to be
+# updated deliberately.
+
+required=(bin/cast)
+
+for req in "${required[@]}"; do
+  if ! printf '%s\n' "${files[@]}" | grep -qxF "$req"; then
+    echo "shellcheck-all: '$req' is not in the swept set" >&2
+    echo "it has no .sh extension, so it enters only via the shebang scan above —" >&2
+    echo "that scan is broken, or the file moved. See #121." >&2
+    exit 1
+  fi
+done
 
 # --- lint ------------------------------------------------------------------
 

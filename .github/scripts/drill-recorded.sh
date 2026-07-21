@@ -95,15 +95,31 @@ esac
 # humans reading the log.
 #
 # grab is re-armed by every '## ' line, so the section ends at the next one —
-# a record cannot borrow the body of the record below it. sed drops the blank
-# padding under the heading and the command substitution eats the trailing
-# blanks, which is what makes "present but EMPTY" distinguishable from
-# "present with content": a heading with nothing but whitespace under it
-# extracts to the empty string.
-record="$(awk -v ver="$ver" '
-  /^## / { grab = ($2 == "Release" && $3 == "drill" && $4 == "—" && $5 == ver); next }
-  grab   { print }
-' "$runs" | sed '/./,$!d')"
+# a record cannot borrow the body of the record below it.
+#
+# `grab && NF` is the non-blank rule, and it is load-bearing rather than
+# tidiness. NF is 0 on a line that is empty OR contains only whitespace, so
+# `record` is non-empty exactly when a line with real content exists. The
+# first cut of this piped through `sed '/./,$!d'` and the comment here claimed
+# "a heading with nothing but whitespace under it extracts to the empty
+# string" — which is precisely what that pipeline did NOT guarantee, because
+# `.` matches a space. A heading followed by one tab satisfied the gate. The
+# comment documented the intended contract and the code did not meet it, which
+# on a gate is the whole ballgame: an evidence-free release for the price of an
+# invisible character. Found by all three reviewers on #138, independently.
+#
+# The '(NF == 5 || $6 == dash)' tail constraint keeps this in step with box's
+# twin: without it '## Release drill — 0.2.0 stray words' counts as a record
+# here and does not there. Two sibling guards disagreeing about what the same
+# heading means is the same trap as disagreeing with release-notes.sh.
+record="$(awk -v ver="$ver" -v dash="—" '
+  /^## / {
+    grab = ($2 == "Release" && $3 == "drill" && $4 == dash && $5 == ver \
+            && (NF == 5 || $6 == dash))
+    next
+  }
+  grab && NF { print }
+' "$runs")"
 
 if [ -z "$record" ]; then
   {

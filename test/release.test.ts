@@ -798,6 +798,30 @@ describe("drill-recorded.sh — a release version has a drill record", () => {
     expect(r.output).toContain("no drill record for version '0.2.0'");
   });
 
+  // ...and whitespace is not evidence either. The first cut extracted with
+  // `sed '/./,$!d'`, where `.` matches a space, so a heading followed by one
+  // tab passed the gate — while the comment above the extractor claimed the
+  // opposite. An evidence-free release for the price of an invisible
+  // character, on the one check whose whole job is to demand evidence.
+  // Found independently by all three reviewers on #138.
+  it("a record body of only spaces and tabs fails (#138)", async () => {
+    const runs = `# Drill runs\n\n${heading("0.2.0")}\n   \n\t\n\n## Notes\n\nUnrelated.\n`;
+    const r = await check(treeWith("blank", "0.2.0", runs));
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("no drill record for version '0.2.0'");
+  });
+
+  // The sibling guards must agree about what a heading IS, not just about the
+  // version in it. box#149 requires the version to be the last field or be
+  // followed by the em dash; without the same constraint here, this heading is
+  // a record in cast and not in box.
+  it("a stray tail after the version is not a heading — in step with box#149", async () => {
+    const runs = `# Drill runs\n\n## Release drill — 0.2.0 stray words\n${legs}`;
+    const r = await check(treeWith("tail", "0.2.0", runs));
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("no drill record for version '0.2.0'");
+  });
+
   // The version is matched WHOLE, both directions — release-notes.sh's trap,
   // solved the same way (awk field equality, no regex, no dot-escaping). A
   // release candidate's drill is not the release's drill: different tree,

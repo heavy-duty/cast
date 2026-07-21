@@ -735,115 +735,134 @@ describe("changelog-monotonic.sh — release headings are append-only (#133)", (
 // gate moves the requirement out of a reviewer's memory and into the tree.
 //
 // What it asserts is that a RECORD EXISTS, never that the drill passed — a
-// maintainer waiver is legal and is itself a section in drill/RUNS.md. That is
-// the point: skipping stays possible and stays a deliberate, reviewable
-// commit. So the cases below are all about presence, emptiness, and whether
-// the version was matched whole; none of them inspect a result.
+// maintainer waiver is legal and is itself the content of drills/<ver>.md.
+// That is the point: skipping stays possible and stays a deliberate,
+// reviewable commit. So the cases below are all about presence and emptiness;
+// none of them inspect a result.
 //
-// Every fixture carries its OWN package.json and RUNS.md inside the temp dir.
-// Pointing the guard at the repo's real package.json would make these cases
-// change meaning on every version bump — green or red depending on where the
-// ceremony happens to be standing, which is the opposite of a fixture.
+// ONE FILE PER VERSION. The earlier design kept every record in one
+// drill/RUNS.md, so the guard parsed headings — and the heading grammar was
+// where both of this feature's review defects lived (a whitespace bypass, and
+// drift from box's stricter form). `0.2.0.md` and `0.2.0-rc1.md` are simply
+// different files, so the whole-version rule is now the filesystem's rather
+// than a comparison that can be got wrong, and the tests that existed only to
+// pin heading syntax (including the stray-tail case) are gone with it.
+//
+// Every fixture carries its OWN package.json and its OWN drills dir inside a
+// temp tree. Pointing the guard at the repo's real package.json would make
+// these cases change meaning on every version bump — green or red depending
+// on where the ceremony happens to be standing, the opposite of a fixture.
 
 describe("drill-recorded.sh — a release version has a drill record", () => {
   const work = tmp("cast-drill-");
 
-  /** A fixture tree: its own package.json + drill runs file. */
-  function treeWith(name: string, version: string, runs?: string): string {
+  /**
+   * A fixture tree: its own package.json, plus an optional `drills/` dir.
+   *
+   * @param records omit for NO drills dir at all; pass a map of
+   *   `<version>.md` -> contents (possibly empty) to create the dir.
+   */
+  function treeWith(
+    name: string,
+    version: string,
+    records?: Record<string, string>,
+  ): string {
     const dir = join(work, name);
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, "package.json"),
       `${JSON.stringify({ name: "cast", version }, null, 2)}\n`,
     );
-    if (runs !== undefined) writeFileSync(join(dir, "RUNS.md"), runs);
+    if (records !== undefined) {
+      mkdirSync(join(dir, "drills"), { recursive: true });
+      for (const [file, body] of Object.entries(records)) {
+        writeFileSync(join(dir, "drills", file), body);
+      }
+    }
     return dir;
   }
 
   const check = (dir: string) =>
-    run("bash", [DRILL, "RUNS.md", "package.json"], {}, dir);
+    run("bash", [DRILL, "drills", "package.json"], {}, dir);
 
-  const heading = (v: string) => `## Release drill — ${v} — 2026-07-21`;
   const legs =
-    "\nInstances: A and B, live. All legs pass: team, apply, diff, smoke,\ninventory, emit-draft, fleet, destroy, read-only guard.\n";
+    "# Release drill\n\nInstances: A and B, live. All legs pass: team, apply,\ndiff, smoke, inventory, emit-draft, fleet, destroy, read-only guard.\n";
 
-  it("a -dev tree passes with no drill record at all — nothing ships from it", async () => {
+  it("a -dev tree passes with no drills dir at all — nothing ships from it", async () => {
     const r = await check(treeWith("dev", "0.1.2-dev"));
     expect(r.code).toBe(0);
     expect(r.output).toContain("development tree");
   });
 
   it("a bare version with a matching, non-empty record passes", async () => {
-    const runs = `# Drill runs\n\n${heading("0.2.0")}\n${legs}`;
-    const r = await check(treeWith("ok", "0.2.0", runs));
+    const r = await check(treeWith("ok", "0.2.0", { "0.2.0.md": legs }));
     expect(r.code).toBe(0);
     expect(r.output).toContain("0.2.0");
   });
 
-  it("a bare version with NO record fails, naming the version", async () => {
-    const runs = "# Drill runs\n\n*None yet.*\n";
-    const r = await check(treeWith("none", "0.2.0", runs));
+  it("a bare version with NO drills dir fails, naming the version", async () => {
+    const r = await check(treeWith("nodir", "0.2.0"));
     expect(r.code).toBe(1);
-    expect(r.output).toContain("no drill record for version '0.2.0'");
+    expect(r.output).toContain("version 0.2.0 is a release");
+    expect(r.output).toContain("drills/0.2.0.md");
   });
 
-  // A heading with nothing under it is ceremony without evidence — the exact
-  // shape a hurried release produces, and the one a heading-only check would
-  // wave through. release-notes.sh refuses an empty section for the same
-  // reason.
-  it("a present-but-EMPTY record fails — a heading is not a record", async () => {
-    const runs = `# Drill runs\n\n${heading("0.2.0")}\n\n\n## Notes\n\nUnrelated.\n`;
-    const r = await check(treeWith("empty", "0.2.0", runs));
+  it("a drills dir with no file for THIS version fails", async () => {
+    const r = await check(
+      treeWith("othersonly", "0.2.0", { "0.1.0.md": legs, "README.md": legs }),
+    );
     expect(r.code).toBe(1);
-    expect(r.output).toContain("no drill record for version '0.2.0'");
+    expect(r.output).toContain("drills/0.2.0.md");
   });
 
-  // ...and whitespace is not evidence either. The first cut extracted with
-  // `sed '/./,$!d'`, where `.` matches a space, so a heading followed by one
-  // tab passed the gate — while the comment above the extractor claimed the
-  // opposite. An evidence-free release for the price of an invisible
-  // character, on the one check whose whole job is to demand evidence.
-  // Found independently by all three reviewers on #138.
-  it("a record body of only spaces and tabs fails (#138)", async () => {
-    const runs = `# Drill runs\n\n${heading("0.2.0")}\n   \n\t\n\n## Notes\n\nUnrelated.\n`;
-    const r = await check(treeWith("blank", "0.2.0", runs));
+  // A file that exists but says nothing is ceremony without evidence — the
+  // exact shape a hurried release produces, and the one an `[ -f ]` check
+  // would wave through. release-notes.sh refuses an empty section likewise.
+  it("a present-but-EMPTY record fails — a filename is not a record", async () => {
+    const r = await check(treeWith("empty", "0.2.0", { "0.2.0.md": "" }));
     expect(r.code).toBe(1);
-    expect(r.output).toContain("no drill record for version '0.2.0'");
+    expect(r.output).toContain("drills/0.2.0.md");
   });
 
-  // The sibling guards must agree about what a heading IS, not just about the
-  // version in it. box#149 requires the version to be the last field or be
-  // followed by the em dash; without the same constraint here, this heading is
-  // a record in cast and not in box.
-  it("a stray tail after the version is not a heading — in step with box#149", async () => {
-    const runs = `# Drill runs\n\n## Release drill — 0.2.0 stray words\n${legs}`;
-    const r = await check(treeWith("tail", "0.2.0", runs));
+  // ...and whitespace is not evidence either. This is the one surviving piece
+  // of the heading-parser era: the first cut extracted with `sed '/./,$!d'`,
+  // where `.` matches a space, so a heading followed by one tab passed the
+  // gate — while the comment above the extractor claimed the opposite. An
+  // evidence-free release for the price of an invisible character, on the one
+  // check whose whole job is to demand evidence. Found independently by all
+  // three reviewers on #138. The file layout changed; this rule did not.
+  it("a record of only spaces, tabs and newlines fails (#138)", async () => {
+    const r = await check(
+      treeWith("blank", "0.2.0", { "0.2.0.md": "   \n\t\n \n" }),
+    );
     expect(r.code).toBe(1);
-    expect(r.output).toContain("no drill record for version '0.2.0'");
+    expect(r.output).toContain("drills/0.2.0.md");
   });
 
-  // The version is matched WHOLE, both directions — release-notes.sh's trap,
-  // solved the same way (awk field equality, no regex, no dot-escaping). A
-  // release candidate's drill is not the release's drill: different tree,
-  // different build, and a prefix match would silently accept it.
+  // The version is matched WHOLE, both directions — but now by the FILESYSTEM
+  // rather than by a comparison. A release candidate's drill is not the
+  // release's drill: different tree, different build, and under the old
+  // heading parser a prefix match would have silently accepted it.
   it("0.2.0-rc1's record does NOT satisfy 0.2.0", async () => {
-    const runs = `# Drill runs\n\n${heading("0.2.0-rc1")}\n${legs}`;
-    const r = await check(treeWith("rc-for-bare", "0.2.0", runs));
+    const r = await check(
+      treeWith("rc-for-bare", "0.2.0", { "0.2.0-rc1.md": legs }),
+    );
     expect(r.code).toBe(1);
-    expect(r.output).toContain("no drill record for version '0.2.0'");
+    expect(r.output).toContain("drills/0.2.0.md");
   });
 
   it("...and 0.2.0's record does NOT satisfy 0.2.0-rc1", async () => {
-    const runs = `# Drill runs\n\n${heading("0.2.0")}\n${legs}`;
-    const r = await check(treeWith("bare-for-rc", "0.2.0-rc1", runs));
+    const r = await check(
+      treeWith("bare-for-rc", "0.2.0-rc1", { "0.2.0.md": legs }),
+    );
     expect(r.code).toBe(1);
-    expect(r.output).toContain("no drill record for version '0.2.0-rc1'");
+    expect(r.output).toContain("drills/0.2.0-rc1.md");
   });
 
   it("...while each still matches its own record", async () => {
-    const runs = `# Drill runs\n\n${heading("0.2.0")}\n${legs}\n${heading("0.2.0-rc1")}\n${legs}`;
-    expect((await check(treeWith("both-a", "0.2.0", runs))).code).toBe(0);
-    expect((await check(treeWith("both-b", "0.2.0-rc1", runs))).code).toBe(0);
+    const both = { "0.2.0.md": legs, "0.2.0-rc1.md": legs };
+    expect((await check(treeWith("both-a", "0.2.0", both))).code).toBe(0);
+    expect((await check(treeWith("both-b", "0.2.0-rc1", both))).code).toBe(0);
   });
 
   // The message is the whole user interface of a blocking guard. A failure
@@ -851,22 +870,16 @@ describe("drill-recorded.sh — a release version has a drill record", () => {
   // than satisfied — including the waiver, which must be visibly ALLOWED or
   // somebody will route around the gate instead of recording one.
   it("the failure names the unblock: run the drill, or record a waiver", async () => {
-    const r = await check(treeWith("unblock", "0.2.0", "# Drill runs\n"));
+    const r = await check(treeWith("unblock", "0.2.0", {}));
     expect(r.code).toBe(1);
-    expect(r.output).toContain("## Release drill — 0.2.0");
+    expect(r.output).toContain("drills/0.2.0.md");
     expect(r.output).toContain("run the drill and record it");
     expect(r.output).toContain("WAIVER");
     expect(r.output).toContain("RECORD, not a");
   });
 
-  it("a missing runs file on a release tree refuses — never a silent pass", async () => {
-    const r = await check(treeWith("norunsfile", "0.2.0"));
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("no RUNS.md at all");
-  });
-
   it("a missing version file refuses by path", async () => {
-    const r = await run("bash", [DRILL, "RUNS.md", "nope.json"], {}, work);
+    const r = await run("bash", [DRILL, "drills", "nope.json"], {}, work);
     expect(r.code).toBe(1);
     expect(r.output).toContain("no such file");
   });
@@ -877,20 +890,50 @@ describe("drill-recorded.sh — a release version has a drill record", () => {
     expect(r.output).toContain("usage:");
   });
 
-  // The REAL tree, run with the REAL defaults — the same discipline as the
-  // arming rule's "the REAL tree is armed". Whatever state the ceremony is in,
-  // this repo must satisfy its own gate.
-  it("the real tree satisfies its own gate, with default arguments", async () => {
+  // The REAL tree, run with the REAL defaults. The property is that the
+  // guard's VERDICT IS CORRECT FOR THIS TREE — not that it always passes.
+  //
+  // The previous wording here claimed "whatever state the ceremony is in, this
+  // repo must satisfy its own gate", and that is exactly wrong: a ceremony tree
+  // CANNOT satisfy the gate until a human has run the drill and written the
+  // record, which is the entire point of the gate. Demanding exit 0 made this
+  // suite un-greenable on every release branch before its drill, and surfaced
+  // as a `build` failure rather than as the gate doing its job — the same
+  // misattribution shape as box#146. Caught when box#148 went red for the
+  // wrong-looking reason.
+  it("the guard's verdict on the real tree matches the tree's own state", async () => {
+    const version = realVersion();
     const r = await run("bash", [DRILL], {}, ROOT);
-    expect(r.code).toBe(0);
+
+    if (version.endsWith("-dev")) {
+      // Vacuous: nothing ships from a development tree.
+      expect(r.code).toBe(0);
+      expect(r.output).toContain("development tree");
+      return;
+    }
+
+    // A ceremony tree: green only once its record exists.
+    const recorded =
+      existsSync(join(ROOT, "drills", `${version}.md`)) &&
+      readFileSync(join(ROOT, "drills", `${version}.md`), "utf8").trim() !== "";
+    expect(r.code).toBe(recorded ? 0 : 1);
+    if (!recorded) expect(r.output).toContain("no drill record");
   });
 
-  it("drill/RUNS.md documents the heading format the gate parses", () => {
-    const runs = readFileSync(join(ROOT, "drill/RUNS.md"), "utf8");
-    expect(runs).toContain("## Release drill — X.Y.Z — YYYY-MM-DD");
+  it("drills/README.md documents the naming rule and the waiver", () => {
+    const doc = readFileSync(join(ROOT, "drills/README.md"), "utf8");
+    expect(doc).toContain("<version>.md");
+    // The placeholder example version can never collide with a real release:
+    // under any scheme, a realistic version in the docs is a real record.
+    expect(doc).toContain("drills/9.9.9.md");
     // Per-repo by construction: cast records cast's legs and never reads
-    // another repo's log to decide whether cast may ship.
-    expect(runs).toMatch(/waiver/i);
+    // another repo's record to decide whether cast may ship.
+    expect(doc).toMatch(/waiver/i);
+    expect(doc).toMatch(/failed drill is still a valid record/i);
+  });
+
+  it("the old single-file log is gone — records are per version", () => {
+    expect(existsSync(join(ROOT, "drill/RUNS.md"))).toBe(false);
   });
 
   it("ci.yml runs it, ungated by event or label", () => {
@@ -914,24 +957,31 @@ describe("drill-recorded.sh — a release version has a drill record", () => {
     expect(block).not.toMatch(/^ {8}if:/m);
   });
 
-  it("CONTRIBUTING documents the gate and the ONE-RUN stack drill", () => {
+  // The three drills are INDEPENDENT — any order, any schedule, separate
+  // sittings. What makes that safe is that each pins the same fixed candidate
+  // refs, so every drill exercises the combination that will ship. That
+  // pinning, not sequencing, is what dissolves the box<->rig recursion: the
+  // refs are static identifiers that exist as soon as the release branches
+  // do. The docs must not re-acquire an ordering rule between repos.
+  it("CONTRIBUTING documents the gate and the INDEPENDENT, ref-pinned drills", () => {
     const doc = readFileSync(join(ROOT, "CONTRIBUTING.md"), "utf8");
-    expect(doc).toContain("drill/RUNS.md");
+    expect(doc).toContain("drills/X.Y.Z.md");
     expect(doc).toContain("drill-recorded.sh");
-    // One orchestrated run over the whole stack, in order: rig builds the
-    // host (installing box), box mints a seed, the seed calls rig back to
-    // converge, cast's legs run on the result.
-    expect(doc).toContain("--host yes");
-    expect(doc).toContain("box new");
-    expect(doc).toContain("rig bootstrap <tenant>-box");
-    // rig sits BELOW box and ABOVE it — mutually recursive, not linear. So
-    // the docs must not promise a fixed release order, and must say the run
-    // pins CANDIDATE refs, which is what dissolves the chicken-and-egg.
+    expect(doc).toMatch(/drills are independent/i);
+    expect(doc).toMatch(/any order/i);
+    expect(doc).toMatch(/pins the same fixed set of\s+candidate\s+refs/i);
+    expect(doc).toMatch(/not sequencing/i);
+    // box and rig stay mutually recursive; the pinning is what makes that a
+    // non-problem, so both halves have to survive together.
     expect(doc).toMatch(/mutually recursive/);
     expect(doc).toContain("RIG_REF");
     expect(doc).toMatch(/candidate refs, not released artifacts/);
     expect(doc).toMatch(/no fixed order|not.*published in a fixed order/i);
-    // Three records, one run: each repo cites the shared run ID.
+    // Each repo drills a different thing — which is WHY records are per-repo.
+    expect(doc).toMatch(/isolation\s+contract/i);
+    expect(doc).toMatch(/convergence/i);
+    expect(doc).toMatch(/promotion/i);
+    // Separate records, one pinned set: each cites the shared run ID.
     expect(doc).toMatch(/run ID/i);
   });
 });

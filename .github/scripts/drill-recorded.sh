@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# drill-recorded.sh [<runs-file>] [<version-file>] — assert that the version
-# this tree claims to ship has a DRILL RECORD in drill/RUNS.md.
+# drill-recorded.sh [<drills-dir>] [<version-file>] — assert that the version
+# this tree claims to ship has a DRILL RECORD at <drills-dir>/<version>.md.
 #
 # CONTRIBUTING says a release carries the full real-hardware drill. Nothing
 # checked that, so no release in this family ever carried one: the step lived
@@ -12,44 +12,81 @@ set -euo pipefail
 # the gate moves into CI, where it is asserted on every release PR rather than
 # recalled.
 #
+# ONE FILE PER VERSION — WHY THE PARSER IS GONE
+#
+# The first cut kept every record in one drill/RUNS.md and asked awk which
+# section belonged to this version. That bought a heading grammar: em-dash
+# field matching, an optional ' — DATE' tail, a whole-version comparison so
+# 0.2.0-rc1 could not satisfy 0.2.0, a '(NF == 5 || $6 == dash)' tail
+# constraint to stay in step with box's twin, and a non-blank body rule.
+#
+# All of it existed ONLY because records shared a file — and in review this
+# repo shipped two defects out of that complexity: a `sed '/./,$!d'`
+# extraction where `.` matches a space, so a heading followed by one tab
+# satisfied the gate; and heading-grammar drift from box's stricter form.
+# Two defects, on the one check whose entire job is to demand evidence.
+#
+# One file per version makes nearly all of it UNREPRESENTABLE. `0.2.0.md` and
+# `0.2.0-rc1.md` are simply different files — the whole-version rule is the
+# filesystem's, not a comparison anyone can get wrong. There is no heading to
+# parse, so there is no grammar to drift from box's. What is left is a
+# question a shell can ask directly: does the file exist, and does it say
+# anything.
+#
+# The directory is plain `drills/`, NOT `.drills/`. Dot-prefixed directories
+# are invisible to globs without `dotglob`, which is the exact blind spot that
+# produced #118, #121 here and box#116 — a sweep that looks green because it
+# never descended into the directory holding the thing it was meant to check.
+#
 # WHAT IT ASSERTS, AND WHAT IT DELIBERATELY DOES NOT
 #
 # It asserts a RECORD EXISTS — not that the drill passed. That is the whole
 # design. A maintainer may ship on a failed or partial drill; what they may not
 # do is ship on silence. Requiring a record makes a waiver a deliberate,
-# reviewable commit (a section saying who waived it and what is untested)
-# instead of the default outcome of forgetting. A guard that demanded a PASS
-# would be argued with and eventually bypassed; one that demands EVIDENCE has
-# nothing to argue about.
+# reviewable commit (a file saying who waived it and what is untested) instead
+# of the default outcome of forgetting. A guard that demanded a PASS would be
+# argued with and eventually bypassed; one that demands EVIDENCE has nothing to
+# argue about.
 #
 # PER-REPO, ON PURPOSE
 #
-# This reads cast's OWN drill/RUNS.md. It does not reach into box or rig to ask
+# This reads cast's OWN drills/. It does not reach into box or rig to ask
 # whether the family drilled. A cross-repo lookup has a failure mode this repo
 # keeps refusing: when the fetch fails — no network, moved file, renamed repo,
 # a token without read on the other repo — the honest answers are "unknown" and
 # "blocked", but the shape such code actually takes degrades to "pass". Same
 # class as the unreadable check rollup that read as "nothing is failing".
 #
-# There is also nothing to look up. The drill is ONE orchestrated run over the
-# whole stack (CONTRIBUTING.md, "Releasing"): rig bootstraps the host and
-# installs box, box mints a seed, the seed calls rig back to converge, and
-# cast's legs run on the result. rig therefore sits BELOW box and ABOVE it —
-# the three repos are mutually recursive, not linearly ordered, and their
-# releases are NOT published in a fixed sequence. The run pins CANDIDATE refs
-# (RIG_REPO/RIG_REF at mint time), so no repo must ship before another can be
-# drilled. Each repo records its own legs from that run, citing the shared run
-# ID and the other repos' SHAs — which is how three records reassemble into one
-# run without any repo reading another's file.
+# There is also nothing to look up. The three repos' drills are INDEPENDENT
+# (CONTRIBUTING.md, "Releasing") — run in any order, on any schedule, in
+# separate sittings. What makes that safe is that every drill pins the SAME
+# FIXED SET OF CANDIDATE REFS (RIG_REPO/RIG_REF at mint time), so each one
+# exercises the combination that will ship rather than whatever main happens
+# to be that afternoon.
+#
+# That pinning, not sequencing, is what dissolves the box<->rig recursion. box
+# and rig ARE mutually recursive — rig builds the host that runs box, box's
+# seed calls rig back to converge the guest — but candidate refs are static
+# identifiers that exist as soon as the release branches do, long before any
+# drill runs. A cycle at runtime becomes independent tests against one fixed
+# pair, and no repo must ship before another can be drilled. The three
+# releases are NOT published in a fixed sequence.
+#
+# Each repo also drills a DIFFERENT thing: box asserts the isolation contract,
+# rig asserts convergence, cast asserts promotion. Three different exercises
+# over a shared substrate — which is exactly why the records are per-repo.
+# Each cites the shared run ID naming the pinned set, plus the other repos'
+# SHAs, so three records still reassemble into one picture without any repo
+# reading another's file.
 #
 # A file of its own, not a clause inlined in ci.yml, for the same reason as
 # release-notes.sh and changelog-monotonic.sh: test/release.test.ts drives the
 # REAL script against fixtures, so what the tests prove is what CI runs.
 
-runs="${1:-drill/RUNS.md}"
+drills="${1:-drills}"
 version_file="${2:-package.json}"
 
-[ "$#" -le 2 ] || { echo "usage: drill-recorded.sh [<runs-file>] [<version-file>]" >&2; exit 2; }
+[ "$#" -le 2 ] || { echo "usage: drill-recorded.sh [<drills-dir>] [<version-file>]" >&2; exit 2; }
 [ -f "$version_file" ] || { echo "drill-recorded: no such file: $version_file" >&2; exit 1; }
 
 # cast's version lives in package.json (there is no VERSION file), so this
@@ -76,69 +113,34 @@ esac
 
 # A bare version is a release ceremony tree: this is the tree whose merge IS
 # the release, so this is where the evidence has to exist.
-[ -f "$runs" ] || {
-  {
-    echo "drill-recorded: version $ver is a release, but there is no $runs at all."
-    echo
-    echo "  The release drill has to be RECORDED, not just performed. Create the file"
-    echo "  with the run's section (see the format below) and commit it."
-  } >&2
-  exit 1
-}
+#
+# The record is <drills-dir>/<version>.md, and it must contain at least one
+# NON-WHITESPACE character. That second clause is the one surviving piece of
+# the whitespace defect found in review (#138): a file of only spaces, tabs
+# and newlines is a file, and `[ -f ]` is happy with it, but it is not a
+# record — an evidence-free release for the price of an invisible character.
+# `grep -q '[^[:space:]]'` asks the question the old `sed '/./,$!d'` only
+# claimed to: `.` matches a space, a POSIX class does not.
+record="$drills/$ver.md"
 
-# $5 of a drill heading ('## Release drill — 0.2.0 — 2026-07-21') is the bare
-# version, compared WHOLE — so 0.2.0 can never be satisfied by a 0.2.0-rc1
-# section, or the reverse, and no regex-escaping of dots. Exactly the trap
-# release-notes.sh solves the same way, with the same awk field split, so the
-# two cannot drift apart about what a heading is. The trailing ' — DATE' is
-# optional and unread: the gate is about the version, and the date is for the
-# humans reading the log.
-#
-# grab is re-armed by every '## ' line, so the section ends at the next one —
-# a record cannot borrow the body of the record below it.
-#
-# `grab && NF` is the non-blank rule, and it is load-bearing rather than
-# tidiness. NF is 0 on a line that is empty OR contains only whitespace, so
-# `record` is non-empty exactly when a line with real content exists. The
-# first cut of this piped through `sed '/./,$!d'` and the comment here claimed
-# "a heading with nothing but whitespace under it extracts to the empty
-# string" — which is precisely what that pipeline did NOT guarantee, because
-# `.` matches a space. A heading followed by one tab satisfied the gate. The
-# comment documented the intended contract and the code did not meet it, which
-# on a gate is the whole ballgame: an evidence-free release for the price of an
-# invisible character. Found by all three reviewers on #138, independently.
-#
-# The '(NF == 5 || $6 == dash)' tail constraint keeps this in step with box's
-# twin: without it '## Release drill — 0.2.0 stray words' counts as a record
-# here and does not there. Two sibling guards disagreeing about what the same
-# heading means is the same trap as disagreeing with release-notes.sh.
-record="$(awk -v ver="$ver" -v dash="—" '
-  /^## / {
-    grab = ($2 == "Release" && $3 == "drill" && $4 == dash && $5 == ver \
-            && (NF == 5 || $6 == dash))
-    next
-  }
-  grab && NF { print }
-' "$runs")"
-
-if [ -z "$record" ]; then
+if [ ! -f "$record" ] || ! grep -q '[^[:space:]]' "$record"; then
   {
-    echo "drill-recorded: $runs has no drill record for version '$ver'."
+    echo "drill-recorded: version $ver is a release, but there is no drill record at $record."
     echo
-    echo "  A release PR's version must have a NON-EMPTY section headed:"
+    echo "  A release PR's version must have a NON-EMPTY file named for it:"
     echo
-    echo "      ## Release drill — $ver — YYYY-MM-DD"
+    echo "      $drills/$ver.md"
     echo
-    echo "  (An empty section under a correct heading counts as no record. The"
-    echo "   heading matches the version WHOLE — a '$ver-rc1' section does not"
-    echo "   satisfy '$ver', and vice versa.)"
+    echo "  (A file that exists but holds only whitespace counts as no record."
+    echo "   One file per version, so '$ver-rc1.md' is a different record and"
+    echo "   does not satisfy '$ver', or the other way round.)"
     echo
     echo "  To unblock, either:"
     echo "    * run the drill and record it — the legs (team, apply, idempotent"
     echo "      diff, smoke, inventory, emit-draft, fleet, destroy, read-only"
     echo "      guard), the numbers, and what failed; or"
-    echo "    * record an explicit maintainer WAIVER for this version in $runs,"
-    echo "      saying who waived it and what is untested."
+    echo "    * record an explicit maintainer WAIVER for this version in that"
+    echo "      file, saying who waived it and what is untested."
     echo
     echo "  The waiver is allowed on purpose: this gate requires a RECORD, not a"
     echo "  passing result, so shipping without a drill stays possible — and"
@@ -147,4 +149,4 @@ if [ -z "$record" ]; then
   exit 1
 fi
 
-echo "drill-recorded: $runs carries a drill record for $ver ($(printf '%s\n' "$record" | grep -c .) line(s))"
+echo "drill-recorded: $record carries a drill record for $ver ($(grep -c '' "$record") line(s))"

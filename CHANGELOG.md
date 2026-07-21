@@ -266,6 +266,33 @@ actually cutting it, and this file starts there.
   wind-down window where the two overlap — and the whole check-outcome enum are
   pinned in `test/labels-reconcile.sh` (fixtures 19 → 51).
 
+- **CI now lints every tracked shell script, and proves the set is
+  complete** (#118) — filed as cast's record of heavy-duty/box#116, whose
+  defect is a `shopt -s globstar; files=(bin/* **/*.sh)` sweep that skips
+  `.github/` because globs do not match dot-prefixed names without
+  `dotglob`. cast's CI turned out never to have had a shellcheck step at
+  all: the only shell gate was `bash -n install.sh bin/cast scripts/*.sh
+  .github/scripts/*.sh`, a syntax check over a hand-maintained list. So the
+  reported symptom was right — `release-notes.sh` and
+  `labels-reconcile.sh` shipped unlinted — but so did every other script in
+  the repo, including `install.sh` and `bin/cast`, and `bash -n` would not
+  have caught a quoting or unset-variable bug in any of them.
+  [.github/scripts/shellcheck-all.sh](.github/scripts/shellcheck-all.sh)
+  now runs `shellcheck -x` over the tracked tree, from CI and from
+  `npm run check:shell`. It takes its file list from `git ls-files` rather
+  than from a glob. `shopt -s globstar dotglob` was measured and does work
+  here — cast's dependency tree ships no `.sh` files, so sweeping after
+  `npm ci` pulls in nothing — but that is a property of somebody else's
+  package tree, re-decided by every install; `git ls-files` does not depend
+  on it. Extensionless scripts are found by shebang, which is how
+  `bin/cast` is covered without being named. All seven scripts passed as
+  they stood — the three findings were intentional (`$PATH` written
+  literally into a profile, advice text in backticks) or a false positive,
+  and are annotated as such, so this lands as a no-op on behavior. It ships
+  with a class check in box#112's shape: the sweep asserts its own list
+  covers `git ls-files '*.sh'` and fails naming the strays otherwise, so a
+  future sweep that quietly narrows is red rather than green over nothing.
+
 ## 0.1.1 — 2026-07-19
 
 ### Fixed

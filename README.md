@@ -119,6 +119,9 @@ cast inventory <org>/<repo> --env <env>
 cast inventory --env <env> [--emit-draft <dir> [--recipient age1…] [--no-secrets]]
 cast destroy   <org>/<repo> --env <env> [--instance <name>] [--with-project]
 cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
+cast github-app create   <org>/<repo> --env <env> [--name <n>] [--port 8765]
+cast github-app register <org>/<repo> --env <env> --app-id <id> --installation-id <id> \
+                         --client-id <id> --client-secret-stdin --private-key <file>
 cast smoke     <org>/<repo> --env <env> [--project <name>] [--environment <name>]
 cast team [--env <env>]
 ```
@@ -166,6 +169,12 @@ cast team [--env <env>]
   environment's name at a plan that says, for every database, whether it is backed
   up and when the last backup landed. See *Tearing an environment down* below.
 - **`server add`** — uploads a server's private key and registers it with Coolify.
+- **`github-app create`** — creates the GitHub App Coolify clones private repos
+  with, by running GitHub's App Manifest flow, then registers it. Two browser
+  clicks, zero transcription. See *The GitHub App* below.
+- **`github-app register`** — adopts an App you already hold: one created by hand,
+  or a disaster-recovery restore from a stored private key. `create` ends by
+  running exactly this.
 - **`smoke`** — contract test against the project's `smoke_target`: proves
   Coolify's bulk env endpoint still *upserts* rather than replacing. Run it after
   every Coolify upgrade — `apply`'s never-delete guarantee rests on that behavior,
@@ -207,6 +216,141 @@ no credentials at all it says so, and names the fix.
 
 The token is never put in the clone URL or in `http.extraheader` — both leak it
 into `ps`, and the latter persists it into the clone's git config.
+
+## The GitHub App: `cast github-app`
+
+That is how *cast* clones. **Coolify** clones with a GitHub App, and the App used
+to be the one piece of a Coolify instance cast could not reproduce: created by
+hand in a browser, its four identifiers copied out of the UI by eye, its private
+key downloaded to `~/Downloads`, its details fed to a shell script as a
+six-variable env pile. Nothing about that survived in state. Rebuild the instance
+and you redid the hoops from memory.
+
+```sh
+cast github-app create heavy-duty/incubator --env prod --name hdb-coolify-prod
+```
+
+There is **no REST endpoint that creates a GitHub App** — no `POST /apps`, no
+GraphQL mutation, no `gh app` subcommand, and no PAT scope that unlocks one. The
+only programmatic path is GitHub's [App Manifest
+flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest):
+a browser form POST whose authentication is your existing GitHub session,
+followed by an unauthenticated code exchange. It is how Coolify's own *Create
+GitHub App* button works, and it is why this command serves you a page instead of
+calling an API.
+
+What `create` does:
+
+1. If `gh` is on `PATH` and authenticated, checks you are an **admin** of the org
+   — so you learn you cannot create Apps there *before* the browser dance, not
+   after. `gh` is never required; an absent one skips the check silently.
+2. Resolves the App's Coolify-facing name from **`github_apps.<org>/<repo>` in
+   `environments.yaml`**, which is what every later `cast apply` resolves this
+   repo's App by. `--name` seeds that entry when it is absent and is **refused**
+   when it disagrees with one that exists.
+3. Serves a one-shot page on `127.0.0.1` that submits an App manifest —
+   `contents: read` + `metadata: read`, webhook inactive, private.
+4. You click *Create GitHub App*; GitHub redirects back to the loopback server,
+   which checks the CSRF `state` and shuts down.
+5. Exchanges the code. **This response is the only moment GitHub ever hands over
+   the private key, the client secret and the webhook secret together.**
+6. **Writes all three to disk immediately**, before waiting on anything —
+   see [Where the credentials land](#where-the-credentials-land). Everything
+   after this point can fail for ordinary reasons (a slow install screen, a
+   dropped network, `Ctrl-C`), and none of those may cost you a key GitHub will
+   not reissue.
+7. Prints (and tries to open) the install URL; you pick the repository.
+8. Recovers the installation id by minting an RS256 JWT with the App's own key —
+   never from the `installation_id` GitHub appends to a redirect, which GitHub
+   documents as a spoofable hint — then fills it into the record from step 6.
+9. Uploads the key to Coolify and creates the App record — unless a Source of
+   that name already exists, in which case it verifies that one rather than
+   registering a second (Coolify does not enforce unique Source names).
+10. **Asks Coolify which repositories the App can actually see, and fails if
+    `<org>/<repo>` is not among them.** This is the step that matters most:
+    without it a misconfigured App fails silently and surfaces hours later, in a
+    different command, as an unresolvable source at `cast apply` time.
+
+If the install never lands, `create` stops at step 8 and tells you the exact
+`register` command that finishes the job against the files from step 6. Nothing
+is lost and nothing has to be recreated — in particular, do **not** re-run
+`create`, which would mint a second App. For that same reason `create` refuses
+up front, before the browser flow, when `<name>.pem` already exists.
+
+`register` is the same command from step 9 onwards, for an App you already hold —
+one made by hand, or a disaster-recovery restore from a stored PEM:
+
+```sh
+pbpaste | cast github-app register heavy-duty/incubator --env prod \
+  --app-id 12345 --installation-id 99887766 --client-id Iv23li… \
+  --client-secret-stdin --private-key ~/Downloads/app.private-key.pem
+```
+
+The client secret is read from **stdin only** — argv is visible in `ps` and kept
+in shell history. `--webhook-secret` is optional: a webhook-**inactive** App is
+the right shape for a tailnet-only Coolify where deliveries can never arrive and
+deploys are CI-triggered, and cast generates a value rather than making you
+invent one.
+
+### Where the credentials land
+
+Into the state directory you point cast at — cast itself stores nothing:
+
+```
+<state>/github-apps/
+├── .gitignore          # `*` — written by cast
+├── <name>.pem          # 0600, the private key
+└── <name>.json         # 0600, app id, installation id, client id + secret, webhook secret
+```
+
+Both are written the instant GitHub yields them, which is *before* `create`
+waits for you to install the App. Until the install lands, `<name>.json` carries
+`"installation_id": null` — that is the one field GitHub will answer again as
+often as it is asked, and it is filled in on success. Re-running against an
+existing file is idempotent on identical content and a **refusal** otherwise;
+`--force` is the deliberate escape hatch for a stale half-run.
+
+All three secrets, because GitHub shows them once and `register` needs the client
+secret to be re-runnable at all — a disaster-recovery restore that is missing it
+is not a restore. They are written **plaintext at 0600**, not into `secrets/`:
+that store holds per-repo-per-env *application* env vars, whose whole purpose is
+to be decrypted and injected into the running container, which is the last place
+an App private key belongs — and its age identity may not exist on the machine
+doing the bootstrap at all. Encrypting the one credential that makes recovery
+possible behind a key that might not be there is how DR fails at the moment it is
+needed.
+
+So the guard is structural rather than cryptographic: the `.gitignore` means
+`git add -A` in your state repo cannot commit these by accident. Committing them
+stays possible and has to be deliberate — encrypt them yourself and commit the
+ciphertext, or keep the directory out of the repo and back it up somewhere that
+is not a git remote.
+
+### Until it has worked once
+
+`create`'s design rests on GitHub accepting a `redirect_url` on
+`http://127.0.0.1:<port>`. The manifest docs are silent on the scheme (loopback
+HTTP is documented for *OAuth* redirect URIs), and the precedent is strong —
+Probot's setup flow does exactly this — but it is unvalidated, because validating
+it needs a logged-in GitHub session. **The manual path below stays supported
+until `create` has succeeded against a real GitHub once.** If it fails, create
+the App by hand in the browser and use `github-app register`, which does not
+depend on the assumption at all.
+
+<details>
+<summary>The manual path</summary>
+
+1. Org → Settings → Developer settings → GitHub Apps → **New GitHub App**.
+   Permissions: **Contents: Read-only**, **Metadata: Read-only**. Uncheck
+   *Active* under Webhook. Uncheck *Any account* (keep it private).
+2. Note the **App ID** and **Client ID**; generate a **client secret**; generate
+   and download a **private key**.
+3. **Install App** → pick the repository. The installation id is the last path
+   segment of the URL you land on (`…/settings/installations/<id>`).
+4. Feed all of it to `cast github-app register` (above), which validates the name
+   against state and verifies the repo is reachable.
+
+</details>
 
 ## Many Coolifys
 
@@ -1003,8 +1147,9 @@ the way back to zero from a half-applied first run.
 
 ## Scripts
 
-Operational helpers, all argument-driven (`scripts/`): register a GitHub App with
-Coolify, restore a database backup into a target container.
+Operational helpers, all argument-driven (`scripts/`): restore a database backup
+into a target container. (`register-github-app.sh` is gone — it is
+`cast github-app register` now.)
 
 **They run where cast runs — off the box.** They drive the Coolify API, or reach a
 box over SSH; none of them expects to be executing *on* a server. Anything that

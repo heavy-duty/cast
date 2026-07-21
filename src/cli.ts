@@ -85,6 +85,13 @@ import {
   renderProjectHeading,
 } from "./fleet.js";
 import {
+  createGithubApp,
+  generateWebhookSecret,
+  registerGithubApp,
+  resolveAppName,
+  seedGithubAppBinding,
+} from "./github-app.js";
+import {
   type LiveResource,
   type SweepEnvironment,
   type SweepProject,
@@ -124,6 +131,10 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
        cast inventory --env <env> --emit-draft <dir> [--recipient age1…] [--no-secrets]
        cast destroy   <org>/<repo> --env <env> [--instance <name>] [--path <dir>] [--with-project]
        cast server add <name> --ip <ip> --key <file> --env <env> [--user root] [--port 22]
+       cast github-app create   <org>/<repo> --env <env> [--name <n>] [--port 8765] [--force]
+       cast github-app register <org>/<repo> --env <env> --app-id <id> --installation-id <id>
+                                --client-id <id> --client-secret-stdin --private-key <file>
+                                [--webhook-secret <v>] [--name <n>] [--force]
        cast smoke     <org>/<repo> --env <env> [--project <name>] [--environment <name>]
        cast team [--env <env>]
        cast versions                                      # list installed versions
@@ -178,6 +189,32 @@ const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--
                   with the repo positional and with every single-project
                   coordinate: --path, --project, --environment, --resource,
                   --hostname-overlay.
+
+github-app (the credential Coolify clones private repos with):
+  create    runs GitHub's App Manifest flow — the ONLY programmatic way to make a
+            GitHub App — then falls through into exactly what \`register\` does. It
+            serves a one-shot page on 127.0.0.1, your browser session authenticates
+            the form, and the conversion response hands over the private key, the
+            client secret and the webhook secret in one body. Nothing is transcribed.
+            All three are written to disk the instant they arrive — BEFORE the wait
+            for you to install the App — so a timeout or a Ctrl-C during that wait
+            cannot lose a key GitHub shows exactly once. If the install never lands,
+            cast prints the \`register\` command that finishes the job; do not re-run
+            \`create\`, which would mint a second App.
+  register  adopts credentials you already hold: an App created by hand, or a
+            disaster-recovery restore from a stored PEM. The client secret is read
+            from STDIN (never argv); --webhook-secret is optional, because a
+            webhook-INACTIVE App is the right shape for a tailnet-only Coolify.
+  --name    seeds \`github_apps.<org>/<repo>\` in environments.yaml when it is
+            ABSENT, and is refused when it disagrees with an entry that exists.
+            The state file is the authority: its value is what every later
+            \`cast apply\` resolves this repo's App by.
+  --force   overwrite an existing PEM/credentials file under <state>/github-apps/.
+  Both verbs end by asking Coolify which repositories the App can actually see
+  and failing if <org>/<repo> is not among them — the check that turns a silent
+  misconfiguration into an error next to the thing that caused it. Re-running
+  \`register\` after that failure RE-VERIFIES an existing Coolify Source of the
+  same name rather than registering a second one.
 
 capture (adopt a hand-built instance into the age secret store):
   --generated <NAME>   force NAME to the \`pending-coolify-generated\` placeholder,
@@ -1423,6 +1460,193 @@ function formatVersion(): string {
   return `cast ${typeof version === "string" ? version : "unknown"} (${dirname(pkgPath)})`;
 }
 
+// `--client-secret-stdin`, mirroring `docker login --password-stdin`: argv is
+// visible in `ps` and lands in shell history, and a GitHub App client secret is
+// shown by GitHub exactly once.
+async function readAllStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8").trim();
+}
+
+// `cast github-app register|create` — one command surface, ONE registration
+// implementation (see src/github-app.ts). Everything up to the point where
+// credentials exist differs between the two verbs; everything from there on is
+// registerGithubApp, which `create` calls rather than reimplements.
+async function githubAppCommand(rest: string[]): Promise<number> {
+  const verb = rest[0];
+  if (verb !== "register" && verb !== "create") {
+    console.error(USAGE);
+    return 2;
+  }
+  const { values, positionals } = parseArgs({
+    args: rest.slice(1),
+    allowPositionals: true,
+    options: {
+      state: { type: "string" },
+      env: { type: "string" },
+      instance: { type: "string" },
+      name: { type: "string" },
+      force: { type: "boolean" },
+      // create
+      port: { type: "string" },
+      // register
+      "app-id": { type: "string" },
+      "installation-id": { type: "string" },
+      "client-id": { type: "string" },
+      "client-secret-stdin": { type: "boolean" },
+      "private-key": { type: "string" },
+      "webhook-secret": { type: "string" },
+    },
+  });
+  const orgRepo = positionals[0];
+  // --env is required for the same reason `server add` requires it: this
+  // writes to a live Coolify, and every write first asserts that the token
+  // belongs to the environment's declared team.
+  if (!orgRepo || !orgRepo.includes("/") || !values.env) {
+    console.error(USAGE);
+    return 2;
+  }
+  // `register`'s two ids reach `Number()` far below, and a non-numeric string
+  // becomes NaN silently. That matters more here than it usually would, because
+  // `register` deliberately persists BEFORE it talks to Coolify:
+  // `JSON.stringify(NaN)` is `null`, so `--app-id nope` would write a credential
+  // record whose app_id is null and could upload the security key before
+  // `POST /github-apps` rejects it — a half-run leaving a corrupt record on disk
+  // and a stray key on the server (cast#7 review).
+  //
+  // This sits with the other ARGV checks, above openCoolify/assertTeam, because
+  // "reject before any write or network call" has to mean the team read too. A
+  // typo should cost nothing, not one request.
+  //
+  // Digits-only rather than Number.isInteger: `1e3` and `0x10` are integers to
+  // JavaScript but are not how a GitHub App id is written, and quietly storing
+  // 1000 for `1e3` is the same class of wrong answer this check exists to stop.
+  if (verb === "register") {
+    for (const [flag, raw] of [
+      ["--app-id", values["app-id"]],
+      ["--installation-id", values["installation-id"]],
+    ] as const) {
+      if (raw !== undefined && (!/^\d+$/.test(raw) || Number(raw) <= 0)) {
+        console.error(
+          `${flag} must be a positive integer (got ${JSON.stringify(raw)})`,
+        );
+        return 2;
+      }
+    }
+  }
+  // `--port` on the create path has the same defect the ids had, and the same
+  // rule applies: `Number("abc")` is NaN, which reaches `server.listen(NaN)` in
+  // github-app.ts and dies as an uncaught ERR_SOCKET_BAD_PORT stack trace —
+  // after `detectOwnerType` and the org-admin preflight have already gone out.
+  // Nothing is lost when it fails (no App and no secret exist yet), so this is
+  // about the command honouring its own stated rule rather than about damage:
+  // reject before any write or network call, and fail with a sentence instead
+  // of a stack trace.
+  //
+  // Range-checked as well as digits-only, because `--port 99999` is accepted by
+  // every check the ids need and still cannot be listened on.
+  if (values.port !== undefined) {
+    const p = Number(values.port);
+    if (!/^\d+$/.test(values.port) || p < 1 || p > 65535) {
+      console.error(
+        `--port must be a port number between 1 and 65535 (got ${JSON.stringify(values.port)})`,
+      );
+      return 2;
+    }
+  }
+  const stateDir = stateDirFrom(values.state);
+  const bindingsPath = join(stateDir, "environments.yaml");
+  const bindings = loadBindings(bindingsPath);
+  const binding = bindings.environments[values.env];
+  if (!binding) {
+    console.error(`environment ${values.env} not in environments.yaml`);
+    return 2;
+  }
+
+  // Step 2, before anything reaches a network: the Coolify-facing name comes
+  // from state. See resolveAppName — this is #5's footgun 1, dissolved.
+  const { name, seed } = resolveAppName({
+    bindings,
+    orgRepo,
+    nameFlag: values.name,
+  });
+
+  const { instance, client } = openCoolify(stateDir, values.instance, binding);
+  assertWritable(instance, `github-app ${verb}`);
+  const team = await assertTeam(client, binding.team, values.env);
+  console.log(`team ${formatTeam(team)} ✓`);
+  console.log(
+    `github app name: ${name}${seed ? "  (from --name, not yet in environments.yaml)" : "  (from environments.yaml)"}`,
+  );
+
+  const org = orgRepo.split("/")[0] ?? orgRepo;
+  if (verb === "create") {
+    await createGithubApp({
+      client,
+      orgRepo,
+      name,
+      stateDir,
+      force: values.force,
+      port: values.port ? Number(values.port) : undefined,
+    });
+  } else {
+    const appId = values["app-id"];
+    const installationId = values["installation-id"];
+    const clientId = values["client-id"];
+    const privateKey = values["private-key"];
+    if (!appId || !installationId || !clientId || !privateKey) {
+      console.error(USAGE);
+      return 2;
+    }
+    if (!values["client-secret-stdin"]) {
+      console.error(
+        "--client-secret-stdin is required: the client secret is read from stdin,\nnever from argv (which `ps` shows and shell history keeps).",
+      );
+      return 2;
+    }
+    const clientSecret = await readAllStdin();
+    if (!clientSecret) {
+      console.error("no client secret on stdin");
+      return 2;
+    }
+    // #5's footgun 3: a webhook-inactive App is the right configuration for a
+    // tailnet-only Coolify, and the old script still demanded a secret for it.
+    const webhookSecret = values["webhook-secret"] ?? generateWebhookSecret();
+    if (!values["webhook-secret"]) {
+      console.log(
+        "no --webhook-secret: generated one (fine for a webhook-inactive App)",
+      );
+    }
+    await registerGithubApp({
+      client,
+      name,
+      org,
+      orgRepo,
+      stateDir,
+      force: values.force,
+      creds: {
+        appId: Number(appId),
+        installationId: Number(installationId),
+        clientId,
+        clientSecret,
+        webhookSecret,
+        privateKeyPem: readFileSync(privateKey, "utf8"),
+      },
+    });
+  }
+
+  // Only after the App is registered AND verified: a state file that names an
+  // App which does not work is worse than one that names none.
+  if (seed) {
+    seedGithubAppBinding(bindingsPath, orgRepo, name);
+    console.log(
+      `environments.yaml: github_apps["${orgRepo}"] = ${name} (added)`,
+    );
+  }
+  return 0;
+}
+
 async function main(): Promise<number> {
   const [command, ...rest] = process.argv.slice(2);
   if (command === "-h" || command === "--help" || command === "help") {
@@ -2297,6 +2521,9 @@ async function main(): Promise<number> {
       port: values.port ? Number(values.port) : undefined,
     });
     return 0;
+  }
+  if (command === "github-app") {
+    return await githubAppCommand(rest);
   }
   if (command === "smoke") {
     const { values, positionals } = parseArgs({

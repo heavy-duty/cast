@@ -9,6 +9,7 @@ actually cutting it, and this file starts there.
 
 ### Added
 
+- CI refuses a release PR with no drill record in `drill/RUNS.md`
 - An application can declare HTTP basic auth, and `apply` sets it (#76)
 - `cast github-app create` / `cast github-app register` run the App Manifest
   flow (#7)

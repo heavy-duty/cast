@@ -36,6 +36,20 @@ PR carries as many as apply.
 | `blocker:conflict` | `#B60205` | GitHub says `CONFLICTING` — the agent owes a **rebase** | it merges cleanly |
 | `blocker:ci-red` | `#B60205` | a check failed — the agent owes a **fix**, which a rebase will not provide | checks are green |
 | `blocker:unrequested` | `#E99695` | this head has no verdict from somebody — never reviewed, or staled by a push — and **nobody was asked** for one | reviews are requested |
+| `blocker:drill-pending` | `#E99695` | a `release` PR whose version has **no drill record** in [drill/RUNS.md](drill/RUNS.md) — the ceremony is correct but *unevidenced* | the record (or a recorded maintainer waiver) lands for that version |
+
+`blocker:drill-pending` is the only blocker that says nothing is *wrong* with
+the code. The version bump, the stamp, the re-arm can all be perfect; what is
+missing is the evidence that anyone ran the real-hardware drill against the
+tree about to ship. It clears on a RECORD, not on a pass — a recorded waiver
+clears it too, which is the point: skipping the drill stays possible and stays
+visible. `.github/scripts/drill-recorded.sh` is what turns CI red meanwhile.
+
+**The label does not exist in the repo yet.** Creating a label needs push
+access and the bot account gets a 403, so a maintainer account has to run the
+`gh label create` line below (or the workflow's manual dispatch) once. Until
+then the reconciler cannot apply it, and plain `blocked` stands in — coarser,
+but it keeps an unevidenced release off the merge path, which is the job.
 
 One rule joins the axes: **`state:needs-human` requires zero blockers.** Any
 blocker means the work is the agent's, whatever the review round says.
@@ -144,6 +158,9 @@ gh label create "state:addressing"     --color D93F0B --description "All bots re
 gh label create "blocker:conflict"     --color B60205 --description "Does not merge — the branch conflicts and the agent owes a rebase" --force
 gh label create "blocker:ci-red"       --color B60205 --description "A check is failing — the agent owes a fix (not a rebase)" --force
 gh label create "blocker:unrequested"  --color E99695 --description "Somebody still owes a verdict and nobody was asked for one" --force
+# needs a MAINTAINER account — the bot 403s on label creation, and until this
+# runs the reconciler cannot apply it and `blocked` stands in.
+gh label create "blocker:drill-pending" --color E99695 --description "Release PR with no drill record in drill/RUNS.md — ceremony correct, unevidenced" --force
 # retired — the reconciler strips it; delete it once no PR carries it
 # gh label delete "state:needs-rebase"
 gh label create "state:needs-human"    --color 8250DF --description "No blockers, all bots approve — waiting on the human reviewer" --force

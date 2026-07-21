@@ -69,6 +69,27 @@ jobs:
           CHANGELOG_MONOTONIC_STRICT: "1"
         run: bash .github/scripts/changelog-monotonic.sh "origin/${{ github.base_ref || github.ref_name }}"
 
+      # ...and a release carries its DRILL RECORD. CONTRIBUTING has always
+      # asked for the real-hardware drill; nothing asserted it, so it was
+      # performed exactly as often as a reviewer remembered to ask — which is
+      # never, across every release in the family, until a bot blocked on it.
+      # Here it is a fact about the tree instead of a fact about somebody's
+      # memory.
+      #
+      # No `if:` guard on the event or the label. The script keys off
+      # package.json itself: a `-dev` tree has no ship claim and passes
+      # trivially, a bare version is a release ceremony tree and must have a
+      # record. Gating this step on the `release` label instead would put the
+      # assert behind a hand-applied label — the guard would be absent from
+      # exactly the PR that mislabels itself, and unasserted PRs are how the
+      # drill went missing in the first place.
+      #
+      # It requires a RECORD, not a PASS: a maintainer waiver is legal, and is
+      # itself a section in drill/RUNS.md. Skipping stays possible and stays
+      # visible.
+      - name: a release version has a drill record
+        run: bash .github/scripts/drill-recorded.sh
+
   # The installer, proven by RUNNING it — CAST_INSTALL_SOURCE points it at
   # this checkout, so CI proves the installer under review (the versioned
   # layout, the current symlink, the PATH chain, the uninstall's absence

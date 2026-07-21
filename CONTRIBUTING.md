@@ -108,13 +108,72 @@ on box#83's shape):
      re-armed `## Unreleased`, but a `## X.Y.Z` section for the version you
      are shipping **must exist and extract non-empty** — a bump without a
      stamp is red here rather than after the merge, in release.yml;
-   - the moment step 3's `-dev` bump lands, the top section must be
+   - the moment step 4's `-dev` bump lands, the top section must be
      `## Unreleased` or CI is red.
 
    The empty `## Unreleased` this step adds is deliberately tolerated: what
    must extract non-empty is the section that SHIPS, not the top one. CI
    green on it, same loop as any PR.
-2. **Merge. That's the ship decision — nothing else to do.**
+2. **Drill, and record it.** Before the PR can be handed over, run the full
+   real-hardware drill — two live Coolify instances, the whole A→B promotion:
+   team, apply, an idempotent diff, smoke, inventory, emit-draft, fleet,
+   destroy, and the read-only guard — and record it in
+   [drill/RUNS.md](drill/RUNS.md) under a heading naming the version:
+
+       ## Release drill — X.Y.Z — YYYY-MM-DD
+
+   [.github/scripts/drill-recorded.sh](.github/scripts/drill-recorded.sh)
+   enforces this on every release PR (a `-dev` tree has no ship claim and
+   passes trivially). It is **not a thing a reviewer has to remember** — that
+   is precisely how every release in this family shipped without one until a
+   bot blocked on it.
+
+   So the release flow is: **draft → ready → bot round → drill →
+   `state:needs-human` → maintainer merge (which IS the release).**
+
+   **The drill is ONE orchestrated run over the whole stack**, not three
+   independent exercises. In order:
+
+   1. `rig bootstrap … --host yes` on a bare Debian host — this installs box
+      and runs box's `setup-host`;
+   2. `box new` mints a creds-free seed;
+   3. the seed converges on first boot: its cloud-init curls rig's installer
+      and runs `rig bootstrap <tenant>-box`;
+   4. cast's legs on top of the converged result — two live Coolify
+      instances and the full A→B promotion.
+
+   Note that rig appears **twice**, below box and above it. box and rig are
+   mutually recursive, not linearly ordered: rig builds the host that runs
+   box, and box's seed calls rig back to converge the guest. cast sits on top
+   of whatever that produces. So there is no "previous repo" for a repo to
+   drill against, and **no fixed order in which the three releases must be
+   published.**
+
+   The run drills **candidate refs, not released artifacts**. `RIG_REPO` and
+   `RIG_REF` are mint-time environment variables (default
+   `heavy-duty/rig@main`), so a run pins the exact commits under test. That
+   dissolves the chicken-and-egg the mutual recursion would otherwise create:
+   no repo has to be released before another can be drilled.
+
+   Drilling the candidate **is** drilling the release. A release PR's diff is
+   the version file and `CHANGELOG.md` — nothing executable differs between
+   the tree that was drilled and the tree that ships, so the evidence carries
+   across the ceremony commit.
+
+   One run emits one shared **run ID**. Each repo records ITS OWN legs under
+   its own `## Release drill — X.Y.Z — DATE`, citing that run ID and the
+   other two repos' commit SHAs — which is what lets three separate records
+   be reassembled into the single run they came from. The guard still reads
+   only this repo's file: cast never queries box's or rig's drill log to
+   decide whether cast may ship, because a cross-repo lookup degrades to
+   "pass" the moment it fails to resolve — the unreadable-rollup bug wearing
+   a different hat.
+
+   A maintainer **waiver** is possible — but it must be RECORDED in
+   `drill/RUNS.md` for that version, saying who waived it and what is
+   untested. The guard requires a *record*, not a passing result, so skipping
+   the drill stays possible and stays visible and deliberate.
+3. **Merge. That's the ship decision — nothing else to do.**
    [release.yml](.github/workflows/release.yml) fires on the merged,
    `release`-labeled PR and asserts, in order, each fail-loud and creating
    nothing: the merged version is non-`-dev`; the version *changed in this
@@ -131,7 +190,7 @@ on box#83's shape):
    *Manual fallback and backfill:* push a bare `X.Y.Z` tag on the merge
    commit yourself — the same workflow runs the same asserts, build, and
    publish from the tag.
-3. **The release re-arms main itself**: the same workflow run bumps
+4. **The release re-arms main itself**: the same workflow run bumps
    `package.json` (and `package-lock.json`) to `X.Y.(Z+1)-dev` and pushes
    the commit straight to main — no follow-up PR (it opens one only if
    branch protection refuses the direct push, and says so loudly).

@@ -16,7 +16,8 @@ genuinely cast's.
 1. **Fork and branch.** Contributors work from forks; upstream branches are
    for maintainers. Title the PR conventionally (`feat:`, `fix:`, `docs:`).
 2. **The review panel** (`.github/labels.conf`'s `panel=` line):
-   `claude-bot-andresmgsl`, `codex-bot-andresmgsl`, `grok-bot-andresmgsl` —
+   `claude-bot-andresmgsl`, `codex-bot-andresmgsl`, `grok-bot-andresmgsl`,
+   `kimi-bot-andresmgsl` —
    the required verdicts for a PR are the panel minus its author. The
    maintainer (`danmt`) takes the last word and merges.
 3. **Checks must be green**: `npm run check`, `npm run build`, and

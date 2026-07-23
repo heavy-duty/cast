@@ -5,8 +5,8 @@ Per-release evidence: **one file per version**, named `<version>.md`, where
 `0.2.0.md`, `0.2.0-rc1` in `0.2.0-rc1.md`.
 
 A release PR's version must have its file here, holding at least one
-non-whitespace character, before CI will let it merge
-(`.github/scripts/drill-recorded.sh`, wired into ci.yml).
+non-whitespace character, before CI will let it merge (the
+`heavy-duty/ceremony/actions/drill-recorded` guard, pinned in ci.yml).
 
 ## One file per version, and why the parser went away
 

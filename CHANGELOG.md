@@ -7,6 +7,12 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Changed
+
+- The release flow and labels automation now run heavy-duty/ceremony's shared
+  machinery at 0.1.0; the prebuilt-asset build moves to the release-artifact
+  hook (heavy-duty/ceremony#15)
+
 ## 0.2.0 — 2026-07-21
 
 ### Added

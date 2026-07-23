@@ -14,19 +14,20 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { tmp } from "./helpers/tmp.js";
 
-// The release flow (#96), proven offline. Two surfaces: the changelog-section
-// extraction release.yml publishes (.github/scripts/release-notes.sh), and
-// the installer's three channels — REAL install.sh runs against throwaway
-// roots, with a stub curl on PATH standing in for GitHub and a POISONED npm
-// proving the release channels never build. Nothing here touches the
-// network. (`cast --version` itself is test/version-cli.test.ts's; the
+// What remains CAST'S OWN of the release flow, after the ceremony moved
+// upstream (heavy-duty/ceremony#15): the caller stubs' load-bearing shape,
+// the artifact hook's install contract, the drill doctrine cast's docs must
+// not lose, and the installer's three channels — REAL install.sh runs
+// against throwaway roots, with a stub curl on PATH standing in for GitHub
+// and a POISONED npm proving the release channels never build. Nothing here
+// touches the network. The machinery the old halves of this file drove —
+// notes extraction, arming, monotonicity, the drill gate — is tested
+// upstream in ceremony's test/ and enforced here by the pinned actions in
+// ci.yml. (`cast --version` itself is test/version-cli.test.ts's; the
 // versioned LAYOUT every channel lands in is test/install-sh.test.ts's —
 // here the layout is asserted only where a channel decides what fills it.)
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const NOTES = join(ROOT, ".github/scripts/release-notes.sh");
-const MONOTONIC = join(ROOT, ".github/scripts/changelog-monotonic.sh");
-const DRILL = join(ROOT, ".github/scripts/drill-recorded.sh");
 
 function run(
   cmd: string,
@@ -51,922 +52,93 @@ function run(
   });
 }
 
-// --- release-notes.sh — the extraction release.yml publishes ----------------
-// A fixture changelog carrying every boundary: an Unreleased section that
-// must never leak into a release, adjacent versions, a version that prefixes
-// another (0.7.0 vs 0.7.0-rc1), and a stamped-but-empty section that must
-// refuse.
+// --- the ceremony callers — the stubs' load-bearing shape -------------------
+// The workflow logic lives upstream at the pin; what can still break HERE is
+// the caller: its triggers, its permissions grant, its backend input, and the
+// pins themselves. Fail-closed, same discipline as the old workflow pins.
 
-const FIXTURE = `# Changelog
+describe("the ceremony callers", () => {
+  const RY = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8");
 
-Intro prose that belongs to no section.
-
-## Unreleased
-
-- **Not yet released** — must never appear in a release body.
-
-## 0.7.0 — 2026-07-20
-
-### Added
-
-- **The seven-oh entry** — prose for 0.7.0, and only 0.7.0.
-
-## 0.7.0-rc1 — 2026-07-19
-
-- **The rc entry** — must not ride along with 0.7.0.
-
-## 0.6.0 — 2026-07-18
-
-- **The six-oh entry** — the previous release's prose.
-
-## 0.5.0 — 2026-07-15
-
-`;
-
-describe("release-notes.sh", () => {
-  const work = tmp("cast-relnotes-");
-  const fix = join(work, "CHANGELOG.md");
-  writeFileSync(fix, FIXTURE);
-  const notes = (ver: string, file = fix) => run("bash", [NOTES, ver, file]);
-
-  it("prints the asked-for version's section, subheaders included", async () => {
-    const r = await notes("0.7.0");
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("The seven-oh entry");
-    expect(r.output).toContain("### Added");
+  it("ONE push key, both filters — a second sibling push: silently kills a door", () => {
+    // YAML maps are last-key-wins (grok's round-2 catch on the old
+    // workflow: the tag fallback had stopped triggering).
+    expect(RY.match(/^ {2}push:$/gm)).toHaveLength(1);
+    expect(RY).toContain('tags: ["**"]');
+    expect(RY).toContain("branches: [main]");
+    // The merge door rides push, never pull_request: a fork PR's token is
+    // read-only and permissions: cannot raise it (box#97).
+    expect(RY).not.toContain("pull_request:");
   });
 
-  it("stops at the next section and never prints a header", async () => {
-    const r = await notes("0.7.0");
-    expect(r.output).not.toContain("The rc entry");
-    expect(r.output).not.toContain("six-oh");
-    expect(r.output).not.toMatch(/^## /m);
+  it("the version backend is package-json", () => {
+    expect(RY).toContain("version-source: package-json");
   });
 
-  it("never leaks Unreleased into a release body", async () => {
-    const r = await notes("0.7.0");
-    expect(r.output).not.toContain("Not yet released");
-  });
-
-  it("matches the version WHOLE — 0.7.0-rc1 is its own section", async () => {
-    const r = await notes("0.7.0-rc1");
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("The rc entry");
-    expect(r.output).not.toContain("seven-oh");
-  });
-
-  it("an adjacent older version still resolves", async () => {
-    const r = await notes("0.6.0");
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("six-oh");
-  });
-
-  it("a missing version refuses by name, citing the ritual", async () => {
-    const r = await notes("9.9.9");
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("no section for '9.9.9'");
-    expect(r.output).toContain("#96");
-  });
-
-  it("a stamped-but-EMPTY section refuses", async () => {
-    const r = await notes("0.5.0");
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("no section for '0.5.0'");
-  });
-
-  it("no version argument is a usage error", async () => {
-    const r = await run("bash", [NOTES]);
-    expect(r.code).toBe(2);
-    expect(r.output).toContain("usage:");
-  });
-
-  it("a missing changelog refuses by path", async () => {
-    const r = await notes("1.0.0", join(work, "nope.md"));
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("no such file");
-  });
-
-  // The REAL changelog: the guard against header-format drift. The file has
-  // two legitimate states, and this test used to know only one (#108, found
-  // the day the first release PR turned CI red): BETWEEN releases the top
-  // section is `## Unreleased`; on a `release: X.Y.Z` tree — the ceremony's
-  // own PR stamps that heading into `## X.Y.Z — date` — and on main right
-  // after it, the top section IS the stamped release. Demanding the literal
-  // Unreleased (with an issue number inside it, rotting per release) made
-  // the release PR unshippable by construction, invisible to fork
-  // rehearsals (a tag push runs release.yml, never ci.yml).
-  //
-  // But keying the assert to the TOP section was only ever a stand-in for
-  // "the section release.yml will publish", and the re-arm (#113) breaks the
-  // stand-in: the ceremony PR now leaves a fresh, deliberately EMPTY
-  // `## Unreleased` on top of the section it just stamped, and an empty
-  // section is exactly what release-notes.sh refuses. Asserting the top
-  // section extracts would make the re-armed ceremony tree CI-red — #108's
-  // unshippability by another route, and the re-arm and the guard would
-  // contradict each other. So the assert retargets to the section that
-  // SHIPS, keyed on package.json the same way the arming rule below is
-  // (rig#67 made the identical move):
-  //
-  //   version BARE  — the tree is, or follows, the release of that version.
-  //                   `## <version>` is what release.yml extracts. It must
-  //                   exist and be non-empty. The top section is NOT
-  //                   constrained here; an empty re-armed Unreleased above
-  //                   it is correct.
-  //   version -dev  — nothing ships from this tree, and the top section is
-  //                   `## Unreleased`, legitimately empty between releases.
-  //                   Drift coverage retargets to the most recent STAMPED
-  //                   section, which release.yml did publish. Before the
-  //                   first release there is none, and that is not a fault.
-  it("the real CHANGELOG.md's SHIPPING section extracts (#113)", async () => {
-    const version = realVersion();
-    const changelog = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8");
-    const target = version.endsWith("-dev") ? firstStamped(changelog) : version;
-    if (!target) return; // greenfield -dev: nothing has shipped yet.
-    const r = await notes(target, join(ROOT, "CHANGELOG.md"));
-    expect(r.code).toBe(0);
-    expect(r.output.trim()).not.toBe("");
+  it("every ceremony reference in .github/ names ONE tag", () => {
+    // CONSUMERS.md's same-tag rule: the two workflow callers and each guard
+    // step pin the same ceremony tag — one reference bumped alone leaves
+    // the repo split across ceremony versions.
+    const all = [
+      "workflows/release.yml",
+      "workflows/labels.yml",
+      "workflows/ci.yml",
+    ]
+      .map((f) => readFileSync(join(ROOT, ".github", f), "utf8"))
+      .join("\n");
+    const refs = [...all.matchAll(/heavy-duty\/ceremony\/[^@\s]+@(\S+)/g)].map(
+      (m) => m[1],
+    );
+    expect(refs.length).toBeGreaterThanOrEqual(6); // 2 callers + 4 guards
+    expect(new Set(refs).size).toBe(1);
   });
 });
 
-// --- the changelog is ARMED — the version says which state is legal --------
-// heavy-duty/rig#66. The section above proves the SHIPPING section extracts;
-// it deliberately does not care what the top section is CALLED, and cannot:
-// #108 relaxed exactly that, because the ceremony PR's own tree has a
-// stamped `## X.Y.Z` on top and a literal-Unreleased demand made the
-// release unshippable by construction. So nothing on main notices when
-// `## Unreleased` is simply gone.
-//
-// That gap is not theoretical. A PR that writes its entry under
-// `## Unreleased`, is authored before a release and merged after, has that
-// entry land under whatever heading now occupies the position — the
-// just-shipped `## X.Y.Z`. Git merges it CLEANLY: the stamped heading and
-// the incoming entry never overlap textually, so the one signal an author
-// relies on ("git told me to look") is absent precisely when the outcome is
-// wrong. It happened in rig: #60's entry landed inside published `## 0.1.0`.
-//
-// The rule that separates the two states #108 collapsed, without demanding
-// Unreleased unconditionally: **the package.json version keys it.** A bare
-// `X.Y.Z` means the tree IS (or immediately follows) a release — the
-// ceremony's stamped top section is legal there, and so is a re-armed
-// Unreleased. A `-dev` version means main between releases, where a stamped
-// top section can only mean the re-arm was skipped: `## Unreleased` is
-// mandatory. Green through the whole ceremony; red on a disarmed `-dev`
-// main, which is the state the guard exists to name.
+// --- the artifact hook — the install contract the workflow used to carry ----
+// The asset name `cast-X.Y.Z.tgz` and the staged layout are what the
+// installer's release channels download; they never run npm or tsc, so the
+// build happens ONCE, in the hook, and the asset is the runnable tree.
 
-/** package.json's version — the fact the whole rule is keyed on. */
-function realVersion(): string {
-  return JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"))
-    .version as string;
-}
+describe("release-artifact hook", () => {
+  const HOOK = readFileSync(
+    join(ROOT, ".github/actions/release-artifact/action.yml"),
+    "utf8",
+  );
 
-/** The top `## ` section's token — `Unreleased`, or a stamped version. */
-function topSection(changelog: string): string {
-  const top = changelog.match(/^## (\S+)/m);
-  if (!top) throw new Error("changelog has no ## section at all");
-  return top[1];
-}
-
-/** The newest stamped (non-Unreleased) section's token, or null if none. */
-function firstStamped(changelog: string): string | null {
-  for (const m of changelog.matchAll(/^## (\S+)/gm)) {
-    if (m[1] !== "Unreleased") return m[1];
-  }
-  return null;
-}
-
-/** Does `## <token>` appear as a section heading at all? */
-function hasSection(changelog: string, token: string): boolean {
-  return [...changelog.matchAll(/^## (\S+)/gm)].some((m) => m[1] === token);
-}
-
-/** null = armed. A string = why this (version, changelog) pair is illegal. */
-function disarmedBecause(version: string, changelog: string): string | null {
-  const top = topSection(changelog);
-
-  // Idempotence: re-arming twice leaves two `## Unreleased` headings, and
-  // the section awk extracts is then the EMPTY first one — armed by the
-  // heading test, unpublishable in fact. One heading, always.
-  const unreleased = [...changelog.matchAll(/^## Unreleased\s*$/gm)].length;
-  if (unreleased > 1) {
-    return `the changelog carries ${unreleased} '## Unreleased' headings — the re-arm ran twice. Entries split across them, and the section release-notes.sh extracts is the empty first one.`;
-  }
-
-  if (version.endsWith("-dev")) {
-    return top === "Unreleased"
-      ? null
-      : `version ${version} is a dev tree, so the top section must be '## Unreleased' — found '## ${top}'. The release ceremony stamps Unreleased into the shipped version and must re-add an empty one (heavy-duty/rig#66); without it the next PR's entry lands inside ${top}'s published notes, with no merge conflict to warn anyone.`;
-  }
-
-  if (top !== "Unreleased" && top !== version) {
-    return `version ${version} is bare, so the top section must be '## Unreleased' (re-armed) or the matching '## ${version}' (the ceremony tree) — found '## ${top}'.`;
-  }
-
-  // A bare version is a SHIP claim: release.yml will extract `## <version>`
-  // and publish it. Every legal bare state has that section — the ceremony
-  // tree (stamped on top), the re-armed ceremony tree (stamped under an
-  // empty Unreleased), and main in the post-release window. Its absence is
-  // the half-ceremony: bumped, never stamped. That passed the heading rule
-  // alone and failed only AFTER merge, in release.yml's notes step — past
-  // the ship decision, leaving main with a minted, unreleased bare version
-  // the decide step then refuses on re-runs. Red here, one round earlier.
-  if (!hasSection(changelog, version)) {
-    return `version ${version} is bare — a ship claim — but there is no '## ${version}' section to publish. The ceremony bumped the version without stamping the changelog; release.yml's notes step would refuse AFTER the merge, past the ship decision.`;
-  }
-
-  return null;
-}
-
-describe("the changelog is armed for the next entry (rig#66)", () => {
-  const work = tmp("cast-arming-");
-  const dated = (v: string) => `## ${v} — 2026-07-19`;
-  const body = "\n\n- **An entry** — prose.\n";
-  const armed = `# Changelog\n\n## Unreleased${body}\n${dated("0.2.0")}${body}`;
-  const stamped = `# Changelog\n\n${dated("0.2.0")}${body}`;
-  // The tree CONTRIBUTING step 1 actually mandates: the stamped section with
-  // a fresh, EMPTY `## Unreleased` above it. The `armed` fixture gives
-  // Unreleased a body and so never exercises this one.
-  const rearmed = `# Changelog\n\n## Unreleased\n\n${dated("0.2.0")}${body}`;
-
-  /** Run the REAL release-notes.sh against a fixture changelog. */
-  const extract = (name: string, changelog: string, ver: string) => {
-    const file = join(work, `${name}.md`);
-    writeFileSync(file, changelog);
-    return run("bash", [NOTES, ver, file]);
-  };
-
-  it("the REAL tree is armed — package.json and CHANGELOG.md agree", () => {
-    const changelog = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8");
-    expect(disarmedBecause(realVersion(), changelog)).toBeNull();
+  it("builds the prod-only tree once and stages the runnable layout", () => {
+    expect(HOOK).toContain("npm ci");
+    expect(HOOK).toContain("npm run build");
+    expect(HOOK).toContain("npm prune --omit=dev");
+    expect(HOOK).toContain("cp -R bin dist node_modules package.json");
   });
 
-  // The ceremony, walked end to end. Every state green — this is the #108
-  // regression the guard must not re-introduce.
-  it("stays green through the ceremony: the release PR's own stamped tree", () => {
-    expect(disarmedBecause("0.2.0", stamped)).toBeNull();
+  it("drops cast-<version>.tgz into $RELEASE_ASSETS_DIR — the channels' exact download name", () => {
+    expect(HOOK).toContain('"$RELEASE_ASSETS_DIR/cast-$VERSION.tgz"');
+    expect(HOOK).toContain('"$RUNNER_TEMP/stage/cast-$VERSION"');
   });
 
-  it("stays green through the ceremony: the ceremony PR that re-arms too", () => {
-    expect(disarmedBecause("0.2.0", armed)).toBeNull();
+  it("runs no tests — ci.yml gated the merge commit already, and the suite needs age", () => {
+    expect(HOOK).not.toContain("npm test");
+    expect(HOOK).not.toContain("npm run check");
   });
 
-  // The state the whole re-arm turns on, and the one this guard is most at
-  // risk of contradicting: CONTRIBUTING's mandated tree, whose top section is
-  // an EMPTY `## Unreleased`. Asserted end to end — the arming rule passes it
-  // AND the exact tool release.yml runs extracts the section that ships. An
-  // assert aimed at the TOP section here is #108's unshippability again
-  // (rig#67 retargeted the same assert for the same reason).
-  it("the MANDATED ceremony tree — empty Unreleased over the stamp — is green end to end", async () => {
-    expect(disarmedBecause("0.2.0", rearmed)).toBeNull();
-    const r = await extract("rearmed", rearmed, "0.2.0");
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("An entry");
-    // And the empty top section is untouchable by release.yml, as intended.
-    const top = await extract("rearmed", rearmed, "Unreleased");
-    expect(top.code).toBe(1);
-  });
-
-  it("stays green through the ceremony: main in the post-release window", () => {
-    // Merged, tagged, published — the -dev bump has not landed yet.
-    expect(disarmedBecause("0.2.0", stamped)).toBeNull();
-  });
-
-  it("stays green through the ceremony: main after the -dev bump, re-armed", () => {
-    expect(disarmedBecause("0.2.1-dev", armed)).toBeNull();
-  });
-
-  // And red on the one state the extraction guard cannot see.
-  it("goes RED on a disarmed -dev main — the rig#66 failure, exactly", () => {
-    const why = disarmedBecause("0.2.1-dev", stamped);
-    expect(why).toContain("must be '## Unreleased'");
-    expect(why).toContain("rig#66");
-  });
-
-  it("goes RED when a bare version's stamp names a different release", () => {
-    // A hand-stamp that drifted from the bump it shipped with.
-    expect(
-      disarmedBecause("0.2.0", `# Changelog\n\n${dated("0.1.9")}${body}`),
-    ).toContain("the ceremony tree");
-  });
-
-  // The half-ceremony: bumped, never stamped. Green under the heading rule
-  // alone — the top IS `## Unreleased`, re-armed and populated — and it fails
-  // only after the merge, in release.yml's notes step, past the ship
-  // decision. Asserted against the real tool so the post-merge failure this
-  // pre-empts is the actual one, not a paraphrase of it.
-  it("goes RED on the half-ceremony: bumped bare, changelog never stamped", async () => {
-    const half = `# Changelog\n\n## Unreleased${body}`;
-    const why = disarmedBecause("0.2.0", half);
-    expect(why).toContain("no '## 0.2.0' section");
-    // Exactly what release.yml would have done instead, after the merge.
-    const r = await extract("half", half, "0.2.0");
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("no section for '0.2.0'");
-  });
-
-  // Idempotence: re-arming an already-armed file is silently wrong, because
-  // the section awk extracts is then the empty first heading.
-  it("goes RED on a double re-arm — two Unreleased headings", () => {
-    const twice = `# Changelog\n\n## Unreleased\n\n## Unreleased${body}\n${dated("0.2.0")}${body}`;
-    expect(disarmedBecause("0.2.1-dev", twice)).toContain(
-      "2 '## Unreleased' headings",
-    );
-  });
-
-  it("refuses a changelog with no sections at all rather than passing it", () => {
-    expect(() => disarmedBecause("0.2.1-dev", "# Changelog\n")).toThrow(
-      "no ## section",
-    );
+  it("owns its toolchain — setup-node moved INTO the hook; the shared workflow is node-free", () => {
+    expect(HOOK).toContain("actions/setup-node");
   });
 });
 
-// --- no SHIPPED release heading was deleted (#133) --------------------------
-// The arming block above guards ONE heading — the top one, the one a PR is
-// about to write under — and is keyed on a single tree. This guards the REST
-// of the file, which no single tree can be asked about: "a heading
-// disappeared" is not a property of a tree, it is a property of a DIFF. So the
-// fixtures here are real throwaway git repos with a base branch and a PR
-// branch, and the assertions drive the REAL script the CI step runs, the same
-// way the block above drives the real release-notes.sh.
-//
-// Two halves, and they catch different shapes. CONTAINMENT catches a DELETED
-// heading (base's set must be a subset of HEAD's). It cannot catch a
-// DUPLICATED one — a duplicate is head-side SURPLUS, and base-minus-head is
-// blind to extras on the head side — so UNIQUENESS on HEAD is asserted
-// alongside it. The duplicate half matters more in cast than in box:
-// release-notes.sh has no `exit`, so `grab` re-arms on every matching '## '
-// line and two copies of a version heading make the published body ABSORB
-// whatever sits between them.
+// --- the drill doctrine, in cast's own docs ---------------------------------
+// The drill-recorded GATE is ceremony's (actions/drill-recorded, tested
+// upstream); the MEANING is cast's. The three drills are INDEPENDENT — any
+// order, any schedule, separate sittings — because each pins the same fixed
+// candidate refs: static identifiers that exist as soon as the release
+// branches do, which is what dissolves the box<->rig recursion. The docs
+// must not re-acquire an ordering rule between repos.
 
-describe("changelog-monotonic.sh — release headings are append-only (#133)", () => {
-  const dated = (v: string) => `## ${v} — 2026-07-19`;
-  const body = "\n\n- **An entry** — prose.\n";
-  /** The base branch's changelog: two shipped releases under an Unreleased. */
-  const BASE = `# Changelog\n\n## Unreleased\n\n${dated("0.1.1")}${body}\n${dated("0.1.0")}${body}`;
-
-  const git = (repo: string, ...args: string[]) =>
-    execFileSync("git", args, { cwd: repo, encoding: "utf8" });
-
-  /**
-   * A throwaway repo with `base` carrying BASE, checked out on a PR branch
-   * whose CHANGELOG.md is `head` (unchanged when omitted).
-   */
-  function repoWith(head?: string): string {
-    const repo = tmp("cast-monotonic-");
-    git(repo, "init", "-q");
-    git(repo, "config", "user.email", "test@example.com");
-    git(repo, "config", "user.name", "test");
-    git(repo, "checkout", "-q", "-b", "base");
-    writeFileSync(join(repo, "CHANGELOG.md"), BASE);
-    git(repo, "add", "CHANGELOG.md");
-    git(repo, "commit", "-qm", "base");
-    git(repo, "checkout", "-q", "-b", "pr");
-    if (head !== undefined) {
-      writeFileSync(join(repo, "CHANGELOG.md"), head);
-      git(repo, "add", "CHANGELOG.md");
-      git(repo, "commit", "-qm", "the PR");
-    }
-    return repo;
-  }
-
-  const check = (
-    repo: string,
-    env: Record<string, string> = {},
-    base = "base",
-  ) => run("bash", [MONOTONIC, base], env, repo);
-
-  it("a branch that touches nothing passes, and says how many headings it checked", async () => {
-    // A branch that touches nothing has HEAD as its own merge base, which is
-    // now the VACUOUS-containment path (#133), so the count this asserts moved
-    // to uniqueness's — which serves the stated intent better anyway: it says
-    // the parser read the file and found real headings in it, rather than that
-    // a comparison of the file against itself came out equal.
-    const r = await check(repoWith());
-    expect(r.code).toBe(0);
-    expect(r.output).toContain(
-      "uniqueness on HEAD checked 2 release heading(s)",
-    );
-  });
-
-  // --- the push-to-main shape: containment vacuous, uniqueness real --------
-  // With the pull_request gate gone (#133), merge_base == HEAD is a ROUTINE
-  // path, not a degradation. Containment compares the file against itself and
-  // asserts nothing, so a line reading "all N still present" would claim a
-  // check that did no work — the same dishonesty the skip messages were fixed
-  // for. The success line therefore has two forms, and these pin which one
-  // each event shape gets, including that they do not collapse into one.
-
-  it("HEAD as its own base reports containment VACUOUS, not verified", async () => {
-    const r = await check(repoWith(), {}, "HEAD");
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("containment vacuous");
-  });
-
-  it("...and names uniqueness as the half that actually ran", async () => {
-    const r = await check(repoWith(), {}, "HEAD");
-    expect(r.output).toContain("uniqueness on HEAD checked");
-  });
-
-  it("...and does NOT claim the headings were still present", async () => {
-    const r = await check(repoWith(), {}, "HEAD");
-    expect(r.output).not.toContain("are still present");
-  });
-
-  it("...while a REAL base still reports containment, naming the count", async () => {
-    // The PR shape. The two wordings must not collapse into one.
-    const good = BASE.replace(
-      "## Unreleased\n",
-      "## Unreleased\n\n### Fixed\n\n- **A new entry**\n",
-    );
-    const r = await check(repoWith(good));
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("all 2 release heading(s)");
-    expect(r.output).toContain("are still present");
-    expect(r.output).not.toContain("containment vacuous");
-  });
-
-  it("adding an entry the CORRECT way — above the heading, never over it — passes", async () => {
-    const good = BASE.replace(
-      "## Unreleased\n",
-      "## Unreleased\n\n### Fixed\n\n- **A new entry**\n",
-    );
-    const r = await check(repoWith(good));
-    expect(r.code).toBe(0);
-  });
-
-  it("goes RED when an entry REPLACED the shipped heading below it — the #133 failure, exactly", async () => {
-    // The one-line edit git merges cleanly and nothing else notices: the
-    // author typed over `## 0.1.1 — …` instead of inserting above it.
-    const clobbered = BASE.replace(
-      `${dated("0.1.1")}`,
-      "## Unreleased\n\n### Fixed\n\n- **An entry**",
-    );
-    const r = await check(repoWith(clobbered));
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("DELETES release heading(s)");
-    expect(r.output).toContain("## 0.1.1");
-    expect(r.output).toContain("APPEND-ONLY");
-    // 0.1.0, untouched, must not be accused.
-    expect(r.output).not.toContain("    ## 0.1.0");
-  });
-
-  it("goes RED on a DUPLICATED version heading — the case containment cannot see", async () => {
-    // Head-side surplus: base {0.1.0, 0.1.1} minus head is still empty, so
-    // only the uniqueness half catches this. It is also the case the arming
-    // rule's "double re-arm" test does NOT cover — that one counts duplicate
-    // '## Unreleased' headings, not duplicate VERSION headings, and it is the
-    // version ones that reach release-notes.sh.
-    const twice = BASE.replace(
-      `${dated("0.1.1")}${body}`,
-      `${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`,
-    );
-    const r = await check(repoWith(twice));
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("DUPLICATE release heading(s)");
-    expect(r.output).toContain("## 0.1.1");
-    expect(r.output).toContain("absorbs");
-  });
-
-  it("the duplicate half survives the entry sitting BETWEEN the copies — the absorbing shape", async () => {
-    // What release-notes.sh would publish for 0.1.1 if this landed: its own
-    // prose, the stranded entry, AND the second copy's prose. Asserted with
-    // the real extractor, so the consequence is the actual one.
-    const absorbing = BASE.replace(
-      `${dated("0.1.1")}${body}`,
-      `${dated("0.1.1")}${body}\n- **A stranded entry**\n\n${dated("0.1.1")}${body}`,
-    );
-    const repo = repoWith(absorbing);
-    const r = await check(repo);
-    expect(r.code).toBe(1);
-    const notes = await run("bash", [
-      NOTES,
-      "0.1.1",
-      join(repo, "CHANGELOG.md"),
-    ]);
-    expect(notes.output).toContain("A stranded entry");
-  });
-
-  it("'## Unreleased' is NOT in the guarded set — the ceremony legitimately consumes it", async () => {
-    // The release stamp: Unreleased becomes 0.2.0. That ADDS a version
-    // heading and removes none, and the Unreleased that disappeared is not a
-    // version heading at all. The arming rule owns that one.
-    const stamped = `${BASE.replace("## Unreleased\n", `${dated("0.2.0")}${body}\n`)}`;
-    const r = await check(repoWith(stamped));
-    expect(r.code).toBe(0);
-    // And deleting Unreleased outright — a disarmed tree, red under the
-    // arming rule — is still not this guard's business.
-    const disarmed = BASE.replace("## Unreleased\n\n", "");
-    expect((await check(repoWith(disarmed))).code).toBe(0);
-  });
-
-  /**
-   * A repo whose `base` has NO changelog at all — the PR INTRODUCES the file.
-   * The merge-base blob is absent, which is the degradation path that used to
-   * `exit 0` before uniqueness had run (#133, box#143).
-   */
-  function repoIntroducing(head: string): string {
-    const repo = tmp("cast-monotonic-new-");
-    git(repo, "init", "-q");
-    git(repo, "config", "user.email", "test@example.com");
-    git(repo, "config", "user.name", "test");
-    git(repo, "checkout", "-q", "-b", "base");
-    writeFileSync(join(repo, "README.md"), "# hi\n");
-    git(repo, "add", "README.md");
-    git(repo, "commit", "-qm", "base");
-    git(repo, "checkout", "-q", "-b", "pr");
-    writeFileSync(join(repo, "CHANGELOG.md"), head);
-    git(repo, "add", "CHANGELOG.md");
-    git(repo, "commit", "-qm", "add the changelog");
-    return repo;
-  }
-
-  it("a changelog absent at the merge base is nothing-to-have-deleted, not a failure", async () => {
-    const r = await check(repoIntroducing(BASE));
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("does not exist at the merge base");
-  });
-
-  // --- #133: uniqueness is a property of HEAD, so nothing base-side may gate
-  // it. Containment needs the merge base; uniqueness needs only the file in
-  // front of it. Before this fix the duplicate check sat DOWNSTREAM of the
-  // base-ref, merge-base and base-blob conditions, so each of the degradation
-  // paths below exited 0 on a tree carrying a duplicate in plain sight — the
-  // base-blob one not even via skip(), but a bare `exit 0` that STRICT could
-  // not reach. These cases pin the ORDER, which is the actual invariant;
-  // asserting the exit code alone is what let the original ship (the
-  // base-absent case above was green before and after).
-  //
-  // The inversion mattered most here: cast's release-notes.sh re-arms `grab`
-  // on every '## ' line, so duplication is the half with a LIVE extraction bug
-  // behind it — and it was the half with the most ways to silently not run.
-
-  it("a duplicate introduced where the base had NO changelog is caught (#133)", async () => {
-    const dup = `# Changelog\n\n## Unreleased\n\n${dated("0.1.1")}${body}\n- **A stranded entry**\n\n${dated("0.1.1")}${body}`;
-    const r = await check(repoIntroducing(dup));
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("DUPLICATE release heading(s)");
-    expect(r.output).toContain("## 0.1.1");
-    // The old message must NOT be what this tree gets.
-    expect(r.output).not.toContain("nothing could have been deleted");
-  });
-
-  it("...and STRICT does not change that — it was never a skip", async () => {
-    const dup = `# Changelog\n\n## Unreleased\n\n${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`;
-    const r = await check(repoIntroducing(dup), {
-      CHANGELOG_MONOTONIC_STRICT: "1",
-    });
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("DUPLICATE release heading(s)");
-  });
-
-  it("...while a CLEAN introduced changelog still passes, SAYING uniqueness ran", async () => {
-    const r = await check(repoIntroducing(BASE));
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("nothing could have been deleted");
-    expect(r.output).toContain("uniqueness on HEAD already passed");
-  });
-
-  it("a duplicate OUTSIDE a git work tree is caught (#133)", async () => {
-    // No git at all — a tarball, an unpacked release. Uniqueness still has
-    // everything it needs; only containment does not.
-    const dir = tmp("cast-monotonic-nogit-");
-    writeFileSync(
-      join(dir, "CHANGELOG.md"),
-      `# Changelog\n\n${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`,
-    );
-    const r = await run("bash", [MONOTONIC, "base"], {}, dir);
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("DUPLICATE release heading(s)");
-  });
-
-  it("a duplicate is caught even when the base ref will not resolve (#133)", async () => {
-    const twice = BASE.replace(
-      `${dated("0.1.1")}${body}`,
-      `${dated("0.1.1")}${body}\n${dated("0.1.1")}${body}`,
-    );
-    const r = await check(repoWith(twice), {}, "origin/no-such-branch");
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("DUPLICATE release heading(s)");
-    expect(r.output).not.toContain("containment SKIPPED");
-  });
-
-  it("a missing changelog refuses by path — never a silent pass", async () => {
-    const r = await run("bash", [MONOTONIC, "base", "nope.md"], {}, repoWith());
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("no such file");
-  });
-
-  // The fail-closed switch, both directions. A guard that can quietly stop
-  // guarding is the failure shape this whole family of checks refuses, so the
-  // degradation that is sensible locally must be RED in CI.
-  it("an unresolvable base ref SKIPS CONTAINMENT locally — not everything (#133)", async () => {
-    const r = await check(repoWith(), {}, "origin/no-such-branch");
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("containment SKIPPED");
-    // ...and it must not claim nothing was checked: uniqueness already ran.
-    expect(r.output).toContain("already ran and passed");
-    expect(r.output).not.toContain("Nothing was checked");
-  });
-
-  it("...and the SAME condition is a hard FAILURE under STRICT=1, naming fetch-depth", async () => {
-    const r = await check(
-      repoWith(),
-      { CHANGELOG_MONOTONIC_STRICT: "1" },
-      "origin/no-such-branch",
-    );
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("CHANGELOG_MONOTONIC_STRICT=1");
-    expect(r.output).toContain("fetch-depth: 0");
-    expect(r.output).not.toContain("SKIPPED");
-    // Even here the message must scope itself to containment (#133).
-    expect(r.output).toContain("it is containment that cannot run");
-  });
-
-  // The wiring, pinned the same way release.yml's is — the script existing is
-  // no use if CI stops running it, and every clause here is load-bearing.
-  it("ci.yml runs it on EVERY event, STRICT, against the base ref, with full history", () => {
-    const CI = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
-    expect(CI).toContain(".github/scripts/changelog-monotonic.sh");
-    // #133: NOT pull-request-only. Deletion is vacuous on a push to main, but
-    // duplication is vacuous on no tree — gating the whole script left a
-    // duplicate that reached main by any other route unasserted forever.
-    //
-    // Scoped to the step's OWN block, deliberately. As a file-wide negative it
-    // would forbid any FUTURE step in ci.yml from being pull_request-gated and
-    // would fail citing #133 when one legitimately is — #133 constrains this
-    // step, not the file. The companion assert below keeps the extractor from
-    // silently matching nothing and turning the negative into a tautology.
-    // Bounded by the next STEP *or* the next JOB. The job boundary is not
-    // optional: the monotonic step is the LAST step of its job, so splitting on
-    // steps alone runs the block into the job below and swallows that job's
-    // level `if:` — reintroducing the bug this scoping fixed, moved from "any
-    // step in the file" to "this step plus the head of the next job".
-    const ciLines = CI.split("\n");
-    const monoStart = ciLines.findIndex((l) =>
-      /^ {6}- name: no shipped changelog heading/.test(l),
-    );
-    const after = ciLines.slice(monoStart + 1);
-    const monoEnd = after.findIndex(
-      (l) => /^ {6}- /.test(l) || /^ {2}\S/.test(l),
-    );
-    const monoBlock =
-      monoStart < 0
-        ? undefined
-        : [
-            ciLines[monoStart],
-            ...after.slice(0, monoEnd < 0 ? after.length : monoEnd),
-          ].join("\n");
-    expect(monoBlock).toBeDefined();
-    expect(monoBlock).toContain("changelog-monotonic.sh");
-    // Anchored: an `if:` inside a `run:` line is not a step condition.
-    expect(monoBlock).not.toMatch(/^ {8}if:/m);
-    // ...and dropping that gate is only safe WITH the fallback: on a push
-    // `github.base_ref` is empty, a bare `origin/` does not resolve, and
-    // STRICT promotes that to a hard failure on every push to main.
-    expect(CI).toContain('"origin/${{ github.base_ref || github.ref_name }}"');
-    expect(CI).toContain("CHANGELOG_MONOTONIC_STRICT");
-    // ...which is only reachable because the checkout has the base history.
-    expect(CI).toContain("fetch-depth: 0");
-  });
-});
-
-// --- a release carries its DRILL RECORD -------------------------------------
-// CONTRIBUTING has always asked for the full real-hardware drill on a release
-// PR; nothing asserted it, so no release in the family ever carried one. The
-// gate moves the requirement out of a reviewer's memory and into the tree.
-//
-// What it asserts is that a RECORD EXISTS, never that the drill passed — a
-// maintainer waiver is legal and is itself the content of drills/<ver>.md.
-// That is the point: skipping stays possible and stays a deliberate,
-// reviewable commit. So the cases below are all about presence and emptiness;
-// none of them inspect a result.
-//
-// ONE FILE PER VERSION. The earlier design kept every record in one
-// drill/RUNS.md, so the guard parsed headings — and the heading grammar was
-// where both of this feature's review defects lived (a whitespace bypass, and
-// drift from box's stricter form). `0.2.0.md` and `0.2.0-rc1.md` are simply
-// different files, so the whole-version rule is now the filesystem's rather
-// than a comparison that can be got wrong, and the tests that existed only to
-// pin heading syntax (including the stray-tail case) are gone with it.
-//
-// Every fixture carries its OWN package.json and its OWN drills dir inside a
-// temp tree. Pointing the guard at the repo's real package.json would make
-// these cases change meaning on every version bump — green or red depending
-// on where the ceremony happens to be standing, the opposite of a fixture.
-
-describe("drill-recorded.sh — a release version has a drill record", () => {
-  const work = tmp("cast-drill-");
-
-  /**
-   * A fixture tree: its own package.json, plus an optional `drills/` dir.
-   *
-   * @param records omit for NO drills dir at all; pass a map of
-   *   `<version>.md` -> contents (possibly empty) to create the dir.
-   */
-  function treeWith(
-    name: string,
-    version: string,
-    records?: Record<string, string>,
-  ): string {
-    const dir = join(work, name);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      join(dir, "package.json"),
-      `${JSON.stringify({ name: "cast", version }, null, 2)}\n`,
-    );
-    if (records !== undefined) {
-      mkdirSync(join(dir, "drills"), { recursive: true });
-      for (const [file, body] of Object.entries(records)) {
-        writeFileSync(join(dir, "drills", file), body);
-      }
-    }
-    return dir;
-  }
-
-  const check = (dir: string) =>
-    run("bash", [DRILL, "drills", "package.json"], {}, dir);
-
-  const legs =
-    "# Release drill\n\nInstances: A and B, live. All legs pass: team, apply,\ndiff, smoke, inventory, emit-draft, fleet, destroy, read-only guard.\n";
-
-  it("a -dev tree passes with no drills dir at all — nothing ships from it", async () => {
-    const r = await check(treeWith("dev", "0.1.2-dev"));
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("development tree");
-  });
-
-  it("a bare version with a matching, non-empty record passes", async () => {
-    const r = await check(treeWith("ok", "0.2.0", { "0.2.0.md": legs }));
-    expect(r.code).toBe(0);
-    expect(r.output).toContain("0.2.0");
-  });
-
-  it("a bare version with NO drills dir fails, naming the version", async () => {
-    const r = await check(treeWith("nodir", "0.2.0"));
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("version 0.2.0 is a release");
-    expect(r.output).toContain("drills/0.2.0.md");
-  });
-
-  it("a drills dir with no file for THIS version fails", async () => {
-    const r = await check(
-      treeWith("othersonly", "0.2.0", { "0.1.0.md": legs, "README.md": legs }),
-    );
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("drills/0.2.0.md");
-  });
-
-  // A file that exists but says nothing is ceremony without evidence — the
-  // exact shape a hurried release produces, and the one an `[ -f ]` check
-  // would wave through. release-notes.sh refuses an empty section likewise.
-  it("a present-but-EMPTY record fails — a filename is not a record", async () => {
-    const r = await check(treeWith("empty", "0.2.0", { "0.2.0.md": "" }));
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("drills/0.2.0.md");
-  });
-
-  // ...and whitespace is not evidence either. This is the one surviving piece
-  // of the heading-parser era: the first cut extracted with `sed '/./,$!d'`,
-  // where `.` matches a space, so a heading followed by one tab passed the
-  // gate — while the comment above the extractor claimed the opposite. An
-  // evidence-free release for the price of an invisible character, on the one
-  // check whose whole job is to demand evidence. Found independently by all
-  // three reviewers on #138. The file layout changed; this rule did not.
-  it("a record of only spaces, tabs and newlines fails (#138)", async () => {
-    const r = await check(
-      treeWith("blank", "0.2.0", { "0.2.0.md": "   \n\t\n \n" }),
-    );
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("drills/0.2.0.md");
-  });
-
-  // The version is matched WHOLE, both directions — but now by the FILESYSTEM
-  // rather than by a comparison. A release candidate's drill is not the
-  // release's drill: different tree, different build, and under the old
-  // heading parser a prefix match would have silently accepted it.
-  it("0.2.0-rc1's record does NOT satisfy 0.2.0", async () => {
-    const r = await check(
-      treeWith("rc-for-bare", "0.2.0", { "0.2.0-rc1.md": legs }),
-    );
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("drills/0.2.0.md");
-  });
-
-  it("...and 0.2.0's record does NOT satisfy 0.2.0-rc1", async () => {
-    const r = await check(
-      treeWith("bare-for-rc", "0.2.0-rc1", { "0.2.0.md": legs }),
-    );
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("drills/0.2.0-rc1.md");
-  });
-
-  it("...while each still matches its own record", async () => {
-    const both = { "0.2.0.md": legs, "0.2.0-rc1.md": legs };
-    expect((await check(treeWith("both-a", "0.2.0", both))).code).toBe(0);
-    expect((await check(treeWith("both-b", "0.2.0-rc1", both))).code).toBe(0);
-  });
-
-  // The message is the whole user interface of a blocking guard. A failure
-  // that names the problem without naming the way out gets bypassed rather
-  // than satisfied — including the waiver, which must be visibly ALLOWED or
-  // somebody will route around the gate instead of recording one.
-  it("the failure names the unblock: run the drill, or record a waiver", async () => {
-    const r = await check(treeWith("unblock", "0.2.0", {}));
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("drills/0.2.0.md");
-    expect(r.output).toContain("run the drill and record it");
-    expect(r.output).toContain("WAIVER");
-    expect(r.output).toContain("RECORD, not a");
-  });
-
-  it("a missing version file refuses by path", async () => {
-    const r = await run("bash", [DRILL, "drills", "nope.json"], {}, work);
-    expect(r.code).toBe(1);
-    expect(r.output).toContain("no such file");
-  });
-
-  it("too many arguments is a usage error", async () => {
-    const r = await run("bash", [DRILL, "a", "b", "c"], {}, work);
-    expect(r.code).toBe(2);
-    expect(r.output).toContain("usage:");
-  });
-
-  // The REAL tree, run with the REAL defaults. The property is that the
-  // guard's VERDICT IS CORRECT FOR THIS TREE — not that it always passes.
-  //
-  // The previous wording here claimed "whatever state the ceremony is in, this
-  // repo must satisfy its own gate", and that is exactly wrong: a ceremony tree
-  // CANNOT satisfy the gate until a human has run the drill and written the
-  // record, which is the entire point of the gate. Demanding exit 0 made this
-  // suite un-greenable on every release branch before its drill, and surfaced
-  // as a `build` failure rather than as the gate doing its job — the same
-  // misattribution shape as box#146. Caught when box#148 went red for the
-  // wrong-looking reason.
-  it("the guard's verdict on the real tree matches the tree's own state", async () => {
-    const version = realVersion();
-    const r = await run("bash", [DRILL], {}, ROOT);
-
-    if (version.endsWith("-dev")) {
-      // Vacuous: nothing ships from a development tree.
-      expect(r.code).toBe(0);
-      expect(r.output).toContain("development tree");
-      return;
-    }
-
-    // A ceremony tree: green only once its record exists.
-    const recorded =
-      existsSync(join(ROOT, "drills", `${version}.md`)) &&
-      readFileSync(join(ROOT, "drills", `${version}.md`), "utf8").trim() !== "";
-    expect(r.code).toBe(recorded ? 0 : 1);
-    if (!recorded) expect(r.output).toContain("no drill record");
-  });
-
-  it("drills/README.md documents the naming rule and the waiver", () => {
+describe("drills/README.md — the independent, ref-pinned drills", () => {
+  it("documents the record files and the INDEPENDENT, ref-pinned drills", () => {
     const doc = readFileSync(join(ROOT, "drills/README.md"), "utf8");
-    expect(doc).toContain("<version>.md");
-    // The placeholder example version can never collide with a real release:
-    // under any scheme, a realistic version in the docs is a real record.
-    expect(doc).toContain("drills/9.9.9.md");
-    // Per-repo by construction: cast records cast's legs and never reads
-    // another repo's record to decide whether cast may ship.
-    expect(doc).toMatch(/waiver/i);
-    expect(doc).toMatch(/failed drill is still a valid record/i);
-  });
-
-  it("the old single-file log is gone — records are per version", () => {
-    expect(existsSync(join(ROOT, "drill/RUNS.md"))).toBe(false);
-  });
-
-  it("ci.yml runs it, ungated by event or label", () => {
-    const CI = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
-    expect(CI).toContain(".github/scripts/drill-recorded.sh");
-    // Scoped to the step's own block (the monotonic assert above explains the
-    // bounding): an `if:` here would put the guard behind a hand-applied
-    // label, absent from exactly the PR that mislabels itself.
-    const lines = CI.split("\n");
-    const start = lines.findIndex((l) =>
-      /^ {6}- name: a release version has a drill record/.test(l),
-    );
-    expect(start).toBeGreaterThanOrEqual(0);
-    const after = lines.slice(start + 1);
-    const end = after.findIndex((l) => /^ {6}- /.test(l) || /^ {2}\S/.test(l));
-    const block = [
-      lines[start],
-      ...after.slice(0, end < 0 ? after.length : end),
-    ].join("\n");
-    expect(block).toContain("drill-recorded.sh");
-    expect(block).not.toMatch(/^ {8}if:/m);
-  });
-
-  // The three drills are INDEPENDENT — any order, any schedule, separate
-  // sittings. What makes that safe is that each pins the same fixed candidate
-  // refs, so every drill exercises the combination that will ship. That
-  // pinning, not sequencing, is what dissolves the box<->rig recursion: the
-  // refs are static identifiers that exist as soon as the release branches
-  // do. The docs must not re-acquire an ordering rule between repos.
-  it("CONTRIBUTING documents the gate and the INDEPENDENT, ref-pinned drills", () => {
-    const doc = readFileSync(join(ROOT, "CONTRIBUTING.md"), "utf8");
-    expect(doc).toContain("drills/X.Y.Z.md");
-    expect(doc).toContain("drill-recorded.sh");
+    expect(doc).toContain("`<version>.md`");
     expect(doc).toMatch(/drills are independent/i);
     expect(doc).toMatch(/any order/i);
     expect(doc).toMatch(/pins the same fixed set of\s+candidate\s+refs/i);
@@ -976,137 +148,13 @@ describe("drill-recorded.sh — a release version has a drill record", () => {
     expect(doc).toMatch(/mutually recursive/);
     expect(doc).toContain("RIG_REF");
     expect(doc).toMatch(/candidate refs, not released artifacts/);
-    expect(doc).toMatch(/no fixed order|not.*published in a fixed order/i);
+    expect(doc).toMatch(/no fixed order/i);
     // Each repo drills a different thing — which is WHY records are per-repo.
     expect(doc).toMatch(/isolation\s+contract/i);
     expect(doc).toMatch(/convergence/i);
     expect(doc).toMatch(/promotion/i);
     // Separate records, one pinned set: each cites the shared run ID.
     expect(doc).toMatch(/run ID/i);
-  });
-});
-
-// --- release.yml — the wiring, pinned --------------------------------------
-// The workflow itself only runs on a tag push upstream, so its load-bearing
-// pieces are pinned here, fail-closed (the house discipline: the labels
-// harness greps its workflow the same way).
-
-describe("release.yml", () => {
-  const RY = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8");
-
-  it("triggers on EVERY tag — the manual fallback survives, and a mismatch must fail loudly, not be pattern-skipped", () => {
-    expect(RY).toContain('tags: ["**"]');
-  });
-
-  it("the merge door rides pushes to main — fork PR tokens are read-only (#111 r1)", () => {
-    // A pull_request run from a public fork gets a read-only GITHUB_TOKEN
-    // (permissions: cannot raise it), and every ceremony PR this org merges
-    // is cross-repo from the bot fork — the tag create would 403 after
-    // green asserts. The door triggers on push to main; the doors split on
-    // the pushed ref; the release label — still the operator's declared
-    // intent — is read via the API off the merge commit's PR, and a
-    // transition with no labeled PR behind it refuses.
-    expect(RY).toContain("branches: [main]");
-    // YAML maps are last-key-wins: a second sibling push: key silently
-    // replaces the first and kills a door (grok's round-2 catch — the tag
-    // fallback had stopped triggering). Exactly ONE push key may exist.
-    expect(RY.match(/^ {2}push:$/gm)).toHaveLength(1);
-    expect(RY).toContain("startsWith(github.ref, 'refs/tags/')");
-    expect(RY).toContain("github.ref == 'refs/heads/main'");
-    expect(RY).toContain("commits/$GITHUB_SHA/pulls");
-    expect(RY).toContain("no merged, release-labeled PR is behind this commit");
-    expect(RY).not.toContain("pull_request:");
-  });
-
-  it("the release re-arms main itself — the -dev bump folds into the release act", () => {
-    // Operator decision (#111 followup): the post-release bump PR was
-    // ceremony debris. Direct push with the job's token, PR fallback when
-    // branch protection refuses, merge-door only.
-    expect(RY).toContain("bump main to the next -dev");
-    expect(RY).toContain("opening the bump PR instead");
-    expect(RY).toContain("npm install --package-lock-only");
-  });
-
-  it("asserts tag == package.json version, and the assert precedes the create", () => {
-    expect(RY).toContain('require("./package.json").version');
-    expect(RY).toContain("creating nothing");
-    expect(RY.indexOf("creating nothing")).toBeLessThan(
-      RY.indexOf('gh release create "$RELEASE_VERSION"'),
-    );
-  });
-
-  it("the merge path decides, then asserts, IN ORDER, all before tag-create, build, and publish", () => {
-    // The decide step (the fused version asserts — see the workflow's
-    // four-state table): base read from git, versions via node, work under
-    // the label no-ops green, half-ceremonies refuse. Then: the shared
-    // notes extraction, the no-existing-tag/release asserts, and only then
-    // the acts — API-tag the merge commit, build, publish. Every marker
-    // present, strictly in file order, fail-closed.
-    const markers = [
-      'git show "$BASE_SHA:package.json"', // decide — base vs merge
-      // Code-unique phrasings (the workflow's own comment table paraphrases
-      // these states, so the pins anchor on the echo strings, not prose):
-      "release-flow work under the release label, not a ceremony. Nothing to publish.", // work no-op, green
-      "a dev tree is by definition not a release", // -dev endstate: always work (the bump PR no-ops green)
-      "release-flow work merged in the post-release window (before the -dev bump)", // window no-op
-      "Refusing to guess — creating nothing.", // bare, unchanged, unreleased: refuse
-      ".github/scripts/release-notes.sh", // assert: notes extract
-      'git ls-remote --exit-code origin "refs/tags/$RELEASE_VERSION"', // assert: no tag
-      'gh release view "$RELEASE_VERSION"', // assert: no release (the decide's own view sits earlier — count checked below)
-      'gh api "repos/$GITHUB_REPOSITORY/git/refs"', // act: tag the merge commit
-      "npm prune --omit=dev", // act: build
-      'gh release create "$RELEASE_VERSION"', // act: publish
-    ];
-    let at = -1;
-    for (const m of markers) {
-      const i = RY.indexOf(m);
-      expect(i, m).toBeGreaterThan(at);
-      at = i;
-    }
-  });
-
-  it("the -dev interlock reads versions via node, never regex, and names the 0.1.0 first-release edge", () => {
-    expect(RY).not.toMatch(/grep.*version/);
-    expect(RY).toContain("node -p 'require(\"./package.json\").version'");
-    // 0.1.0 never carried -dev, so the interlock correctly skips #110's
-    // ceremony — the workflow must say so where the next reader will look.
-    expect(RY).toContain("applies from 0.1.1");
-  });
-
-  it("tag, build, and publish happen in the SAME job — a GITHUB_TOKEN tag fires no workflows", () => {
-    const jobs = RY.slice(RY.indexOf("\njobs:")).match(/^ {2}\S+:\s*$/gm) ?? [];
-    expect(jobs).toEqual(["  release:"]); // one job under jobs:
-    expect(RY).toContain("does not trigger other workflows");
-    expect(RY).toContain('-f "sha=$MERGE_SHA"');
-  });
-
-  it("the body comes from the shared extraction script", () => {
-    expect(RY).toContain(".github/scripts/release-notes.sh");
-  });
-
-  it("the release is bound to its tag (--verify-tag)", () => {
-    expect(RY).toContain("--verify-tag");
-  });
-
-  it("builds the prod-only tree once and attaches it as the asset", () => {
-    expect(RY).toContain("npm prune --omit=dev");
-    expect(RY).toContain("cp -R bin dist node_modules package.json");
-    expect(RY).toContain("cast-$RELEASE_VERSION.tgz");
-  });
-
-  it("both trigger paths converge on the SAME asset name — one build, one tar, no per-path naming", () => {
-    // Each path's entry step exports RELEASE_VERSION; everything downstream
-    // (notes, stage dir, tarball, release title) reads only that. A second
-    // tar or a $GITHUB_REF_NAME-named asset would be the paths drifting
-    // apart — the exact failure this shape exists to prevent.
-    expect(RY.match(/>> "\$GITHUB_ENV"/g)).toHaveLength(2);
-    expect(RY.match(/tar -C/g)).toHaveLength(1);
-    expect(RY).not.toContain("cast-$GITHUB_REF_NAME");
-  });
-
-  it("runs no tests — ci.yml gated the merge commit already", () => {
-    expect(RY).not.toContain("npm test");
-    expect(RY).not.toContain("npm run check");
   });
 });
 

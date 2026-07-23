@@ -11,16 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # fetch-depth: 0, for the changelog-monotonic step below and only
-          # for it. That check is about a DIFF — which release headings the
-          # merge base had — so it needs the base branch's history present,
-          # and the default depth-1 checkout has none of it. An explicit
-          # `git fetch origin <base>` would be narrower, but it has to be
-          # right on both event types and on fork PRs, and getting it subtly
-          # wrong degrades to a SKIP (a guard that silently stops guarding —
-          # the exact failure this repo keeps refusing). Full history on a
-          # tree this size costs a second; the STRICT flag below turns any
-          # remaining skip red rather than green.
+          # changelog-monotonic compares HEAD against the merge base; a
+          # checkout that cannot resolve it is a hard failure in CI, not
+          # a skip (a guard that can quietly stop guarding is the failure
+          # shape this repo keeps refusing).
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -40,55 +34,35 @@ jobs:
       # tracked *.sh, so a new script cannot go unlinted quietly (#118).
       - name: shellcheck — every tracked shell script
         run: bash .github/scripts/shellcheck-all.sh
-      - name: labels state-machine tests
-        run: bash test/labels-reconcile.sh
 
-      # ...and no SHIPPED release heading was deleted or DUPLICATED (#133;
-      # box#122's guard, box#143's ordering fix). Its own step so that when it
-      # goes red the log names the invariant that broke — and a DIFFERENT
-      # invariant from the arming rule npm test carries: arming is a fact
-      # about this tree, monotonicity is a fact about this tree versus its
-      # merge base. STRICT=1 so a checkout that cannot reach the base ref
-      # fails here instead of skipping quietly forever.
+      # The release guards, doctrine in heavy-duty/ceremony's README
+      # (ceremony#15 is this conversion). Each guard's war story — why it
+      # exists, what it refuses — lives with its implementation upstream;
+      # the four pins below and the two workflow callers must always name
+      # the same ceremony tag.
       #
-      # NOT pull-request-only, and that is the #133 fix at the workflow level.
-      # The two halves have different vacuity: DELETION is vacuous on a push
-      # to main (the merge base IS HEAD), but DUPLICATION is vacuous on no
-      # tree at all, so gating the whole script on `pull_request` left a
-      # duplicate that reached main by any other route unasserted forever.
-      #
-      # The `|| github.ref_name` fallback is load-bearing, not defensive. On a
-      # push event `github.base_ref` is EMPTY, so the argument would collapse
-      # to a bare `origin/`, which does not resolve — and STRICT=1 correctly
-      # promotes that to a hard failure, turning every push to main red. With
-      # the fallback it resolves to the pushed branch, whose merge base with
-      # HEAD is HEAD or its parent: containment passes vacuously, exactly as
-      # the old `if` intended, while uniqueness now runs on every push.
-      - name: no shipped changelog heading was deleted or duplicated
-        env:
-          CHANGELOG_MONOTONIC_STRICT: "1"
-        run: bash .github/scripts/changelog-monotonic.sh "origin/${{ github.base_ref || github.ref_name }}"
-
-      # ...and a release carries its DRILL RECORD. CONTRIBUTING has always
-      # asked for the real-hardware drill; nothing asserted it, so it was
-      # performed exactly as often as a reviewer remembered to ask — which is
-      # never, across every release in the family, until a bot blocked on it.
-      # Here it is a fact about the tree instead of a fact about somebody's
-      # memory.
-      #
-      # No `if:` guard on the event or the label. The script keys off
-      # package.json itself: a `-dev` tree has no ship claim and passes
-      # trivially, a bare version is a release ceremony tree and must have a
-      # record. Gating this step on the `release` label instead would put the
-      # assert behind a hand-applied label — the guard would be absent from
-      # exactly the PR that mislabels itself, and unasserted PRs are how the
-      # drill went missing in the first place.
-      #
-      # It requires a RECORD, not a PASS: a maintainer waiver is legal, and is
-      # itself the content of drills/<version>.md. Skipping stays possible and
-      # stays visible.
-      - name: a release version has a drill record
-        run: bash .github/scripts/drill-recorded.sh
+      # changelog-armed: the version-keyed arming rule (rig#66 is the
+      # incident; the unconditional form cast#108 reverted — this is its
+      # correct return).
+      - uses: heavy-duty/ceremony/actions/changelog-armed@0.1.0
+        with:
+          version-source: package-json
+      # changelog-monotonic: no shipped heading deleted or duplicated
+      # (#133; box#122's guard, box#143's ordering fix). Strict by default:
+      # an unresolvable base ref is red, never a quiet skip — hence the
+      # fetch-depth: 0 above.
+      - uses: heavy-duty/ceremony/actions/changelog-monotonic@0.1.0
+      # drill-recorded: a release version carries drills/<version>.md
+      # (cast's drill meaning: drills/README.md). Vacuous on -dev trees; it
+      # requires a RECORD, not a pass — a maintainer waiver is legal, and
+      # is itself the content of the file.
+      - uses: heavy-duty/ceremony/actions/drill-recorded@0.1.0
+        with:
+          version-source: package-json
+      # docs-sync: the .ceremony/ doctrine mirror is byte-identical to the
+      # pin read from release.yml (ceremony#19) — a hand edit or a
+      # half-done pin bump goes red here.
+      - uses: heavy-duty/ceremony/actions/docs-sync@0.1.0
 
   # The installer, proven by RUNNING it — CAST_INSTALL_SOURCE points it at
   # this checkout, so CI proves the installer under review (the versioned

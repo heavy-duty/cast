@@ -1,0 +1,39 @@
+name: release-artifact
+description: >-
+  Build cast's prebuilt release asset — the ceremony's artifact hook
+  (ceremony#9's contract; ceremony#15 is this conversion). Where cast
+  differs from its siblings: box and rig are pure bash, so GitHub's source
+  tarball for the tag IS their package; cast's source tarball is not
+  runnable — it needs npm ci and tsc first. So the build happens ONCE,
+  here, and the asset is the runnable tree — bin/, dist/, production
+  node_modules/, package.json — staged as cast-<version>/ inside
+  cast-<version>.tgz. That name and layout are the install contract: the
+  installer's release channels download this exact asset and never run npm
+  or tsc (test/install-sh.test.ts pins it). The hook owns its own
+  toolchain (the shared workflow is node-free).
+inputs:
+  version:
+    description: The release version the asset is named for
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+        cache: npm
+    - name: build once, stage the runnable tree, drop the tgz
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        # Deliberately no tests/checks here: ci.yml already gated the merge
+        # commit this release names, and cast's suite needs `age`, which
+        # the release runner does not install. The staged tree is exactly
+        # what an install needs to run.
+        npm ci
+        npm run build
+        npm prune --omit=dev
+        mkdir -p "$RUNNER_TEMP/stage/cast-$VERSION"
+        cp -R bin dist node_modules package.json "$RUNNER_TEMP/stage/cast-$VERSION/"
+        tar -C "$RUNNER_TEMP/stage" -czf "$RELEASE_ASSETS_DIR/cast-$VERSION.tgz" "cast-$VERSION"

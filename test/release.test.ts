@@ -420,3 +420,66 @@ describe("install.sh — the three channels", () => {
     expect(existsSync(join(r.dest, "versions"))).toBe(false);
   });
 });
+
+// --- the node floor, one value on four surfaces (#154) ----------------------
+// package.json's engines.node is the machine-read statement (ratified by #96);
+// README.md, bin/cast and install.sh restate it in prose and in the gate's
+// data. The four spell it four ways, so each is normalised to `major.minor`
+// and all four must agree. `.github` is deliberately NOT read: its three
+// `node-version: "22"` lines resolve the latest 22.x, which always satisfies
+// the floor, and pinning them would stop CI tracking the line.
+describe("the node floor is stated once, on four surfaces", () => {
+  const SURFACES: ReadonlyArray<
+    readonly [file: string, read: (text: string) => string | undefined]
+  > = [
+    ["package.json", (t) => /"node":\s*">=(\d+\.\d+)/.exec(t)?.[1]],
+    ["README.md", (t) => /`node` >= (\d+\.\d+)/.exec(t)?.[1]],
+    ["bin/cast", (t) => /node \(>=(\d+\.\d+)\)/.exec(t)?.[1]],
+    [
+      "install.sh",
+      (t) => {
+        const major = /^NODE_MIN_MAJOR=(\d+)$/m.exec(t)?.[1];
+        const minor = /^NODE_MIN_MINOR=(\d+)$/m.exec(t)?.[1];
+        return major && minor ? `${major}.${minor}` : undefined;
+      },
+    ],
+  ];
+
+  it("reads exactly these four files and finds one floor", () => {
+    expect(SURFACES.map(([f]) => f)).toEqual([
+      "package.json",
+      "README.md",
+      "bin/cast",
+      "install.sh",
+    ]);
+    const floors = SURFACES.map(([file, read]) => [
+      file,
+      read(readFileSync(join(ROOT, file), "utf8")),
+    ]);
+    for (const [file, floor] of floors) expect(floor, file).toBeDefined();
+    const distinct = new Map<string, string[]>();
+    for (const [file, floor] of floors) {
+      distinct.set(String(floor), [
+        ...(distinct.get(String(floor)) ?? []),
+        String(file),
+      ]);
+    }
+    expect(
+      distinct,
+      `the surfaces disagree: ${JSON.stringify([...distinct])}`,
+    ).toHaveProperty("size", 1);
+  });
+
+  it("install.sh states the floor as data, never as a literal in a message", () => {
+    const sh = readFileSync(join(ROOT, "install.sh"), "utf8");
+    expect(sh).not.toMatch(/NODE_MAJOR" -ge 22/);
+    expect(sh.match(/^NODE_MIN_(MAJOR|MINOR)=/gm)).toHaveLength(2);
+    expect(sh).not.toContain("22.12");
+  });
+
+  it("the launcher stays a presence check", () => {
+    const launcher = readFileSync(join(ROOT, "bin/cast"), "utf8");
+    expect(launcher.match(/command -v node/g)).toHaveLength(1);
+    expect(launcher).not.toMatch(/NODE_MAJOR|NODE_MIN/);
+  });
+});

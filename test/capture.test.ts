@@ -173,6 +173,72 @@ describe("classify", () => {
   });
 });
 
+// #163: the store is one KEY=value per line, and a value with a newline in it
+// — a multi-line PEM — wrote a store the reader then refused as malformed,
+// after the operator had typed the environment's name.
+describe("classify — a multi-line value is refused up front, from either provenance", () => {
+  const PEM = "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n";
+  it("names an overridden multi-line value, and drops it from the plan", () => {
+    const c = classify([REQUIRED[2]], [], LIVE, { ADMIN_EMAIL: PEM });
+    expect(c.unwritable).toEqual([
+      {
+        ref: "ADMIN_EMAIL",
+        provenance: "overridden",
+        sites: [{ resource: "core", key: "ADMIN_EMAIL" }],
+      },
+    ]);
+    expect(c.plan).toEqual([]);
+  });
+  it("names a captured multi-line value, from the source", () => {
+    const c = classify(
+      [REQUIRED[1]],
+      [],
+      { core: { MAILGUN_API_KEY: PEM } },
+      {},
+    );
+    expect(c.unwritable).toEqual([
+      {
+        ref: "MAILGUN_API_KEY",
+        provenance: "captured",
+        sites: [{ resource: "core", key: "MAILGUN_API_KEY" }],
+      },
+    ]);
+    expect(c.plan).toEqual([]);
+  });
+  it("is silent about a value carrying a LITERAL backslash-n, which the store holds fine", () => {
+    const flat =
+      "-----BEGIN PRIVATE KEY-----\\nMIIE\\n-----END PRIVATE KEY-----\\n";
+    const c = classify(
+      [REQUIRED[1]],
+      [],
+      { core: { MAILGUN_API_KEY: flat } },
+      {},
+    );
+    expect(c.unwritable).toEqual([]);
+    expect(c.plan[0].value).toBe(flat);
+  });
+  it("renders the refusal by name and provenance, never the value", () => {
+    const c = classify(
+      [REQUIRED[1], REQUIRED[2]],
+      [],
+      { core: { MAILGUN_API_KEY: PEM, ADMIN_EMAIL: "x" } },
+      { ADMIN_EMAIL: PEM },
+    );
+    const out = renderCapturePlan(c, CTX);
+    expect(out).toContain("MAILGUN_API_KEY");
+    expect(out).toContain(
+      "MULTI-LINE  the value from the source, on core.MAILGUN_API_KEY spans several lines",
+    );
+    expect(out).toContain(
+      "MULTI-LINE  the value from CAST_CAPTURE_ADMIN_EMAIL spans several lines",
+    );
+    expect(out).toContain(
+      "refusing to write the store: 2 name(s) hold a value with a newline",
+    );
+    expect(out).not.toContain("BEGIN PRIVATE KEY");
+  });
+});
+
 describe("renderCapturePlan", () => {
   // THE invariant. "No secret value is ever written to stdout" — so the plan
   // is names and provenance, and the test asserts on the actual live values

@@ -24,6 +24,12 @@ export type Disposition = {
 
 export type Classification = {
   plan: Disposition[];
+  // A value the store's own format cannot carry — one KEY=value per line, so a
+  // value with a newline in it (a multi-line PEM) writes a store that
+  // decryptSecrets then refuses as malformed, after the operator has typed the
+  // environment's name (#163). Refused up front instead, naming the ref and
+  // where it came from; never the value.
+  unwritable: Array<{ ref: string; provenance: Provenance; sites: Site[] }>;
   // Required by a template, absent from the source, and not dispositioned
   // otherwise. Refuses the run: writing an empty value substitutes to nothing
   // and the app boots misconfigured — the exact failure capture exists to
@@ -125,6 +131,7 @@ export function classify(
   const plan: Disposition[] = [];
   const missing: Classification["missing"] = [];
   const conflicts: Classification["conflicts"] = [];
+  const unwritable: Classification["unwritable"] = [];
 
   for (const [ref, sites] of groupByRef(required)) {
     // The operator's word beats both the manifest and the source box: this is
@@ -169,7 +176,28 @@ export function classify(
       sites,
     });
   }
-  return { plan, missing, conflicts };
+  // Both provenances that carry a real value are checked here, after the
+  // plan is built, so the check is one place and cannot miss a future third.
+  for (const d of plan) {
+    if (!storeCanCarry(d.value)) {
+      unwritable.push({ ref: d.ref, provenance: d.provenance, sites: d.sites });
+    }
+  }
+  return {
+    plan: plan.filter((d) => !unwritable.some((u) => u.ref === d.ref)),
+    missing,
+    conflicts,
+    unwritable,
+  };
+}
+
+// Whether the age store's line format can hold this value: one `KEY=value` per
+// line, so a newline or a carriage return inside a value is the one thing it
+// cannot say. The single definition, shared with encryptSecrets (the writer's
+// own belt) — a value that passes here is a value the reader gives back byte
+// for byte.
+export function storeCanCarry(value: string): boolean {
+  return !/[\r\n]/.test(value);
 }
 
 const site = (s: Site) => `${s.resource}.${s.key}`;
@@ -200,7 +228,9 @@ export function renderCapturePlan(
   ];
   const width = Math.max(
     0,
-    ...[...c.plan, ...c.missing, ...c.conflicts].map((d) => d.ref.length),
+    ...[...c.plan, ...c.missing, ...c.conflicts, ...c.unwritable].map(
+      (d) => d.ref.length,
+    ),
   );
   for (const d of c.plan) {
     const where = d.sites.map(site).join(", ");
@@ -222,6 +252,15 @@ export function renderCapturePlan(
   for (const c2 of c.conflicts) {
     lines.push(
       `  ${c2.ref.padEnd(width)}  CONFLICT    differs between ${c2.values.map(site).join(" and ")}`,
+    );
+  }
+  for (const u of c.unwritable) {
+    const from =
+      u.provenance === "overridden"
+        ? `CAST_CAPTURE_${u.ref}`
+        : `the source, on ${u.sites.map(site).join(", ")}`;
+    lines.push(
+      `  ${u.ref.padEnd(width)}  MULTI-LINE  the value from ${from} spans several lines`,
     );
   }
   const counts = (["captured", "generated", "overridden"] as const)
@@ -248,6 +287,17 @@ export function renderCapturePlan(
       `refusing to write the store: ${c.conflicts.length} name(s) carry different values on`,
       "different resources of the source. The store holds one value per name, and cast",
       "will not pick for you. Reconcile them on the source, or pin one with --override.",
+    );
+  }
+  if (c.unwritable.length > 0) {
+    lines.push(
+      "",
+      `refusing to write the store: ${c.unwritable.length} name(s) hold a value with a newline`,
+      "in it, which the store's one-KEY=value-per-line format cannot carry: cast would",
+      "write a store that its own reader then refuses as malformed. Flatten the value to",
+      "one line with a literal \\n where each line break was (a PEM survives this, and",
+      "an app that expects one rebuilds it) — for an override, in CAST_CAPTURE_<NAME>;",
+      "for a captured value, on the source — and capture again.",
     );
   }
   return lines.join("\n");

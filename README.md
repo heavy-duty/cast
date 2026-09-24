@@ -111,7 +111,7 @@ Pass it with `--state <dir>`, or set `CAST_STATE`. Defaults to the cwd.
 ```sh
 cast apply     <org>/<repo> --env <env> [--path <dir>] [--hostname-overlay <file>]
 cast apply     --env <env> --all                # no repo: EVERY registered project
-cast diff      <org>/<repo> --env <env> [--full]
+cast diff      <org>/<repo> --env <env> [--full] [--path <dir>] [--hostname-overlay <file>]
 cast diff      --env <env> --all [--full]       # no repo: EVERY registered project
 cast capture   <org>/<repo> --env <env> [--generated <NAME>] [--override <NAME>]
 cast capture   <org>/<repo> --env <env> --generated-only [--from <NAME>=<db>]
@@ -460,6 +460,7 @@ values off the instance, and classifies every name:
 | **generated** | the manifest's `generated_secrets` declares it provider-made → written as the literal `pending-coolify-generated`, never the live value |
 | **overridden** | supplied by you, for a value that must *not* be carried over |
 | **missing** | required by a template, absent live → **refuses** |
+| **multi-line** | a value with a newline in it, captured or overridden → **refuses**: the store is one `KEY=value` per line and cannot carry it. Flatten it to one line with a literal `\n` per line break (a PEM survives; the app rebuilds it) and capture again |
 
 Then it prints a plan of **names and provenance — never values** — and waits for
 you to type the environment's name.

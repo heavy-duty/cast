@@ -111,10 +111,23 @@ if [ -z "${CAST_INSTALL_SOURCE:-}" ]; then
   command -v curl >/dev/null 2>&1 || die "curl is required but was not found."
 fi
 command -v tar  >/dev/null 2>&1 || die "tar is required but was not found."
-command -v node >/dev/null 2>&1 || die "node >=22.12 is required but was not found."
+# The node floor, declared ONCE: the comparison below and both messages read
+# these, so a message can no longer state a rule the test does not implement
+# (#154: the gate compared the major alone, and twelve 22.x minors passed a
+# check whose own message named the minor). Keep in step with package.json's
+# engines.node (test/release.test.ts guards all four surfaces).
+NODE_MIN_MAJOR=22
+NODE_MIN_MINOR=12
 
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge 22 ] || die "node >=22.12 is required (found $(node -v))."
+command -v node >/dev/null 2>&1 \
+  || die "node >=${NODE_MIN_MAJOR}.${NODE_MIN_MINOR} is required but was not found."
+
+NODE_VER="$(node -p 'process.versions.node')"
+NODE_MAJOR="${NODE_VER%%.*}"
+NODE_MINOR="$(printf '%s\n' "$NODE_VER" | cut -d. -f2)"
+[ "$NODE_MAJOR" -gt "$NODE_MIN_MAJOR" ] \
+  || { [ "$NODE_MAJOR" -eq "$NODE_MIN_MAJOR" ] && [ "$NODE_MINOR" -ge "$NODE_MIN_MINOR" ]; } \
+  || die "node >=${NODE_MIN_MAJOR}.${NODE_MIN_MINOR} is required (found $(node -v))."
 
 # readlink -f is load-bearing across the layout (the launcher and every verb
 # resolve the symlink chain with it). GNU always has it; Apple's readlink

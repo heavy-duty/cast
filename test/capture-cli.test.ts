@@ -236,6 +236,26 @@ describe("cast capture (end to end)", () => {
     }
   });
 
+  // #163: a multi-line override (a PEM in CAST_CAPTURE_<NAME>) used to reach
+  // the store raw and leave it unreadable. Refused before the confirmation,
+  // nothing written, the value never printed.
+  it("refuses a multi-line --override before the confirmation, writing nothing", async () => {
+    const f = fixture((await stubCoolify()).url);
+    const pem =
+      "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\n";
+    const r = await runCapture([...base(f), "--override", "ADMIN_EMAIL"], {
+      stdin: "staging\n",
+      env: { CAST_CAPTURE_ADMIN_EMAIL: pem },
+    });
+    expect(r.code).toBe(2);
+    expect(r.output).toContain("ADMIN_EMAIL");
+    expect(r.output).toContain("MULTI-LINE");
+    expect(r.output).toContain("literal \\n");
+    expect(r.output).not.toContain("BEGIN PRIVATE KEY");
+    expect(r.output).not.toContain("type the environment name");
+    expect(existsSync(f.store)).toBe(false);
+  });
+
   // A name required by the template but absent from the source refuses the run
   // — writing an empty would boot the app misconfigured, plausibly.
   it("refuses when a required name is absent from the source", async () => {

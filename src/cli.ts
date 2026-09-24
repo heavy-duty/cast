@@ -120,9 +120,110 @@ import { serverAdd } from "./server.js";
 import { smoke } from "./smoke.js";
 import { assertTeam, formatTeam } from "./team.js";
 
-const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--hostname-overlay <file>]
+// The options tables of every command, hoisted to module level (#151) so
+// test/usage.test.ts can assert the class of defect that issue was one instance
+// of: a flag a command accepts that its own USAGE line does not show. Every key
+// here appears on that command's usage lines, or in the seven flags the block
+// below USAGE describes, or is the one declared exemption in that test.
+export const GITHUB_APP_OPTIONS = {
+  state: { type: "string" },
+  env: { type: "string" },
+  instance: { type: "string" },
+  name: { type: "string" },
+  force: { type: "boolean" },
+  // create
+  port: { type: "string" },
+  // register
+  "app-id": { type: "string" },
+  "installation-id": { type: "string" },
+  "client-id": { type: "string" },
+  "client-secret-stdin": { type: "boolean" },
+  "private-key": { type: "string" },
+  "webhook-secret": { type: "string" },
+} as const;
+
+export const APPLY_DIFF_OPTIONS = {
+  env: { type: "string" },
+  path: { type: "string" },
+  state: { type: "string" },
+  project: { type: "string" },
+  environment: { type: "string" },
+  resource: { type: "string", multiple: true },
+  instance: { type: "string" },
+  "hostname-overlay": { type: "string" },
+  full: { type: "boolean", default: false },
+  all: { type: "boolean", default: false },
+} as const;
+
+export const CAPTURE_OPTIONS = {
+  env: { type: "string" },
+  state: { type: "string" },
+  path: { type: "string" },
+  project: { type: "string" },
+  environment: { type: "string" },
+  resource: { type: "string", multiple: true },
+  instance: { type: "string" },
+  generated: { type: "string", multiple: true },
+  override: { type: "string", multiple: true },
+  force: { type: "boolean", default: false },
+  "generated-only": { type: "boolean", default: false },
+  from: { type: "string", multiple: true },
+} as const;
+
+export const INVENTORY_OPTIONS = {
+  env: { type: "string" },
+  state: { type: "string" },
+  path: { type: "string" },
+  project: { type: "string" },
+  environment: { type: "string" },
+  resource: { type: "string", multiple: true },
+  instance: { type: "string" },
+  "emit-draft": { type: "string" },
+  recipient: { type: "string" },
+  "no-secrets": { type: "boolean", default: false },
+} as const;
+
+export const SERVER_ADD_OPTIONS = {
+  ip: { type: "string" },
+  key: { type: "string" },
+  env: { type: "string" },
+  user: { type: "string" },
+  port: { type: "string" },
+  state: { type: "string" },
+  instance: { type: "string" },
+} as const;
+
+export const SMOKE_OPTIONS = {
+  state: { type: "string" },
+  env: { type: "string" },
+  project: { type: "string" },
+  environment: { type: "string" },
+  instance: { type: "string" },
+} as const;
+
+export const DESTROY_OPTIONS = {
+  env: { type: "string" },
+  state: { type: "string" },
+  path: { type: "string" },
+  instance: { type: "string" },
+  "with-project": { type: "boolean", default: false },
+  // Declared ONLY so that it can be refused with a sentence. Left out of
+  // this list, `--all` would die as parseArgs's "Unknown option" — which
+  // reads like a version skew, invites a retry, and says nothing about why
+  // a fleet-wide delete is a thing cast does not have. See
+  // renderDestroyAllRefusal.
+  all: { type: "boolean", default: false },
+} as const;
+
+export const TEAM_OPTIONS = {
+  state: { type: "string" },
+  env: { type: "string" },
+  instance: { type: "string" },
+} as const;
+
+export const USAGE = `usage: cast apply     <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--hostname-overlay <file>]
        cast apply     --env <env> --all                   # no repo: EVERY registered project
-       cast diff      <org>/<repo> --env <env> [--full] [--project <name>] [--environment <name>]
+       cast diff      <org>/<repo> --env <env> [--full] [--path <dir>] [--project <name>] [--environment <name>] [--hostname-overlay <file>]
        cast diff      --env <env> --all [--full]          # no repo: EVERY registered project
        cast capture   <org>/<repo> --env <env> [--path <dir>] [--project <name>] [--environment <name>] [--generated <NAME>] [--override <NAME>] [--force]
        cast capture   <org>/<repo> --env <env> --generated-only [--from <NAME>=<db>] [--force]   # pass 2, AFTER apply
@@ -1524,22 +1625,7 @@ async function githubAppCommand(rest: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: rest.slice(1),
     allowPositionals: true,
-    options: {
-      state: { type: "string" },
-      env: { type: "string" },
-      instance: { type: "string" },
-      name: { type: "string" },
-      force: { type: "boolean" },
-      // create
-      port: { type: "string" },
-      // register
-      "app-id": { type: "string" },
-      "installation-id": { type: "string" },
-      "client-id": { type: "string" },
-      "client-secret-stdin": { type: "boolean" },
-      "private-key": { type: "string" },
-      "webhook-secret": { type: "string" },
-    },
+    options: GITHUB_APP_OPTIONS,
   });
   const orgRepo = positionals[0];
   // --env is required for the same reason `server add` requires it: this
@@ -1703,18 +1789,7 @@ async function main(): Promise<number> {
     const { values, positionals } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: {
-        env: { type: "string" },
-        path: { type: "string" },
-        state: { type: "string" },
-        project: { type: "string" },
-        environment: { type: "string" },
-        resource: { type: "string", multiple: true },
-        instance: { type: "string" },
-        "hostname-overlay": { type: "string" },
-        full: { type: "boolean", default: false },
-        all: { type: "boolean", default: false },
-      },
+      options: APPLY_DIFF_OPTIONS,
     });
     const orgRepo = positionals[0];
     const envName = values.env;
@@ -1882,20 +1957,7 @@ async function main(): Promise<number> {
     const { values, positionals } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: {
-        env: { type: "string" },
-        state: { type: "string" },
-        path: { type: "string" },
-        project: { type: "string" },
-        environment: { type: "string" },
-        resource: { type: "string", multiple: true },
-        instance: { type: "string" },
-        generated: { type: "string", multiple: true },
-        override: { type: "string", multiple: true },
-        force: { type: "boolean", default: false },
-        "generated-only": { type: "boolean", default: false },
-        from: { type: "string", multiple: true },
-      },
+      options: CAPTURE_OPTIONS,
     });
     const orgRepo = positionals[0];
     const envName = values.env;
@@ -2179,7 +2241,8 @@ async function main(): Promise<number> {
     // and the plan above has already named every offending entry.
     if (
       classification.missing.length > 0 ||
-      classification.conflicts.length > 0
+      classification.conflicts.length > 0 ||
+      classification.unwritable.length > 0
     )
       return 2;
     if (!(await confirmCapture(envName))) {
@@ -2200,18 +2263,7 @@ async function main(): Promise<number> {
     const { values, positionals } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: {
-        env: { type: "string" },
-        state: { type: "string" },
-        path: { type: "string" },
-        project: { type: "string" },
-        environment: { type: "string" },
-        resource: { type: "string", multiple: true },
-        instance: { type: "string" },
-        "emit-draft": { type: "string" },
-        recipient: { type: "string" },
-        "no-secrets": { type: "boolean", default: false },
-      },
+      options: INVENTORY_OPTIONS,
     });
     const orgRepo = positionals[0];
     const envName = values.env;
@@ -2520,15 +2572,7 @@ async function main(): Promise<number> {
     const { values, positionals } = parseArgs({
       args: rest.slice(1),
       allowPositionals: true,
-      options: {
-        ip: { type: "string" },
-        key: { type: "string" },
-        env: { type: "string" },
-        user: { type: "string" },
-        port: { type: "string" },
-        state: { type: "string" },
-        instance: { type: "string" },
-      },
+      options: SERVER_ADD_OPTIONS,
     });
     // --env is required: a server is registered under the token's team and
     // belongs to exactly one team forever (Coolify has no pivot and no
@@ -2571,13 +2615,7 @@ async function main(): Promise<number> {
     const { values, positionals } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: {
-        state: { type: "string" },
-        env: { type: "string" },
-        project: { type: "string" },
-        environment: { type: "string" },
-        instance: { type: "string" },
-      },
+      options: SMOKE_OPTIONS,
     });
     // REQUIRED, like every other verb's — because the repo IS the project, and
     // the project is half of the only scope in which the target's name means
@@ -2686,19 +2724,7 @@ async function main(): Promise<number> {
     const { values, positionals } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: {
-        env: { type: "string" },
-        state: { type: "string" },
-        path: { type: "string" },
-        instance: { type: "string" },
-        "with-project": { type: "boolean", default: false },
-        // Declared ONLY so that it can be refused with a sentence. Left out of
-        // this list, `--all` would die as parseArgs's "Unknown option" — which
-        // reads like a version skew, invites a retry, and says nothing about why
-        // a fleet-wide delete is a thing cast does not have. See
-        // renderDestroyAllRefusal.
-        all: { type: "boolean", default: false },
-      },
+      options: DESTROY_OPTIONS,
     });
     // FIRST, before the usage check even: `cast destroy --env prod --all` has no
     // repo positional, and answering it with a usage block would tell an operator
@@ -2885,11 +2911,7 @@ async function main(): Promise<number> {
     const { values } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: {
-        state: { type: "string" },
-        env: { type: "string" },
-        instance: { type: "string" },
-      },
+      options: TEAM_OPTIONS,
     });
     const stateDir = stateDirFrom(values.state);
     // Bindings first, but only when --env was given: an environment's

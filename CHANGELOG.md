@@ -7,6 +7,8 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+## 0.3.0 — 2026-09-24
+
 ### Added
 
 - `build.pack: dockerimage`: an application deployed from a registry image,

@@ -361,7 +361,13 @@ const comment = (lines: string[]) =>
 
 // --- The manifest ------------------------------------------------------------
 
-const PACKS = new Set(["nixpacks", "static", "dockerfile", "dockercompose"]);
+const PACKS = new Set([
+  "nixpacks",
+  "static",
+  "dockerfile",
+  "dockercompose",
+  "dockerimage",
+]);
 
 type Spec = Record<string, unknown>;
 
@@ -388,18 +394,40 @@ function applicationSpec(
     return undefined;
   }
 
-  const repo = repoFromGitUrl(r.raw.git_repository);
-  if (!repo) {
+  // A dockerimage app (cast#161) has no source: Coolify stamps
+  // `coollabsio/coolify` / `main` on it (ApplicationsController.php:1854-1855
+  // @ v4.1.2), which a draft must not transcribe as a remote to clone. Its
+  // identity is the image name and tag, both plain columns on the read.
+  const image = pack === "dockerimage";
+  const repo = image ? undefined : repoFromGitUrl(r.raw.git_repository);
+  if (!image && !repo) {
     flag(
       "source.repo",
       `git remote "${String(r.raw.git_repository ?? "")}" — cast could not read an <org>/<repo> out of it, and wrote it through verbatim. \`apply\` resolves a GitHub App by that slug; fix it before you trust this.`,
     );
   }
   const branch = r.raw.git_branch;
-  if (typeof branch !== "string" || branch === "") {
+  if (!image && (typeof branch !== "string" || branch === "")) {
     flag(
       "source.branch",
       "the box reports no branch for this application. `main` was written; confirm it.",
+    );
+  }
+  const imageName = String(r.raw.docker_registry_image_name ?? "");
+  const imageTag = String(r.raw.docker_registry_image_tag ?? "");
+  if (image && imageName === "") {
+    flag(
+      "image.name",
+      "the box reports no registry image for this Docker Image application; an empty name was written, which the manifest refuses. Read it off the Coolify UI.",
+    );
+  }
+  if (image && imageTag === "") {
+    // Coolify treats an empty tag as `latest` at deploy time
+    // (resolveDockerImageTag); the draft says so rather than pulling a
+    // moving tag into a manifest silently.
+    flag(
+      "image.tag",
+      "the box reports no tag for this Docker Image application, which Coolify deploys as `latest`. `latest` was written; pin what the box actually runs.",
     );
   }
 
@@ -495,6 +523,33 @@ function applicationSpec(
       "is_static",
       `this Coolify cannot say whether the app serves as a static site — is_static lives on the ApplicationSetting relation, which 4.1.2's read API never returns (cast#68) — and this app is plausibly static (${pack} pack with publish_directory ${String(r.raw.publish_directory)}). The draft carries no \`static: true\`; if the box has "Is it a static site?" checked, a rebuild from this draft would build and RUN it as a plain app (the #63 crash). Check the box in the Coolify UI (Build settings) and, if set, add \`static: true\` under \`build:\` yourself.`,
     );
+  }
+
+  if (image) {
+    // `port` is required on the pack (the proxy and the health check need
+    // it), so a box that reports none gets 80 and a line saying so — an
+    // unloadable draft helps nobody, and a wrong port shows up on the first
+    // deploy as an unroutable app rather than a silently different one.
+    if (!r.raw.ports_exposes) {
+      flag(
+        "port",
+        "the box reports no exposed port for this Docker Image application; `port: 80` was written because the manifest requires one. Confirm it against the image.",
+      );
+    }
+    return {
+      image: { name: imageName, tag: imageTag === "" ? "latest" : imageTag },
+      build: { pack },
+      port: r.raw.ports_exposes
+        ? Number(String(r.raw.ports_exposes).split(",")[0])
+        : 80,
+      ...(r.raw.health_check_path
+        ? { healthcheck: String(r.raw.health_check_path) }
+        : {}),
+      domains: fqdn,
+      ...(hasEnv
+        ? { env_template: `env/${slug(r.name)}.${ctx.env}.env.template` }
+        : {}),
+    };
   }
 
   return {

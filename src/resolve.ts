@@ -716,14 +716,41 @@ export function desiredFromManifest(
         `application ${name} builds with dockercompose, but apply cannot enable "Include Source Commit in Build" on Coolify 4.1.2 — the setting is absent from the API's field allowlist. If the build consumes SOURCE_COMMIT as a build arg, enable it in the Coolify UI and redeploy; Coolify injects SOURCE_COMMIT at runtime regardless.`,
       );
     }
+    // A declared `healthcheck` ENABLES Coolify's health check, beside naming
+    // its path (cast#161). Before this, cast wrote `health_check_path` alone:
+    // a resource whose check had been switched off in the UI kept the path,
+    // looked guarded, and guarded nothing — and on a Docker Image resource,
+    // where no Dockerfile HEALTHCHECK can be found, Coolify then declares the
+    // new container healthy at once and the rolling update removes the old one
+    // without waiting (ApplicationDeploymentJob.php:1961-1964 @ v4.1.2). The
+    // toggle is emitted only when a path is declared, so a manifest that says
+    // nothing about health checks keeps saying nothing — the is_static rule.
+    const healthcheck = app.healthcheck
+      ? { healthcheck: app.healthcheck, health_check_enabled: true }
+      : {};
     desired.push({
       kind: "application",
       name,
       fields: {
-        git_repository: app.source.repo,
-        git_branch: app.source.branch,
-        build_pack: app.build.pack,
-        base_directory: app.build.base_directory,
+        // A dockerimage app (cast#161) has no source to clone and no checkout
+        // to build in: what identifies it is the registry image and its tag,
+        // both ordinary PATCHable columns (ApplicationsController.php:2368 @
+        // v4.1.2), so moving a tier from `:2.0.0` to `:2.1.0` is a manifest
+        // edit and an apply. Coolify stamps `git_repository` /`git_branch` on
+        // such an app itself (`coollabsio/coolify` / `main`, :1854-1855); they
+        // are not declared here, so they are never compared.
+        ...(app.build.pack === "dockerimage"
+          ? {
+              build_pack: app.build.pack,
+              docker_registry_image_name: app.image?.name,
+              docker_registry_image_tag: app.image?.tag,
+            }
+          : {
+              git_repository: app.source?.repo,
+              git_branch: app.source?.branch,
+              build_pack: app.build.pack,
+              base_directory: app.build.base_directory,
+            }),
         ...(app.build.publish_directory
           ? { publish_directory: app.build.publish_directory }
           : {}),
@@ -734,7 +761,7 @@ export function desiredFromManifest(
             }
           : {
               ...(app.port !== undefined ? { port: app.port } : {}),
-              ...(app.healthcheck ? { healthcheck: app.healthcheck } : {}),
+              ...healthcheck,
               domains: app.domains,
               // Emitted only when the manifest DECLARES `static:` — like the
               // three commands, not unconditionally. Emitting `is_static:false`

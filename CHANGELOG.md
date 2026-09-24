@@ -7,8 +7,21 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Added
+
+- `build.pack: dockerimage`: an application deployed from a registry image,
+  declared as `image: { name, tag }`, created through
+  `POST /applications/dockerimage` with no GitHub App, its tag diffed and
+  moved in place (#161)
+- `service_domains: { <service>: [] }` declares a compose service with no
+  hostname, and it reads back clean (#161)
+
 ### Changed
 
+- A declared `healthcheck` now enables Coolify's health check, and a check
+  switched off under a declared path is drift `apply` repairs (#161)
+- `draft` emits a Docker Image application by its image, not the git remote
+  Coolify stamps on it (#161)
 - The release flow and labels automation now run heavy-duty/ceremony's shared
   machinery at 0.1.0; the prebuilt-asset build moves to the release-artifact
   hook (heavy-duty/ceremony#15)

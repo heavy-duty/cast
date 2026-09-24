@@ -637,7 +637,9 @@ a verb people run on a schedule.
 **[docs/semantics.md](docs/semantics.md)** is the contract behind those
 commands: what `apply` guarantees (never deletes, never recreates a database,
 fails loudly rather than recreating on un-updatable drift), the `dockercompose`
-build pack, the hostname-overlay shapes, and the places Coolify 4.1.2 does not
+and `dockerimage` build packs (the second is a registry image with no git
+source, the shape Coolify gives a rolling update to), the hostname-overlay
+shapes, and the places Coolify 4.1.2 does not
 cooperate — each citation verified against `coollabsio/coolify` v4.1.2 and the
 vendored OpenAPI in `reference/`. Read it before changing `apply`.
 

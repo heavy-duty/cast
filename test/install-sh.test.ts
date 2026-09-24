@@ -463,9 +463,10 @@ describe("install.sh — the node floor is 22.12, minor included (#154)", () => 
       const real = process.env.PATH?.split(":")
         .map((d) => join(d, tool))
         .find((p) => existsSync(p));
-      if (real)
-        writeFileSync(join(tools, tool), `#!/bin/sh\nexec "${real}" "$@"\n`),
-          chmodSync(join(tools, tool), 0o755);
+      if (real) {
+        writeFileSync(join(tools, tool), `#!/bin/sh\nexec "${real}" "$@"\n`);
+        chmodSync(join(tools, tool), 0o755);
+      }
     }
     let output = "";
     try {

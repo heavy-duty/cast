@@ -63,7 +63,7 @@ const TABLES: ReadonlyArray<
 // (register's wrapped flags) belong to the same group. Read from the synopsis
 // only — the prose block below it is deliberately not consulted, which is what
 // makes "add a description paragraph instead of fixing the line" fail.
-export function usageFlags(usage: string): Map<string, Set<string>> {
+function usageFlags(usage: string): Map<string, Set<string>> {
   const synopsis = usage.split("\n\n")[0];
   const flags = new Map<string, Set<string>>();
   let current: string | undefined;
@@ -79,7 +79,7 @@ export function usageFlags(usage: string): Map<string, Set<string>> {
 }
 
 // The defects: every (command, flag) the table accepts and the usage hides.
-export function hiddenFlags(
+function hiddenFlags(
   usage: string,
   tables: typeof TABLES,
 ): Array<[string, string]> {

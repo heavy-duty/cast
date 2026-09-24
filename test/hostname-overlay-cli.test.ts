@@ -1,9 +1,9 @@
+import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { spawn } from "node:child_process";
 import { tmp } from "./helpers/tmp.js";
 
 // `cast diff --hostname-overlay <file>` overlays (#151). The unit half is

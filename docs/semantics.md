@@ -128,6 +128,77 @@ to `undefined`, so cast diffed the desired map against nothing and re-PATCHed +
 redeployed the stack on every apply. Projecting both fields — decoded
 correctly — is what keeps a matching re-apply a true no-op.
 
+**`dockerimage` build pack** (cast#161): an application deployed from a
+**registry image**, with no git source. It is the pack Coolify 4.1.2 gives a
+rolling update to: on a standalone server `rolling_update()` starts the new
+container, waits for its health check, and only then stops the old one
+(`ApplicationDeploymentJob.php` ll. 1904-1953), where the Compose path stops
+first and starts after (l. 782). A manifest application on this pack declares
+`image: { name, tag }` — the repository without its tag, and the tag or
+Coolify's `sha256-<digest>` spelling — plus `port` and `domains`, and nothing
+of a checkout: `source`, `build.base_directory`, `publish_directory`,
+`compose_file`, the three commands, `static` and `service_domains` are all
+parse-time refusals, in the same shape as the compose ones above.
+
+```yaml
+site:
+  image: { name: ghcr.io/acme/widget, tag: stable }
+  build: { pack: dockerimage }
+  port: 80
+  healthcheck: /version
+  domains: ["https://widget.example.com"]
+  env_template: site.prod.env.template
+```
+
+The create goes to `POST /applications/dockerimage` (the vendored OpenAPI;
+`ApplicationsController::create_dockerimage_application`, :896 → :1792-1860),
+with the destination exactly as on the other creates and **no
+`github_app_uuid`**: a manifest whose applications are all images resolves no
+GitHub App at all, for the same reason a databases-only one does not (#103).
+Coolify sets `build_pack` itself on that route and stamps `git_repository` /
+`git_branch` as `coollabsio/coolify` / `main` (:1854-1855); cast declares
+neither on this pack, so neither is ever compared. `docker_registry_image_name`
+and `docker_registry_image_tag` are ordinary PATCHable columns (the update
+allowlist, :2368), read back by `projectLiveFields` when set, so **moving a
+tier's tag is a manifest edit and an apply, and a tag moved in the UI is
+drift**. `build_pack` stays un-updatable: a compose resource does not become an
+image resource in place, and `apply` refuses rather than recreating (below).
+
+Three settings on the resource decide whether Coolify's rolling update
+actually runs, and cast can set only the first (l. 1921): **no
+`ports_mappings`** (a host port cannot be held by two containers; cast never
+writes one), **no "consistent container name"** and **no custom internal
+name** — those two live on `ApplicationSetting`, which 4.1.2's API neither
+writes nor reads (the `is_static` story above), so they are UI acts and a
+resource that has them falls back to stop → start with a line in its deploy
+log saying so. And the health check must be **enabled**, which brings the
+next point.
+
+**A declared `healthcheck` enables the check** (cast#161, every non-compose
+pack). Before this, cast wrote `health_check_path` alone: a resource whose
+check had been switched off in the UI kept its path, looked guarded, and
+guarded nothing — and on a Docker Image resource, where no Dockerfile
+`HEALTHCHECK` can be read, Coolify then declares the new container healthy at
+once (`health_check()`, ll. 1961-1964) and removes the old one without waiting,
+so the "rolling update" is a stop → start with extra steps. Now `healthcheck:
+<path>` emits `health_check_enabled: true` beside `health_check_path`, the
+toggle is read back (a boolean or 0/1, by driver) and compared, and a live
+`false` under a declared path is drift `apply` repairs. An absent `healthcheck`
+still emits nothing, so a manifest silent about health checks keeps saying
+nothing — the `is_static` rule. Coolify's generated check is a `curl … ||
+wget …` inside the container (`generate_healthcheck_commands`), so the image
+must carry one of the two; the interval, timeout, retries and start period are
+Coolify's defaults (5 s, 5 s, 10, 5 s) and not manifest fields.
+
+**A compose service with no hostname** is declared `service_domains: { api:
+[] }` — an internal-only service behind another resource's proxy. The write
+goes out as `{ name: api, domain: "" }`, Laravel's `ConvertEmptyStringsToNull`
+stores `{ "api": { "domain": null } }`, and `parseDockerComposeDomains` reads a
+null or empty domain back as an empty list for that service, so the pair
+round-trips clean (it used to drop the service and re-PATCH forever). The
+update route keeps only entries whose service is in the stored compose file
+(#159), so the service must already be there.
+
 **Hostname overlay, compose apps:** `--hostname-overlay <file>` accepts a
 per-service map value for a compose app's entry instead of the plain-app
 `string[]`:

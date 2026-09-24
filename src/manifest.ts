@@ -102,13 +102,56 @@ const BasicAuthSchema = z
     }
   });
 
+// A registry image reference, for the `dockerimage` pack (cast#161). The name
+// is the repository without a tag (`ghcr.io/acme/widget`), the tag a plain tag
+// or Coolify's digest spelling (`sha256-<hex>`). Coolify 4.1.2 normalises the
+// pair itself on create (DockerImageParser, ApplicationsController.php:1822-
+// 1839), so a name carrying a `:tag` would be split and stored differently from
+// what the manifest says, and diff forever. Refused at parse time instead.
+const ImageSchema = z
+  .object({
+    name: z
+      .string()
+      .regex(
+        /^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:(?::[0-9]+)?\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$/,
+        "image.name is the repository only — ghcr.io/acme/widget — with the tag under image.tag (Coolify splits a name:tag itself and the manifest would never match what it stored)",
+      ),
+    tag: z
+      .string()
+      .regex(
+        /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/,
+        "image.tag must be a docker tag (letters, digits, _ . -; up to 128 characters), or Coolify's sha256-<digest> spelling",
+      ),
+  })
+  .strict();
+
+// The packs Coolify clones a git source for. `dockerimage` is the one that does
+// not: its application is created from a registry image, through a different
+// route (POST /applications/dockerimage), and carries no `source`.
+const GIT_PACKS = [
+  "nixpacks",
+  "static",
+  "dockerfile",
+  "dockercompose",
+] as const;
+
 const AppSpecSchema = z
   .object({
-    source: z.object({ repo: z.string(), branch: z.string() }).strict(),
+    // Optional in the SHAPE only for the dockerimage pack — every git-sourced
+    // pack still requires it, through the superRefine below, so no existing
+    // manifest changes.
+    source: z
+      .object({ repo: z.string(), branch: z.string() })
+      .strict()
+      .optional(),
+    image: ImageSchema.optional(),
     build: z
       .object({
-        pack: z.enum(["nixpacks", "static", "dockerfile", "dockercompose"]),
-        base_directory: repoDirectoryPath("base_directory"),
+        pack: z.enum([...GIT_PACKS, "dockerimage"]),
+        // Same story as `source`: a checkout path is meaningless without a
+        // checkout, so the dockerimage pack refuses it and every other pack
+        // requires it (superRefine).
+        base_directory: repoDirectoryPath("base_directory").optional(),
         publish_directory: repoDirectoryPath("publish_directory").optional(),
         compose_file: composeFilePath.optional(),
         // The three build/run commands and the static flag Coolify accepts on
@@ -135,6 +178,76 @@ const AppSpecSchema = z
   })
   .strict()
   .superRefine((app, ctx) => {
+    // The dockerimage pack (cast#161): an application deployed from a registry
+    // image, with no git source and nothing Coolify could build. Everything
+    // that describes a checkout or a build is refused in the same shape as the
+    // dockercompose refusals below, so a reader learns the rule from either
+    // message; what routes traffic (`domains`, `port`) is required, because a
+    // Docker Image resource without a port has nothing for the proxy to reach,
+    // and Coolify's rolling update needs a port to health-check.
+    if (app.build.pack === "dockerimage") {
+      if (!app.image)
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "dockerimage apps require image: { name, tag } (the registry image Coolify pulls; there is no git source to build from)",
+        });
+      if (app.source !== undefined)
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "source not allowed on a dockerimage app (it is pulled from a registry, not cloned; the image is image: { name, tag })",
+        });
+      for (const k of [
+        "base_directory",
+        "publish_directory",
+        "compose_file",
+        "install_command",
+        "build_command",
+        "start_command",
+        "static",
+      ] as const)
+        if (app.build[k] !== undefined)
+          ctx.addIssue({
+            code: "custom",
+            message: `build.${k} not allowed on a dockerimage app (nothing is checked out or built; the image is pulled as-is)`,
+          });
+      if (app.service_domains !== undefined)
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "service_domains only allowed with pack dockercompose (a dockerimage app is one container; use domains)",
+        });
+      if (!app.domains)
+        ctx.addIssue({
+          code: "custom",
+          message: "domains required (dockerimage app)",
+        });
+      if (app.port === undefined)
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "port required on a dockerimage app (Coolify's proxy and health check need the port the container serves)",
+        });
+      return;
+    }
+    // Every git-sourced pack: the source and the checkout root are required, and
+    // an image block names a registry image Coolify would never pull.
+    if (app.source === undefined)
+      ctx.addIssue({
+        code: "custom",
+        message: `source required (a ${app.build.pack} app is cloned from source: { repo, branch })`,
+      });
+    if (app.build.base_directory === undefined)
+      ctx.addIssue({
+        code: "custom",
+        message: "build.base_directory required (the checkout root is /)",
+      });
+    if (app.image !== undefined)
+      ctx.addIssue({
+        code: "custom",
+        message: `image only allowed with pack dockerimage (a ${app.build.pack} app builds from its source)`,
+      });
     if (app.build.pack === "dockercompose") {
       if (!app.build.compose_file)
         ctx.addIssue({

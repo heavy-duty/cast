@@ -350,14 +350,26 @@ export function parseDockerComposeDomains(
     return undefined;
   }
   const map: Record<string, string[]> = {};
+  // A service that is THERE with no hostname — `{ "api": { "domain": null } }`
+  // — is a service with an empty domain list, not a service to drop (cast#161).
+  // Coolify stores exactly that for a compose service declared internal-only
+  // (`service_domains: { api: [] }`): the write goes out as `domain: ""`,
+  // Laravel's ConvertEmptyStringsToNull turns it into null, and the update
+  // route keeps the entry because the service is in the compose file
+  // (ApplicationsController.php:2600-2606 @ v4.1.2). Reading that back as an
+  // absent service diffed `{api: []}` against `{}` and re-PATCHed forever.
+  const urlsOf = (domain: unknown): string[] | undefined =>
+    domain === null || domain === undefined || domain === ""
+      ? []
+      : typeof domain === "string"
+        ? domain.split(",").filter(Boolean)
+        : undefined;
   if (Array.isArray(parsed)) {
     // Legacy / write-side shape: [{ name, domain }].
     for (const entry of parsed) {
       const name = (entry as { name?: unknown } | null)?.name;
-      const domain = (entry as { domain?: unknown } | null)?.domain;
-      if (typeof name === "string" && typeof domain === "string") {
-        map[name] = domain.split(",").filter(Boolean);
-      }
+      const urls = urlsOf((entry as { domain?: unknown } | null)?.domain);
+      if (typeof name === "string" && urls) map[name] = urls;
     }
     return map;
   }
@@ -366,10 +378,8 @@ export function parseDockerComposeDomains(
     for (const [service, value] of Object.entries(
       parsed as Record<string, unknown>,
     )) {
-      const domain = (value as { domain?: unknown } | null)?.domain;
-      if (typeof domain === "string") {
-        map[service] = domain.split(",").filter(Boolean);
-      }
+      const urls = urlsOf((value as { domain?: unknown } | null)?.domain);
+      if (urls) map[service] = urls;
     }
     return map;
   }
@@ -394,6 +404,31 @@ export function projectLiveFields(
         : {}),
       ...(raw.ports_exposes ? { port: Number(raw.ports_exposes) } : {}),
       ...(raw.health_check_path ? { healthcheck: raw.health_check_path } : {}),
+      // The toggle behind the path (cast#161). Compared only when the desired
+      // side declares `healthcheck` (resolve.ts emits the pair together), so a
+      // manifest silent about health checks never diffs on it; a live `false`
+      // under a declared path is a check somebody switched off in the UI, and
+      // that is drift. Coolify serializes the column as a boolean or 0/1
+      // depending on the driver, hence the two-form read; absent means an
+      // older read path and is left absent, never coerced to `false`.
+      ...(raw.health_check_enabled == null
+        ? {}
+        : {
+            health_check_enabled:
+              raw.health_check_enabled === true ||
+              raw.health_check_enabled === 1,
+          }),
+      // A dockerimage app's identity (cast#161). Both are nullable columns that
+      // a git-sourced app leaves null, so they are projected only when set, and
+      // only a manifest declaring `image:` compares them.
+      ...(typeof raw.docker_registry_image_name === "string" &&
+      raw.docker_registry_image_name !== ""
+        ? { docker_registry_image_name: raw.docker_registry_image_name }
+        : {}),
+      ...(typeof raw.docker_registry_image_tag === "string" &&
+      raw.docker_registry_image_tag !== ""
+        ? { docker_registry_image_tag: raw.docker_registry_image_tag }
+        : {}),
       domains: String(raw.fqdn ?? "")
         .split(",")
         .filter(Boolean),
@@ -1417,7 +1452,14 @@ async function runProject(
   // application keeps the refusal even on a clean plan, exactly as before —
   // a missing binding there is state the next create will need, and the
   // operator should hear about it now, not mid-bootstrap.
-  const githubAppUuid = desired.some((d) => d.kind === "application")
+  //
+  // A dockerimage application (cast#161) is created from a registry image
+  // through POST /applications/dockerimage, which takes no github_app_uuid and
+  // clones nothing — so a manifest whose applications are all images needs no
+  // App binding at all, for the same reason a databases-only one does not.
+  const githubAppUuid = desired.some(
+    (d) => d.kind === "application" && d.fields.build_pack !== "dockerimage",
+  )
     ? await ctx.client.githubAppUuid(githubAppNameFor(ctx.bindings, orgRepo))
     : null;
   const exec = buildExecutor(ctx.client, {
@@ -3764,15 +3806,39 @@ export function buildExecutor(
           change.fieldDiffs.map((f) => [f.field, f.desired]),
         );
         const projectUuid = await projectEnv();
+        if (
+          change.kind === "application" &&
+          fields.build_pack === "dockerimage"
+        ) {
+          // A registry image, not a checkout (cast#161): Coolify's own create
+          // route for the pack, which takes the image name and tag, the port
+          // and the domains, and no git or GitHub App field at all. The
+          // destination rides exactly as on the other creates. Coolify sets
+          // build_pack itself on this route (ApplicationsController.php:1846
+          // @ v4.1.2), so it is not sent — a field the server overwrites is
+          // one it might one day validate.
+          const { build_pack: _pack, ...imageFields } = fields;
+          const res = (await client.post("/applications/dockerimage", {
+            project_uuid: projectUuid,
+            environment_name: ctx.envName,
+            server_uuid: ctx.serverUuid,
+            ...destination,
+            name: change.name,
+            instant_deploy: false,
+            ...applicationApiFields(imageFields),
+          })) as { uuid: string };
+          return res.uuid;
+        }
         if (change.kind === "application") {
           // Unreachable by construction (#103): githubAppUuid is null only
-          // when the desired state holds no applications, and a plan can only
-          // create resources the desired state holds. Guarded anyway — this is
-          // the uuid's single consumer, and a null slipping onto the wire
-          // would surface as a Coolify 422 about somebody else's field.
+          // when the desired state holds no git-sourced applications, and a
+          // plan can only create resources the desired state holds. Guarded
+          // anyway — this is the uuid's single consumer, and a null slipping
+          // onto the wire would surface as a Coolify 422 about somebody else's
+          // field.
           if (ctx.githubAppUuid === null) {
             throw new Error(
-              "internal: application create reached an executor built without a GitHub App uuid — resolution was skipped as applications-free, yet the plan creates an application",
+              "internal: application create reached an executor built without a GitHub App uuid — resolution was skipped as free of git-sourced applications, yet the plan creates one",
             );
           }
           const res = (await client.post("/applications/private-github-app", {

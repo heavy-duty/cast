@@ -36,12 +36,26 @@ export function decryptSecrets(
     encoding: "utf8",
   });
   const secrets: Record<string, string> = {};
-  for (const raw of out.split("\n")) {
+  const lines = out.split("\n");
+  for (const [index, raw] of lines.entries()) {
     const line = raw.trim();
     if (line === "" || line.startsWith("#")) continue;
     const eq = line.indexOf("=");
-    if (eq === -1)
-      throw new Error("age store: malformed line (expected KEY=value)");
+    if (eq === -1) {
+      // Which line, and the likeliest cause, never the line itself: a store
+      // an older capture wrote with a multi-line value in it reads as one
+      // KEY=value line followed by lines that are neither (#163).
+      const previous = lines
+        .slice(0, index)
+        .reverse()
+        .find((l) => l.includes("="));
+      const under = previous
+        ? ` under ${previous.slice(0, previous.indexOf("="))}`
+        : "";
+      throw new Error(
+        `age store ${file}: line ${index + 1} is malformed (expected KEY=value)${under} — a multi-line value written by an older capture? Flatten it to one line with a literal \\n and capture again.`,
+      );
+    }
     secrets[line.slice(0, eq)] = line.slice(eq + 1);
   }
   return secrets;
@@ -59,6 +73,18 @@ export function encryptSecrets(
   file: string,
   vars: Record<string, string>,
 ): void {
+  // The writer's own belt (#163): capture refuses these in its plan, before
+  // the typed confirmation, and this is the single function that writes a
+  // store, so a value the reader cannot give back never reaches age from any
+  // caller. Names only, never the value.
+  const unwritable = Object.entries(vars)
+    .filter(([, v]) => /[\r\n]/.test(v))
+    .map(([k]) => k);
+  if (unwritable.length > 0) {
+    throw new Error(
+      `refusing to write ${file}: the value of ${unwritable.join(", ")} spans several lines, which the store's KEY=value-per-line format cannot carry (the store would read back as malformed). Flatten it to one line with a literal \\n and try again.`,
+    );
+  }
   const plaintext = `${Object.entries(vars)
     .map(([k, v]) => `${k}=${v}`)
     .join("\n")}\n`;

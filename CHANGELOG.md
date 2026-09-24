@@ -15,6 +15,8 @@ actually cutting it, and this file starts there.
   moved in place (#161)
 - `service_domains: { <service>: [] }` declares a compose service with no
   hostname, and it reads back clean (#161)
+- `cast --help` and the README show `--path` and `--hostname-overlay` on
+  `diff`, and a test keeps every command's flags on its usage lines (#151)
 
 ### Changed
 
@@ -25,6 +27,17 @@ actually cutting it, and this file starts there.
 - The release flow and labels automation now run heavy-duty/ceremony's shared
   machinery at 0.1.0; the prebuilt-asset build moves to the release-artifact
   hook (heavy-duty/ceremony#15)
+
+### Fixed
+
+- `install.sh` refuses node 22.0–22.11: the gate compares the minor version
+  its message always named, and one test binds the floor across
+  `package.json`, `README.md`, `bin/cast` and the installer (#154)
+- `ci.yml` declares `permissions: contents: read`, the token the workflow
+  needs and no more (#157)
+- `capture` refuses a multi-line value, overridden or captured, before the
+  confirmation, and the store's reader names the malformed line and its key
+  (#163)
 
 ## 0.2.0 — 2026-07-21
 

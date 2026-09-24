@@ -365,3 +365,119 @@ describe("portability — cast runs on the operator's own machine, macOS include
     });
   }
 });
+
+// --- the node prerequisite gate (#154) ---------------------------------------
+// The gate stated `>=22.12` and compared the major alone, so 22.0–22.11 passed
+// a check whose own message said they must not. Driven against the REAL
+// install.sh with a `node` shim on the child's PATH that reports a chosen
+// version to the two calls the gate makes (`-p process.versions.node`, `-v`)
+// and hands everything else to the real node, so a passing row still installs.
+const NODE_SHIM = `#!/usr/bin/env bash
+case "\${1:-}" in
+  -v) printf 'v%s\\n' "$CAST_TEST_NODE_VERSION" ;;
+  -p) case "\${2:-}" in
+        *process.versions.node*) printf '%s\\n' "$CAST_TEST_NODE_VERSION" ;;
+        *) exec "$CAST_TEST_REAL_NODE" "$@" ;;
+      esac ;;
+  *) exec "$CAST_TEST_REAL_NODE" "$@" ;;
+esac
+`;
+
+async function installWithNode(
+  version: string,
+  installSh = INSTALL_SH,
+): Promise<{ code: number; output: string }> {
+  const sb = sandbox();
+  const src = sourceTree(sb, "0.5.0");
+  const stubs = join(sb.root, "node-stubs");
+  mkdirSync(stubs);
+  writeFileSync(join(stubs, "node"), NODE_SHIM);
+  chmodSync(join(stubs, "node"), 0o755);
+  try {
+    const { stdout, stderr } = await run("bash", [installSh], {
+      env: {
+        ...sb.env,
+        PATH: `${stubs}:${sb.env.PATH}`,
+        CAST_INSTALL_SOURCE: src,
+        CAST_TEST_NODE_VERSION: version,
+        CAST_TEST_REAL_NODE: process.execPath,
+      },
+    });
+    return { code: 0, output: stdout + stderr };
+  } catch (e) {
+    const err = e as { code?: number; stdout?: string; stderr?: string };
+    return { code: err.code ?? 1, output: `${err.stdout}${err.stderr}` };
+  }
+}
+
+describe("install.sh — the node floor is 22.12, minor included (#154)", () => {
+  const REJECTED = ["20.19.0", "21.9.0", "22.0.0", "22.9.0", "22.11.0"];
+  const PASSED = ["22.12.0", "22.12.1", "22.23.2", "23.0.0", "24.1.0"];
+
+  it.each(REJECTED)(
+    "rejects node %s, naming the floor and the version found",
+    async (v) => {
+      const r = await installWithNode(v);
+      expect(r.code).not.toBe(0);
+      expect(r.output).toContain(`node >=22.12 is required (found v${v}).`);
+    },
+  );
+
+  it.each(PASSED)("passes node %s and installs", async (v) => {
+    const r = await installWithNode(v);
+    expect(r.code, r.output).toBe(0);
+    expect(r.output).toContain("done (local source");
+  });
+
+  // The message with no node at all is byte-identical to before the fix: the
+  // floor is data, and both messages read it.
+  it("says the same thing with node absent", async () => {
+    const sb = sandbox();
+    const src = sourceTree(sb, "0.5.0");
+    // A PATH of explicit tools only: on a merged-/usr system /bin is /usr/bin,
+    // so any PATH carrying it still finds node and proves nothing.
+    const tools = join(sb.root, "tools");
+    mkdirSync(tools);
+    for (const tool of [
+      "bash",
+      "tar",
+      "readlink",
+      "cut",
+      "printf",
+      "mkdir",
+      "cp",
+      "rm",
+      "mv",
+      "ln",
+      "cat",
+      "sed",
+      "grep",
+      "date",
+      "dirname",
+      "basename",
+      "uname",
+      "id",
+      "env",
+      "sh",
+    ]) {
+      const real = process.env.PATH?.split(":")
+        .map((d) => join(d, tool))
+        .find((p) => existsSync(p));
+      if (real)
+        writeFileSync(join(tools, tool), `#!/bin/sh\nexec "${real}" "$@"\n`),
+          chmodSync(join(tools, tool), 0o755);
+    }
+    let output = "";
+    try {
+      await run("bash", [INSTALL_SH], {
+        env: { ...sb.env, PATH: tools, CAST_INSTALL_SOURCE: src },
+      });
+    } catch (e) {
+      const err = e as { stdout?: string; stderr?: string };
+      output = `${err.stdout}${err.stderr}`;
+    }
+    expect(output).toContain(
+      "cast-install: ERROR: node >=22.12 is required but was not found.",
+    );
+  });
+});

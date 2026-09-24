@@ -1,8 +1,19 @@
 import { execFileSync, spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { decryptSecrets, keyFileFor, secretsFileFor } from "../src/secrets.js";
+import {
+  decryptSecrets,
+  encryptSecrets,
+  keyFileFor,
+  secretsFileFor,
+} from "../src/secrets.js";
 import { tmp } from "./helpers/tmp.js";
 
 // A key file and a store encrypted to it, for the decrypt tests.
@@ -46,6 +57,46 @@ describe("decryptSecrets", () => {
     } finally {
       closeSync(fd);
     }
+  });
+});
+
+// #163: the writer's own belt, and a reader that says which line and why.
+describe("encryptSecrets / decryptSecrets — a store is one KEY=value per line", () => {
+  it("encryptSecrets refuses a value with a newline, naming the key and never the value", () => {
+    const dir = tmp("infra-age-");
+    const keyFile = join(dir, "key.txt");
+    execFileSync("age-keygen", ["-o", keyFile]);
+    const recipient = execFileSync("age-keygen", ["-y", keyFile], {
+      encoding: "utf8",
+    }).trim();
+    const out = join(dir, "s.env.age");
+    expect(() =>
+      encryptSecrets(recipient, out, {
+        A: "fine",
+        PEM: "-----BEGIN\nSECRET-BODY\n-----END",
+      }),
+    ).toThrow(/refusing to write .*: the value of PEM spans several lines/);
+    expect(() =>
+      encryptSecrets(recipient, out, { PEM: "-----BEGIN\nSECRET-BODY" }),
+    ).not.toThrow(/SECRET-BODY/);
+    expect(existsSync(out)).toBe(false);
+  });
+  it("decryptSecrets names the malformed line and the key it sits under", () => {
+    const dir = tmp("infra-age-");
+    const keyFile = join(dir, "key.txt");
+    execFileSync("age-keygen", ["-o", keyFile]);
+    const recipient = execFileSync("age-keygen", ["-y", keyFile], {
+      encoding: "utf8",
+    }).trim();
+    const plain = join(dir, "s.env");
+    // What an older capture wrote for a multi-line value.
+    writeFileSync(plain, "A=1\nPEM=-----BEGIN\nMIIE\n-----END\n");
+    const enc = join(dir, "s.env.age");
+    execFileSync("age", ["-r", recipient, "-o", enc, plain]);
+    expect(() => decryptSecrets(enc, keyFile)).toThrow(
+      /line 3 is malformed \(expected KEY=value\) under PEM — a multi-line value written by an older capture\?/,
+    );
+    expect(() => decryptSecrets(enc, keyFile)).not.toThrow(/MIIE/);
   });
 });
 

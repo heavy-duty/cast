@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# The token this workflow runs with (#157). It executes code — the dependency
+# tree's install scripts under `npm ci`, the repo's own build and tests, and
+# `install.sh` — and calls no GitHub API and reads no secret, so the complete
+# set is one read scope. Naming it zeroes every scope left unnamed, which is
+# the point: a fork PR's token is read-only anyway, but the `push: main` run
+# on every merge, and a maintainer-branch PR (CONTRIBUTING permits them),
+# would otherwise carry whatever the org's default workflow permission is.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest

@@ -7,6 +7,10 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Added
+
+- `network_aliases:` on a non-compose application declares the names other resources reach it by, Coolify's `custom_network_aliases`: sent on create and update, compared as a set when declared, and drafted (#170)
+
 ## 0.4.0 — 2026-09-25
 
 ### Added

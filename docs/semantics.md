@@ -893,6 +893,51 @@ applied.
 
 A storage change redeploys the application, like any other mutation.
 
+## Network aliases (`network_aliases:`)
+
+A non-compose application's `network_aliases` list is the names **other
+resources on the destination network reach it by** (cast#170) — Coolify's
+`custom_network_aliases`. On a Docker Image resource the container's own name
+is Coolify's, made per deploy, and a rolling update runs two containers for a
+moment, so a caller cannot use it; an alias is the stable name.
+
+```yaml
+admin:
+  image: { name: ghcr.io/heavy-duty/la-familia-admin, tag: stable }
+  build: { pack: dockerimage }
+  port: 8787
+  network_aliases: [api]
+  domains: []
+```
+
+Accepted on `dockerimage`, `nixpacks`, `dockerfile` and `static`; **refused on
+`dockercompose`**, whose services name their aliases in the compose file. Each
+alias is `^[a-zA-Z0-9][a-zA-Z0-9._-]*$` and appears once.
+
+**On the wire** (v4.1.2): the create and PATCH allowlists both carry
+`custom_network_aliases` (`ApplicationsController.php:914`, `:2368`), validated
+only as `string|nullable` (`bootstrap/helpers/api.php:111`). cast sends the
+list comma-joined; `[]` sends `""`, which clears it. Coolify's model
+(`Application::customNetworkAliases`) splits a string on commas, trims each
+alias and rewrites a space to `-`, drops duplicates, and stores a JSON array —
+which is why cast refuses a comma or a space rather than let Coolify store
+something other than what the manifest says.
+
+**Read back and diffed** like any field: environment details serialize the
+column through the same accessor, as a comma string (null for none). cast
+splits and sorts it, and emits the desired list sorted, so the order Coolify
+stored them in is never drift. Compared **only when declared**: a manifest
+silent about aliases says nothing about the ones a box has. A read that carries
+no such key at all (a Coolify before the column) projects nothing.
+
+**An alias change redeploys the application**, like any other field — and it
+must: the alias is part of the application's configuration hash
+(`Application.php:1268`), and reaches the container only when it is started
+again.
+
+`draft` emits `network_aliases` for a non-compose application that has any,
+through the same parser the diff reads with.
+
 ## Instance selection
 
 **The Coolify a command talks to is an explicit, named value** — not a property

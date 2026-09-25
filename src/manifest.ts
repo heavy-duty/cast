@@ -169,6 +169,12 @@ const StorageSchema = z
   })
   .strict();
 
+// A network alias (cast#170): a DNS label a container answers on. Coolify
+// 4.1.2 validates `custom_network_aliases` only as a string, splits it on
+// commas, and rewrites a space to `-` (Application::customNetworkAliases), so
+// cast holds each entry to the shape that survives that round trip unchanged.
+const NETWORK_ALIAS = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+
 // The packs Coolify clones a git source for. `dockerimage` is the one that does
 // not: its application is created from a registry image, through a different
 // route (POST /applications/dockerimage), and carries no `source`.
@@ -221,10 +227,41 @@ const AppSpecSchema = z
     // Persistent volumes on a non-compose application (cast#167). A compose
     // application's volumes are its compose file's, and are refused here.
     storages: z.array(StorageSchema).optional(),
+    // Network aliases on a non-compose application (cast#170): the names
+    // another resource on the destination network reaches it by, Coolify's
+    // `custom_network_aliases`. A compose application's aliases are its
+    // compose file's, and are refused here.
+    network_aliases: z
+      .array(
+        z
+          .string()
+          .regex(
+            NETWORK_ALIAS,
+            "network_aliases[] must start with a letter or digit and hold only letters, digits, '.', '_' or '-' — Coolify splits the list on commas and rewrites a space to '-'",
+          ),
+      )
+      .optional(),
     env_template: z.string().optional(),
   })
   .strict()
   .superRefine((app, ctx) => {
+    if (app.network_aliases) {
+      const seen = new Set<string>();
+      for (const alias of app.network_aliases) {
+        if (seen.has(alias))
+          ctx.addIssue({
+            code: "custom",
+            message: `network_aliases: ${alias} is listed twice (Coolify keeps one)`,
+          });
+        seen.add(alias);
+      }
+      if (app.build.pack === "dockercompose")
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "network_aliases not allowed on a dockercompose app (a compose service's aliases live in the compose file, under its networks)",
+        });
+    }
     // A volume is matched by its name and mounted at one path: two entries
     // sharing either would be two claims on one thing, and apply could only
     // honour one of them.

@@ -797,6 +797,12 @@ export function desiredFromManifest(
               ...(app.storages !== undefined
                 ? { storages: canonicalStorages(app.storages) }
                 : {}),
+              // Network aliases (cast#170), only when DECLARED, sorted so the
+              // order Coolify stores them in never reads as drift. `[]` is a
+              // declaration too: it asserts there are none.
+              ...(app.network_aliases !== undefined
+                ? { network_aliases: [...app.network_aliases].sort() }
+                : {}),
             }),
         // Outside the pack branch: basic auth is a property of the APPLICATION
         // (Coolify sets it on the app's proxy labels, not on anything the build
@@ -924,4 +930,14 @@ export function canonicalStorages(
         : {}),
     }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+// `custom_network_aliases` as Coolify reads it back — a comma string, or null
+// for none — into the manifest's sorted list (cast#170). Shared by the diff's
+// read-back (projectLiveFields) and `draft`, so the two agree to the byte.
+export function parseNetworkAliases(raw: unknown): string[] {
+  const list = Array.isArray(raw)
+    ? raw.map(String)
+    : String(raw ?? "").split(",");
+  return [...new Set(list.map((a) => a.trim()).filter(Boolean))].sort();
 }

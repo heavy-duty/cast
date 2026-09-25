@@ -8,7 +8,7 @@
 "scope:apply":
   - changed-files:
       - any-glob-to-any-file:
-          ["src/apply.ts", "src/diff.ts", "src/destroy.ts", "src/smoke.ts", "test/apply.test.ts", "test/diff.test.ts", "test/destroy.test.ts", "test/storages*.test.ts"]
+          ["src/apply.ts", "src/diff.ts", "src/destroy.ts", "src/smoke.ts", "test/apply.test.ts", "test/diff.test.ts", "test/destroy.test.ts", "test/storages*.test.ts", "test/network-aliases*.test.ts"]
 "scope:secrets":
   - changed-files:
       - any-glob-to-any-file: ["src/secrets.ts", "test/secrets.test.ts"]

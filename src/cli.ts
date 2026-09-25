@@ -108,6 +108,7 @@ import {
   desiredFromManifest,
   fillDesiredDerived,
   manifestResources,
+  parseNetworkAliases,
   refusesPathInProd,
   requiredSecrets,
   resolveCheckout,
@@ -507,6 +508,14 @@ export function projectLiveFields(
         : {}),
       ...(raw.ports_exposes ? { port: Number(raw.ports_exposes) } : {}),
       ...(raw.health_check_path ? { healthcheck: raw.health_check_path } : {}),
+      // Network aliases (cast#170): Coolify stores a JSON array and serializes
+      // it back as a comma string (Application::customNetworkAliases @ v4.1.2);
+      // null means none. Projected sorted, as the desired side emits it, and
+      // compared only when a manifest declares `network_aliases:`. A read that
+      // carries no such key at all (an older Coolify) projects nothing.
+      ...("custom_network_aliases" in raw
+        ? { network_aliases: parseNetworkAliases(raw.custom_network_aliases) }
+        : {}),
       // The toggle behind the path (cast#161). Compared only when the desired
       // side declares `healthcheck` (resolve.ts emits the pair together), so a
       // manifest silent about health checks never diffs on it; a live `false`
@@ -3196,6 +3205,7 @@ export function applicationApiFields(
     domains,
     docker_compose_domains,
     storages: _storages,
+    network_aliases,
     ...rest
   } = fields;
   // Coolify's presence rule, enforced at the wire (cast#76). PATCH
@@ -3259,6 +3269,11 @@ export function applicationApiFields(
     // domains wants a comma-separated string, not an array.
     ...(port !== undefined ? { ports_exposes: String(port) } : {}),
     ...(healthcheck !== undefined ? { health_check_path: healthcheck } : {}),
+    // Coolify takes the aliases as one comma string (cast#170); `[]` sends ""
+    // which clears them, and an undeclared list sends nothing at all.
+    ...(Array.isArray(network_aliases)
+      ? { custom_network_aliases: network_aliases.join(",") }
+      : {}),
     ...(domains !== undefined
       ? { domains: Array.isArray(domains) ? domains.join(",") : domains }
       : {}),

@@ -8,6 +8,7 @@ import {
   isReservedEnvName,
   reservedConsequence,
 } from "./reserved.js";
+import { parseNetworkAliases } from "./resolve.js";
 import { encryptSecrets } from "./secrets.js";
 
 // `inventory` can already SEE a whole instance (#22). This is it writing down
@@ -559,6 +560,11 @@ function applicationSpec(
       `a file storage is mounted at ${f.mount_path || "(no path)"}: a file or directory Coolify writes from the host. The manifest declares persistent volumes only (\`storages:\`), so it is NOT in this draft; re-create it by hand after a rebuild.`,
     );
   }
+  // Network aliases ARE captured (cast#170): the names other resources reach
+  // this one by, read off the same column the diff reads, through the same
+  // parser. None emits nothing.
+  const aliases = parseNetworkAliases(r.raw.custom_network_aliases);
+  const networkAliases = aliases.length > 0 ? { network_aliases: aliases } : {};
   const storages =
     st && st !== "unreadable" && st.persistent.length > 0
       ? { storages: st.persistent }
@@ -586,6 +592,7 @@ function applicationSpec(
         : {}),
       domains: fqdn,
       ...storages,
+      ...networkAliases,
       ...(hasEnv
         ? { env_template: `env/${slug(r.name)}.${ctx.env}.env.template` }
         : {}),
@@ -649,6 +656,7 @@ function applicationSpec(
             : {}),
           domains: fqdn,
           ...storages,
+          ...networkAliases,
         }),
     ...(compose
       ? { service_domains: composeDomains(r, project, uncaptured) }

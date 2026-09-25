@@ -7,6 +7,8 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+## 0.4.0 — 2026-09-25
+
 ### Added
 
 - `storages:` on a non-compose application declares its persistent volumes: created through `POST /applications/{uuid}/storages`, compared by name, moved in place, and an undeclared one reported and never deleted; `draft` emits them (#167)

@@ -168,6 +168,24 @@ export type DraftResource = {
   // in UNCAPTURED.md rather than aborting the sweep the way
   // attachServiceDomains fails a one-project diff closed.
   serviceDomains?: Record<string, string[]>;
+  // Non-compose applications only: the storages read off
+  // GET /applications/{uuid}/storages (cast#167) — the supplementary GET
+  // diff/apply make for an application that declares `storages:`, made here by
+  // the CLI's draft loop for every drafted non-compose application, with the
+  // persistent ones projected through THE projection diff/apply use
+  // (projectStorages in cli.ts). `"unreadable"` is a failed read, REPORTED in
+  // UNCAPTURED.md rather than aborting the sweep; absent means not read (a
+  // compose application, whose volumes are its compose file's).
+  storages?:
+    | {
+        persistent: Array<{
+          name: string;
+          mount_path: string;
+          host_path?: string;
+        }>;
+        files: Array<{ mount_path: string }>;
+      }
+    | "unreadable";
 };
 
 export type DraftProject = {
@@ -525,6 +543,27 @@ function applicationSpec(
     );
   }
 
+  // Persistent volumes ARE captured (cast#167); a failed read and a `file`
+  // storage are not, and each is named here — a rebuild without its volume
+  // comes up EMPTY, which is the quietest way to lose data there is.
+  const st = r.storages;
+  if (st === "unreadable") {
+    flag(
+      "storages",
+      "`GET /applications/{uuid}/storages` was unreachable or returned a shape cast does not recognize, so this application's volumes are NOT in this draft. If it holds data on a volume, a rebuild from here comes up empty: read them off the Coolify UI and declare `storages: [{ name, mount_path }]` yourself.",
+    );
+  }
+  for (const f of st && st !== "unreadable" ? st.files : []) {
+    flag(
+      "file storage",
+      `a file storage is mounted at ${f.mount_path || "(no path)"}: a file or directory Coolify writes from the host. The manifest declares persistent volumes only (\`storages:\`), so it is NOT in this draft; re-create it by hand after a rebuild.`,
+    );
+  }
+  const storages =
+    st && st !== "unreadable" && st.persistent.length > 0
+      ? { storages: st.persistent }
+      : {};
+
   if (image) {
     // `port` is required on the pack (the proxy and the health check need
     // it), so a box that reports none gets 80 and a line saying so — an
@@ -546,6 +585,7 @@ function applicationSpec(
         ? { healthcheck: String(r.raw.health_check_path) }
         : {}),
       domains: fqdn,
+      ...storages,
       ...(hasEnv
         ? { env_template: `env/${slug(r.name)}.${ctx.env}.env.template` }
         : {}),
@@ -608,6 +648,7 @@ function applicationSpec(
             ? { healthcheck: String(r.raw.health_check_path) }
             : {}),
           domains: fqdn,
+          ...storages,
         }),
     ...(compose
       ? { service_domains: composeDomains(r, project, uncaptured) }

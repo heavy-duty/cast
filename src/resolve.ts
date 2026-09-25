@@ -788,6 +788,15 @@ export function desiredFromManifest(
               ...(app.build.start_command !== undefined
                 ? { start_command: app.build.start_command }
                 : {}),
+              // Persistent volumes (cast#167), emitted only when DECLARED — the
+              // is_static rule again: a manifest silent about volumes says
+              // nothing about the ones a box holds. Canonical, so the diff
+              // compares it by value: sorted by name, and `host_path` only when
+              // given, which is exactly the live projection's shape
+              // (projectStorages in cli.ts).
+              ...(app.storages !== undefined
+                ? { storages: canonicalStorages(app.storages) }
+                : {}),
             }),
         // Outside the pack branch: basic auth is a property of the APPLICATION
         // (Coolify sets it on the app's proxy labels, not on anything the build
@@ -891,4 +900,28 @@ export function fillDesiredDerived(
   return desired.map((d) =>
     d.env ? { ...d, env: fillDerivedEnv(d.env, urls) } : d,
   );
+}
+
+// A storage list in the one shape both sides of a diff use (cast#167): sorted
+// by name, each entry `{ name, mount_path }` plus `host_path` only when set.
+// The desired side (above) and the live projection (projectStorages in
+// cli.ts) both go through here, so they cannot disagree about key order or
+// about how an absent host path is spelled.
+export type StorageDecl = {
+  name: string;
+  mount_path: string;
+  host_path?: string;
+};
+export function canonicalStorages(
+  list: Array<{ name: string; mount_path: string; host_path?: string | null }>,
+): StorageDecl[] {
+  return [...list]
+    .map((st) => ({
+      name: st.name,
+      mount_path: st.mount_path,
+      ...(typeof st.host_path === "string" && st.host_path !== ""
+        ? { host_path: st.host_path }
+        : {}),
+    }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }

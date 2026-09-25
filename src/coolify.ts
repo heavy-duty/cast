@@ -52,6 +52,65 @@ export type LiveBackup = {
 //               "backed up" (which would pass a cutover on an unbacked-up db).
 export type BackupRead = LiveBackup[] | undefined;
 
+// An application's storages as GET /applications/{uuid}/storages answers them
+// (cast#167; ApplicationsController::storages @ v4.1.2):
+// `{ persistent_storages: [...], file_storages: [...] }`, each row a model.
+// `name` is the STORED name — `<application uuid>-<declared name>` for a volume
+// the API created — and is left as stored here; stripping the prefix is the
+// projection's job (projectStorages in cli.ts), because only it holds the
+// application's uuid.
+//
+// `undefined` means "could not read": unreachable, a non-2xx, or a body that is
+// not this shape. It is a DIFFERENT fact from "has none" (both lists empty),
+// the BackupRead rule on another route — an unreadable read must produce
+// neither drift nor a clean bill, and must never let apply POST a volume that
+// may already exist.
+export type LiveStorage = {
+  uuid: string;
+  name: string;
+  mount_path: string;
+  host_path: string | null;
+};
+export type StorageRead =
+  | { persistent: LiveStorage[]; files: Array<{ mount_path: string }> }
+  | undefined;
+
+export function parseApplicationStorages(raw: unknown): StorageRead {
+  const body = raw as {
+    persistent_storages?: unknown;
+    file_storages?: unknown;
+  } | null;
+  if (
+    !body ||
+    typeof body !== "object" ||
+    !Array.isArray(body.persistent_storages) ||
+    !Array.isArray(body.file_storages)
+  )
+    return undefined;
+  const persistent: LiveStorage[] = [];
+  for (const row of body.persistent_storages as Array<
+    Record<string, unknown>
+  >) {
+    if (
+      !row ||
+      typeof row.name !== "string" ||
+      typeof row.mount_path !== "string" ||
+      typeof row.uuid !== "string"
+    )
+      return undefined;
+    persistent.push({
+      uuid: row.uuid,
+      name: row.name,
+      mount_path: row.mount_path,
+      host_path: typeof row.host_path === "string" ? row.host_path : null,
+    });
+  }
+  const files = (body.file_storages as Array<Record<string, unknown>>).map(
+    (row) => ({ mount_path: String(row?.mount_path ?? "") }),
+  );
+  return { persistent, files };
+}
+
 // Coolify's int columns arrive as ints, but a tinyint `enabled` has no cast on
 // ScheduledDatabaseBackup (v4.1.2 casts() covers only the two float storage
 // fields), so it can serialize as 1/0 rather than true/false. Accept both; only
@@ -423,6 +482,20 @@ export class CoolifyClient {
   // `[]` for that, with a 200. Reading 404 as "none" would let a mistyped uuid
   // report an unbacked-up database as clean, and let apply POST a second schedule
   // onto a database that already had one.
+  // An application's storages, parsed (cast#167). Every failure — transport, a
+  // non-2xx including 404, an unrecognized body — lands on `undefined`, for the
+  // databaseBackupSchedules reason below: a 404 here is "no such application",
+  // never "no volumes".
+  async applicationStorages(uuid: string): Promise<StorageRead> {
+    try {
+      return parseApplicationStorages(
+        await this.get(`/applications/${encodeURIComponent(uuid)}/storages`),
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
   async databaseBackupSchedules(uuid: string): Promise<BackupRead> {
     try {
       return parseBackupSchedules(await this.databaseBackups(uuid));

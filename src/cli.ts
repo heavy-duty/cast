@@ -102,6 +102,8 @@ import {
 import { assertNoReservedEnvNames, reservedHits } from "./reserved.js";
 import {
   PATH_IN_PROD_REFUSAL,
+  type StorageDecl,
+  canonicalStorages,
   canonicalizeServiceDomains,
   desiredFromManifest,
   fillDesiredDerived,
@@ -718,6 +720,50 @@ export async function attachBackup(
     retention: schedule.retention,
     ...(schedule.enabled ? {} : { enabled: false }),
   };
+}
+
+// An application's persistent storages in the manifest's shape (cast#167): the
+// stored `<application uuid>-<name>` loses its prefix, so a declared `name`
+// matches the volume the API created from it. A name without the prefix (a
+// volume made some other way) is kept whole: it matches only a declaration of
+// exactly that name, and otherwise reads as undeclared — reported, never
+// guessed at. THE one projection, shared by diff/apply (attachStorages) and
+// draft, so a drafted manifest diffs clean the moment it is applied.
+export function projectStorages(
+  appUuid: string,
+  persistent: Array<{
+    name: string;
+    mount_path: string;
+    host_path: string | null;
+  }>,
+): StorageDecl[] {
+  const prefix = `${appUuid}-`;
+  return canonicalStorages(
+    persistent.map((st) => ({
+      name: st.name.startsWith(prefix) ? st.name.slice(prefix.length) : st.name,
+      mount_path: st.mount_path,
+      host_path: st.host_path,
+    })),
+  );
+}
+
+// Attach an application's persistent storages to its Live, or the reason there
+// is none to attach (cast#167) — a supplementary GET, made only for an
+// application whose manifest declares `storages:` (runProject decides; see
+// there). Read cleanly, the full list goes in `fields.storages` and
+// computeDiff compares the declared names and reports the rest. Unreadable,
+// storagesNotCompared: neither drift nor a clean bill.
+export async function attachStorages(
+  client: CoolifyClient,
+  app: Live,
+): Promise<void> {
+  const read = await client.applicationStorages(app.uuid);
+  if (read === undefined) {
+    app.storagesNotCompared =
+      "GET /applications/{uuid}/storages was unreachable or returned a shape cast does not recognize";
+    return;
+  }
+  app.fields.storages = projectStorages(app.uuid, read.persistent);
 }
 
 // Project GET /services/{uuid}'s body into the manifest's `service_domains`
@@ -1491,6 +1537,17 @@ async function runProject(
   // the D-237 lie by another route: a confident full-create plan that verified
   // nothing, against a box that has all of it under other names.
   const live = lookup.found ? aliasLive(lookup.live, aliases) : [];
+  // Storages (cast#167): one supplementary GET per live application whose
+  // manifest DECLARES `storages:` — after aliasing, so the manifest's name is
+  // the one matched. A manifest silent about volumes reads none and says
+  // nothing about them.
+  for (const l of live) {
+    if (l.kind !== "application") continue;
+    const d = desired.find(
+      (x) => x.kind === "application" && x.name === l.name,
+    );
+    if (d && "storages" in d.fields) await attachStorages(ctx.client, l);
+  }
   if (ctx.mode === "full") {
     for (const l of live) {
       l.env = await fetchEnv(ctx.client, l);
@@ -2439,6 +2496,24 @@ async function main(): Promise<number> {
           r.env = flattenEnv(
             await fetchEnv(client, { kind: r.kind, uuid: r.uuid }),
           );
+          // An application's volumes (cast#167), on their own route like a
+          // database's backups: read for every drafted NON-compose application
+          // (a compose application's volumes are its compose file's), projected
+          // through THE projection diff/apply use, so the drafted `storages:`
+          // diffs clean once applied. A failed read becomes an UNCAPTURED entry.
+          if (
+            r.kind === "application" &&
+            r.raw.build_pack !== "dockercompose"
+          ) {
+            const read = await client.applicationStorages(r.uuid);
+            r.storages =
+              read === undefined
+                ? "unreadable"
+                : {
+                    persistent: projectStorages(r.uuid, read.persistent),
+                    files: read.files,
+                  };
+          }
           // A service's hostnames live behind the same kind of supplementary
           // GET as a database's backups (#83, sibling of #75 — one design, both
           // reads): GET /services/{uuid} is the only route that eager-loads
@@ -3111,8 +3186,18 @@ function projectEnvironmentResolver(
 export function applicationApiFields(
   fields: Record<string, unknown>,
 ): Record<string, unknown> {
-  const { port, healthcheck, domains, docker_compose_domains, ...rest } =
-    fields;
+  // `storages` is not a column on the application: it is rows on another
+  // route (/applications/{uuid}/storages, cast#167), written by the executor's
+  // storage reconcile. It rides in `fields` to be DIFFED; it must never reach
+  // the application's own create or PATCH body, which rejects unknown fields.
+  const {
+    port,
+    healthcheck,
+    domains,
+    docker_compose_domains,
+    storages: _storages,
+    ...rest
+  } = fields;
   // Coolify's presence rule, enforced at the wire (cast#76). PATCH
   // /applications/{uuid} rejects an enable without both credentials
   // (ApplicationsController.php:2446-2463 @ v4.1.2) and the create allowlist
@@ -3219,6 +3304,35 @@ export function desiredBackup(
   if (typeof b.frequency !== "string" || typeof b.retention !== "number")
     return undefined;
   return { frequency: b.frequency, retention: b.retention };
+}
+
+// The declared storages, narrowed out of the untyped `fields` bag (cast#167).
+// The schema has already checked every entry; anything malformed here reads as
+// none, the desiredBackup rule — writing half a volume is worse than none.
+export function desiredStorages(
+  fields: Record<string, unknown>,
+): StorageDecl[] {
+  const list = fields.storages;
+  if (!Array.isArray(list)) return [];
+  return list.filter(
+    (st): st is StorageDecl =>
+      !!st &&
+      typeof st.name === "string" &&
+      typeof st.mount_path === "string" &&
+      (st.host_path === undefined || typeof st.host_path === "string"),
+  );
+}
+
+// The body of a storage create (cast#167): Coolify's own shape for a persistent
+// volume. `host_path` only when declared — omitted, the volume is a Docker named
+// volume, `<application uuid>-<name>`.
+export function storageBody(st: StorageDecl): Record<string, unknown> {
+  return {
+    type: "persistent",
+    name: st.name,
+    mount_path: st.mount_path,
+    ...(st.host_path ? { host_path: st.host_path } : {}),
+  };
 }
 
 export function databaseApiFields(
@@ -3726,6 +3840,48 @@ export function buildExecutor(
     }
     await client.post(`/databases/${dbUuid}/backups`, body);
   };
+  // Make an application's persistent storages match the manifest (cast#167).
+  // Matched by NAME: a declared name absent live is POSTed; one whose paths
+  // differ is PATCHed in place — never its name, which is the match and which
+  // Coolify stores prefixed. A live storage the manifest does not declare is
+  // left exactly as it is (the iron rule: apply never deletes, and a volume
+  // holds data). Reads first, like reconcileBackupSchedule, and RAISES when the
+  // read fails: POSTing blindly could create a second volume beside the one
+  // that holds the data, and skipping would be the silent no-op.
+  const reconcileStorages = async (
+    appUuid: string,
+    declared: StorageDecl[],
+  ): Promise<void> => {
+    const read = await client.applicationStorages(appUuid);
+    if (read === undefined) {
+      throw new Error(
+        `application ${appUuid}: cannot set the declared storages — GET /applications/${appUuid}/storages was unreachable or returned an unrecognized shape, so cast cannot tell which volumes already exist (creating one blindly could put an empty volume where the data is expected). Re-run when the API is reachable.`,
+      );
+    }
+    const prefix = `${appUuid}-`;
+    const byName = new Map(
+      read.persistent.map((st) => [
+        st.name.startsWith(prefix) ? st.name.slice(prefix.length) : st.name,
+        st,
+      ]),
+    );
+    for (const st of declared) {
+      const live = byName.get(st.name);
+      if (!live) {
+        await client.post(`/applications/${appUuid}/storages`, storageBody(st));
+        continue;
+      }
+      const hostPath = st.host_path ?? null;
+      if (live.mount_path === st.mount_path && live.host_path === hostPath)
+        continue;
+      await client.patch(`/applications/${appUuid}/storages`, {
+        uuid: live.uuid,
+        type: "persistent",
+        mount_path: st.mount_path,
+        host_path: hostPath,
+      });
+    }
+  };
   // Resolve any ${resource:<name>.url} still unresolved when apply is about to
   // write an env (#60). It can only still be unresolved on a from-nothing run:
   // runProject filled every ref whose database already existed at plan time, so
@@ -3849,6 +4005,15 @@ export function buildExecutor(
             instant_deploy: false,
             ...applicationApiFields(imageFields),
           })) as { uuid: string };
+          // Its volumes, before anything deploys it (the create is
+          // instant_deploy: false, and apply redeploys after): an application
+          // created a moment ago provably has none, so each declared storage is
+          // a POST — the database-backup create rule (cast#167).
+          for (const st of desiredStorages(fields))
+            await client.post(
+              `/applications/${res.uuid}/storages`,
+              storageBody(st),
+            );
           return res.uuid;
         }
         if (change.kind === "application") {
@@ -3879,6 +4044,11 @@ export function buildExecutor(
               ? { connect_to_docker_network: true }
               : {}),
           })) as { uuid: string };
+          for (const st of desiredStorages(fields))
+            await client.post(
+              `/applications/${res.uuid}/storages`,
+              storageBody(st),
+            );
           return res.uuid;
         }
         if (change.kind === "database") {
@@ -3944,6 +4114,10 @@ export function buildExecutor(
         const schedule = desiredBackup(fields);
         if (schedule) await reconcileBackupSchedule(uuid, schedule);
       }
+      // Declared storages on UPDATE, not only on create (cast#167): adding a
+      // volume to a live application is an apply, like adding a backup.
+      if (kind === "application" && "storages" in fields)
+        await reconcileStorages(uuid, desiredStorages(fields));
     },
     async syncEnv(uuid, kind, env) {
       // Fill any ${resource:<name>.url} still carrying the unresolved sentinel

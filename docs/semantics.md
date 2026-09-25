@@ -820,6 +820,79 @@ mutates, and a schedule change is a mutation of the database, so changing
 `frequency` restarts the container. Consistent with every other field, and worth
 knowing before you edit a schedule on a live production database.
 
+## Persistent storages (`storages:`)
+
+A non-compose application's `storages` list declares its **persistent volumes**
+(cast#167) — the data a Docker Image resource keeps across redeploys, which a
+manifest could not say before, so a volume on such a resource was a hand-set UI
+setting:
+
+```yaml
+admin:
+  image: { name: ghcr.io/heavy-duty/la-familia-admin, tag: stable }
+  build: { pack: dockerimage }
+  port: 8787
+  healthcheck: /api/health
+  storages:
+    - { name: admin-data, mount_path: /data }
+  domains: []
+```
+
+Accepted on `dockerimage`, `nixpacks`, `dockerfile` and `static`; **refused on
+`dockercompose`**, whose volumes are its compose file's. Each entry is `name`
+(Coolify's volume-name rule, `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`), `mount_path` (an
+absolute path in the container) and an optional `host_path` (an absolute path on
+the server; omitted, the volume is a Docker named volume). Two entries sharing a
+name or a mount path are refused at parse time.
+
+It has its own route, beside the application's, like a database's backups:
+
+```
+GET    /applications/{uuid}/storages   ← { persistent_storages: [...], file_storages: [...] }
+POST   /applications/{uuid}/storages   ← create: { type: "persistent", name, mount_path, host_path? }
+PATCH  /applications/{uuid}/storages   ← update: { uuid, type, mount_path, host_path } (the storage's uuid is in the BODY at 4.1.2)
+```
+
+**The name is bound to the resource.** Coolify stores a volume the API creates as
+**`<application uuid>-<name>`** (`ApplicationsController::create_storage`,
+v4.1.2). cast strips that prefix on the read, so the declared name matches; and
+because the stored name carries the application's uuid, **recreating the
+resource is a data migration, not an apply** — a new application gets a new,
+empty volume beside the old one.
+
+**Compared by name, only when declared.** `diff` and `apply` read the route for
+each application whose manifest declares `storages:` (one supplementary GET, like
+`backup:`), and compare the declared names:
+
+- a declared name absent live is a **create** — `apply` POSTs it, on a new
+  application after the create and before the first deploy, and on an existing
+  one on update;
+- a declared name whose `mount_path` or `host_path` differs is an **update in
+  place** — a PATCH by the storage's uuid. The name is never PATCHed: it is the
+  match, and Coolify writes a PATCHed name verbatim, without the prefix;
+- a live persistent storage the manifest does **not** declare is **reported and
+  never deleted** — `undeclared storage <name> on application <app>` — and
+  counts against `clean`, like an orphan resource. An orphan volume holds data;
+  only a person can decide what it was.
+
+**An unreadable answer** — the route unreachable, a non-2xx (a 404 included: it
+means no such application, never "no volumes"), or a body cast does not
+recognize — is `storages on application <app> declared, NOT compared`: neither
+drift nor clean. On the write side the same failure **raises**: POSTing blind
+could create an empty volume where the data is expected.
+
+**A manifest silent about storages says nothing about them** — no read, no
+comparison, no report — the `is_static` rule: an upgrade of cast must not start
+reporting volumes nobody declared.
+
+**`file` storages** (a file or directory Coolify writes from the host) are the
+same route with another shape and are **not in the vocabulary**. `draft` names
+each one in UNCAPTURED.md, and drafts persistent volumes as `storages:` through
+the same projection the diff reads, so a drafted manifest diffs clean once
+applied.
+
+A storage change redeploys the application, like any other mutation.
+
 ## Instance selection
 
 **The Coolify a command talks to is an explicit, named value** — not a property

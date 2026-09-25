@@ -100,6 +100,13 @@ export type Live = {
   // equivalent: computeDiff would diff `true` against `undefined` and report
   // confident drift, and apply would rewrite a protection it never read.
   basicAuthNotCompared?: string;
+  // Set ONLY when GET /applications/{uuid}/storages could not be read for an
+  // application whose manifest declares `storages:` (cast#167) — the reason,
+  // printed verbatim. The backupNotCompared rule on another route: DO NOT
+  // COMPARE `storages` for this application. Leaving it merely absent from
+  // `fields` would diff every declared volume as "to create", and let apply
+  // POST a volume that may well exist and hold the data.
+  storagesNotCompared?: string;
 };
 export type FieldDiff = {
   field: string;
@@ -188,6 +195,19 @@ export type DiffReport = {
   // it is an absence of evidence, not evidence of drift, and a run that failed
   // because a read failed is a run operators learn to force past.
   basicAuthNotCompared: { name: string; fields: string[]; reason: string }[];
+  // Applications whose declared `storages:` cast could not read back this run
+  // (cast#167). Same disposition as backupsNotCompared: printed, NOT counted
+  // against `clean`.
+  storagesNotCompared: { name: string; reason: string }[];
+  // Live persistent storages on an application that declares `storages:`, but
+  // not under any declared name (cast#167). Reported and NEVER deleted — an
+  // orphan volume holds data, and apply never removes anything. Counted against
+  // `clean`, like an orphan resource: it is real drift, and only a person can
+  // resolve it (declare it, or remove it in the UI knowing what it held).
+  storagesUndeclared: {
+    name: string;
+    storages: { name: string; mount_path: string }[];
+  }[];
   clean: boolean;
 };
 
@@ -362,6 +382,8 @@ export function computeDiff(
   const changes: Change[] = [];
   const backupsNotCompared: { name: string; reason: string }[] = [];
   const basicAuthNotCompared: DiffReport["basicAuthNotCompared"] = [];
+  const storagesNotCompared: DiffReport["storagesNotCompared"] = [];
+  const storagesUndeclared: DiffReport["storagesUndeclared"] = [];
   // is_static is unreadable on Coolify 4.1.2's read path (cast#68); warn once
   // per run when the degradation actually bites (a manifest declares `static:`
   // on an app whose live value cast could not read), not per application.
@@ -424,7 +446,43 @@ export function computeDiff(
         reason: l.basicAuthNotCompared as string,
       });
     }
+    // Storages (cast#167), compared by NAME, and only when declared. The live
+    // side carries every persistent storage the application has (attached for
+    // declared applications only, see attachStorages); the comparison sees the
+    // live entries under the declared names, and whatever else is there is
+    // reported as undeclared and left alone. Unreadable: skipped and reported,
+    // the backup rule.
+    const liveFields: Record<string, unknown> = { ...l.fields };
+    let skipStorages = false;
+    if ("storages" in d.fields) {
+      if (l.storagesNotCompared !== undefined) {
+        storagesNotCompared.push({
+          name: d.name,
+          reason: l.storagesNotCompared,
+        });
+        skipStorages = true;
+      } else {
+        const declared = new Set(
+          (d.fields.storages as Array<{ name: string }>).map((st) => st.name),
+        );
+        const all = (l.fields.storages ?? []) as Array<{
+          name: string;
+          mount_path: string;
+        }>;
+        liveFields.storages = all.filter((st) => declared.has(st.name));
+        const extra = all.filter((st) => !declared.has(st.name));
+        if (extra.length > 0)
+          storagesUndeclared.push({
+            name: d.name,
+            storages: extra.map((st) => ({
+              name: st.name,
+              mount_path: st.mount_path,
+            })),
+          });
+      }
+    }
     const fieldDiffs: FieldDiff[] = Object.entries(d.fields)
+      .filter(([field]) => !(skipStorages && field === "storages"))
       .filter(([field]) => !(skipBackup && field === "backup"))
       .filter(([field]) => !skippedBasicAuth.includes(field))
       .filter(([field]) => {
@@ -447,11 +505,11 @@ export function computeDiff(
         }
         return true;
       })
-      .filter(([field, value]) => !eq(value, l.fields[field]))
+      .filter(([field, value]) => !eq(value, liveFields[field]))
       .map(([field, value]) => ({
         field,
         desired: value,
-        live: l.fields[field],
+        live: liveFields[field],
         updatable: !NON_UPDATABLE[d.kind].includes(field),
       }));
     const envDiffs =
@@ -480,6 +538,8 @@ export function computeDiff(
     placement,
     backupsNotCompared,
     basicAuthNotCompared,
+    storagesNotCompared,
+    storagesUndeclared,
     // A split project is drift, and drift is not clean — the same disposition
     // as an orphan: reported, counted, and NOT repaired (apply moves nothing
     // between networks; see renderDiff).
@@ -497,6 +557,7 @@ export function computeDiff(
     clean:
       changes.length === 0 &&
       orphans.length === 0 &&
+      storagesUndeclared.length === 0 &&
       reserved.length === 0 &&
       !placement.split,
   };
@@ -534,6 +595,12 @@ export function renderDiff(report: DiffReport): string {
       // REDACTED_FIELDS. `f.live` is undefined here whenever the read could not
       // see it, which is the common case, so even the shape of the old value
       // would be a claim cast cannot make.
+      // One line per storage (cast#167), never the two lists as JSON: what an
+      // operator has to read is which volume is created and which one moves.
+      if (f.field === "storages") {
+        lines.push(...renderStorageDiff(f));
+        continue;
+      }
       if (REDACTED_FIELDS.has(f.field)) {
         lines.push(
           `  ${f.field}: differs — apply will set it (secret; value not printed)`,
@@ -578,6 +645,14 @@ export function renderDiff(report: DiffReport): string {
       `orphan ${o.kind} ${o.name} (live, not in manifest — removal is a manual runbook act)`,
     );
   }
+  // An undeclared volume is reported like an orphan resource, with the same
+  // disposition and a sharper reason: it holds data (cast#167).
+  for (const u of report.storagesUndeclared) {
+    for (const st of u.storages)
+      lines.push(
+        `undeclared storage ${st.name} on application ${u.name} (mounted at ${st.mount_path}) — apply never deletes a volume; declare it, or remove it by hand knowing what it holds`,
+      );
+  }
   // Printed as a FINDING, in its own paragraph, with the consequence attached —
   // not as a one-line entry in a list of things that are fine. The failure this
   // catches is green: the deploy worked, the health check passed, and this line
@@ -612,6 +687,12 @@ export function renderDiff(report: DiffReport): string {
     lines.push(
       `basic_auth on application ${b.name} declared, ${b.fields.join(", ")} NOT compared — verify in the Coolify UI`,
       `  (${b.reason})`,
+    );
+  }
+  for (const st of report.storagesNotCompared) {
+    lines.push(
+      `storages on application ${st.name} declared, NOT compared — verify in the Coolify UI`,
+      `  (${st.reason})`,
     );
   }
   const { placement } = report;
@@ -673,6 +754,10 @@ export function renderDiff(report: DiffReport): string {
     report.clean
       ? "clean"
       : `${report.changes.length} change(s), ${report.orphans.length} orphan(s)${
+          report.storagesUndeclared.length > 0
+            ? `, ${report.storagesUndeclared.reduce((n, u) => n + u.storages.length, 0)} undeclared storage(s)`
+            : ""
+        }${
           report.reserved.length > 0
             ? `, ${report.reserved.length} reserved-name FINDING(s)`
             : ""
@@ -683,4 +768,33 @@ export function renderDiff(report: DiffReport): string {
         }`,
   );
   return lines.join("\n");
+}
+
+// The per-storage lines of a `storages` field diff (cast#167). `desired` is the
+// declared list; `live` the live entries under the declared names (undefined on
+// a create). A storage absent live is created; one whose paths differ is
+// updated in place — its name never changes, because the name is how it is
+// matched, and Coolify stores it prefixed with the application's uuid.
+function renderStorageDiff(f: FieldDiff): string[] {
+  type St = { name: string; mount_path: string; host_path?: string };
+  const desired = (f.desired ?? []) as St[];
+  const live = new Map(((f.live ?? []) as St[]).map((st) => [st.name, st]));
+  const lines: string[] = [];
+  for (const st of desired) {
+    const was = live.get(st.name);
+    const where = `${st.mount_path}${st.host_path ? ` (host ${st.host_path})` : ""}`;
+    if (!was) {
+      lines.push(`  storage ${st.name}: create, mounted at ${where}`);
+      continue;
+    }
+    if (was.mount_path !== st.mount_path)
+      lines.push(
+        `  storage ${st.name}: mount_path ${JSON.stringify(was.mount_path)} → ${JSON.stringify(st.mount_path)}`,
+      );
+    if ((was.host_path ?? null) !== (st.host_path ?? null))
+      lines.push(
+        `  storage ${st.name}: host_path ${JSON.stringify(was.host_path ?? null)} → ${JSON.stringify(st.host_path ?? null)}`,
+      );
+  }
+  return lines;
 }

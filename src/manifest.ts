@@ -125,6 +125,50 @@ const ImageSchema = z
   })
   .strict();
 
+// A persistent volume on a non-compose application (cast#167): Coolify's
+// `LocalPersistentVolume`, written through POST /applications/{uuid}/storages.
+// Three rules come straight from Coolify 4.1.2 (ApplicationsController.php
+// create_storage / update_storage, ValidationPatterns.php), refused here at
+// parse time rather than as a 422 half-way through an apply:
+//
+//   - `name` matches VOLUME_NAME_PATTERN, `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`.
+//     Coolify stores the volume as `<application uuid>-<name>` — so the name
+//     a manifest declares is bound to the RESOURCE, and recreating the
+//     resource is a data migration, never an apply.
+//   - `host_path`, when given, matches DIRECTORY_PATH_PATTERN (an absolute
+//     path); omitted, the volume is a Docker named volume.
+//   - `mount_path` is where the container sees it. Coolify does not validate
+//     it on this route, so cast holds it to an absolute path: a relative mount
+//     is a volume mounted somewhere nobody meant.
+//
+// Only `persistent` storages. A `file` storage (a file or directory written
+// from the host) is the same route with a different shape; it is out of scope,
+// and `draft` names any it finds as not expressible.
+const COOLIFY_VOLUME_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+const StorageSchema = z
+  .object({
+    name: z
+      .string()
+      .regex(
+        COOLIFY_VOLUME_NAME,
+        "storages[].name must start with a letter or digit and hold only letters, digits, '.', '_' or '-' (Coolify's volume-name rule; it stores the volume as <application uuid>-<name>)",
+      ),
+    mount_path: z
+      .string()
+      .regex(
+        /^\/[a-zA-Z0-9._/~@+-]+$/,
+        "storages[].mount_path must be an absolute path inside the container, such as /data",
+      ),
+    host_path: z
+      .string()
+      .regex(
+        COOLIFY_DIRECTORY_PATH,
+        "storages[].host_path must be an absolute path on the server (Coolify 4.1.2 rejects the write otherwise); omit it for a Docker named volume",
+      )
+      .optional(),
+  })
+  .strict();
+
 // The packs Coolify clones a git source for. `dockerimage` is the one that does
 // not: its application is created from a registry image, through a different
 // route (POST /applications/dockerimage), and carries no `source`.
@@ -174,10 +218,35 @@ const AppSpecSchema = z
     domains: z.array(z.string()).optional(),
     service_domains: z.record(z.array(z.string())).optional(),
     basic_auth: BasicAuthSchema.optional(),
+    // Persistent volumes on a non-compose application (cast#167). A compose
+    // application's volumes are its compose file's, and are refused here.
+    storages: z.array(StorageSchema).optional(),
     env_template: z.string().optional(),
   })
   .strict()
   .superRefine((app, ctx) => {
+    // A volume is matched by its name and mounted at one path: two entries
+    // sharing either would be two claims on one thing, and apply could only
+    // honour one of them.
+    if (app.storages) {
+      for (const k of ["name", "mount_path"] as const) {
+        const seen = new Set<string>();
+        for (const st of app.storages) {
+          if (seen.has(st[k]))
+            ctx.addIssue({
+              code: "custom",
+              message: `storages: two entries share ${k} ${st[k]} (a storage is matched by name and mounted at one path)`,
+            });
+          seen.add(st[k]);
+        }
+      }
+      if (app.build.pack === "dockercompose")
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "storages not allowed on a dockercompose app (its volumes live in the compose file, under the service that mounts them)",
+        });
+    }
     // The dockerimage pack (cast#161): an application deployed from a registry
     // image, with no git source and nothing Coolify could build. Everything
     // that describes a checkout or a build is refused in the same shape as the

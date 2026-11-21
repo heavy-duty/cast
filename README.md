@@ -766,6 +766,53 @@ is a tiebreak, not a filter — a project with only one populated environment is
 drafted from it either way, which is what keeps the client sites (each alone in
 Coolify's default `production`) in a blueprint that claims to describe the box.
 
+## Keys the app owns: `owned_keys`
+
+Some applications set env vars on their own Coolify resource — an admin screen
+with a write token that flips a config flag or takes a rotated credential. For
+those keys cast is **break-glass**, and a break-glass `apply` must not revert
+what the app changed. Declare them, per application (or service), as a list of
+env var names or as a pointer to a JSON file in the product repo:
+
+```yaml
+admin:
+  image: { name: ghcr.io/heavy-duty/la-familia-admin, tag: stable }
+  build: { pack: dockerimage }
+  port: 8787
+  domains: []
+  env_template: admin.prod.env.template
+  owned_keys: { file: .infra/admin-editable.json }   # or: [MCP_ENABLED, MAILGUN_API_KEY]
+```
+
+The file is the product's own list: one array per env template **file name**
+(`"admin.prod.env.template": ["MCP_ENABLED", …]`), `_`-prefixed arrays that
+apply to **every** template pointing at the file, filtered to the keys each one
+declares (`"_secretos": ["MAILGUN_API_KEY", …]`), and `_`-prefixed strings as
+comments (`"_why": "…"`).
+
+- **On an existing resource** `apply` never overwrites or deletes an owned key
+  the resource already carries, and `diff --full` names those — never a value —
+  without counting them as drift:
+  `env on application admin: MAILGUN_API_KEY, MCP_ENABLED owned by the app — not compared`
+  An owned key **absent** live is written once (`env FOO: add — owned by the
+  app; absent live, written once`): that reverts nothing the app set, and
+  Coolify 4.1.2's single-key PATCH cannot create a key, so nothing else would.
+- **When `apply` creates the resource** (a first apply, a rebuild) it writes
+  them from the template and the store like any other key — a stale value beats
+  an empty one, and the app re-applies after — and the plan says so per key.
+- **The store still holds every owned secret ref**, on an existing resource
+  too: the template resolves whole before anything is compared. **`capture` is
+  unchanged** — it still reads every templated key into the store, owned or
+  not; run it before a break-glass apply.
+- **Validated before anything runs**, by `apply`, `diff` and `capture`: a
+  declared key its template does not declare, a shared name no template
+  pointing at the file declares, an entry that is no pointing template's file
+  name, or a missing file (or one that symlinks out of the repo) is a refusal —
+  the `generated_secrets` rule. Inline and per-template lists are checked for
+  the environment being run; only the shared lists are checked across
+  environments. A resource that resolves to no owned keys is a warning. See
+  [semantics.md](docs/semantics.md) → *Keys owned by the app*.
+
 ## Secrets, and attended applies
 
 An environment's age identity is resolved in exactly two ways:

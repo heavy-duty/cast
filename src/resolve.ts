@@ -15,6 +15,7 @@ import {
 } from "./envtemplate.js";
 import type { AppSpec, EnvironmentSpec } from "./manifest.js";
 import { loadManifest, storeRefName } from "./manifest.js";
+import { ownedKey, resolveOwnedKeys } from "./owned.js";
 import {
   type ReservedHit,
   assertNoReservedEnvNames,
@@ -470,6 +471,11 @@ export function requiredSecrets(
   // app/service is broken for every verb — but they never enter `required`: a
   // domain is manifest data, not a secret the store must hold.
   assertDomainRefs(envName, envSpec.applications, domainRefs);
+  // owned_keys (cast#177) are validated here too, and ONLY validated: capture
+  // is unchanged by them — it still reads every templated key, owned or not,
+  // because the store is what a created resource is written from. But a
+  // declaration naming a key no template carries is broken for every verb.
+  resolveOwnedKeys(checkoutDir, manifest, envName);
   const generated = envSpec.generated_secrets ?? [];
   // A generated_secrets entry naming something no template refs is dead
   // config — and dead config in THIS list is not merely untidy, it is
@@ -671,6 +677,14 @@ export function desiredFromManifest(
   // against it at plan time. assertDomainRefs at the end throws on any ref that
   // did not resolve, so the sentinel never escapes into a returned env.
   const domainMap = buildDomainMap(envSpec);
+  // Env keys the app owns (cast#177), per resource. Carried on the Desired
+  // entry beside its env, so the diff and apply — not this function — decide
+  // what "owned" means on a live resource versus one being created.
+  const owned = resolveOwnedKeys(checkoutDir, manifest, envName);
+  const ownedFor = (kind: "application" | "service", name: string) => {
+    const keys = owned[ownedKey(kind, name)];
+    return keys ? { ownedEnv: keys } : {};
+  };
   const resolveEnvFile = (
     name: string,
     template?: string,
@@ -812,6 +826,7 @@ export function desiredFromManifest(
         ...basicAuthFields(envName, name, app, secrets),
       },
       env: resolveEnvFile(name, app.env_template),
+      ...ownedFor("application", name),
     });
   }
   for (const [name, db] of Object.entries(envSpec.databases ?? {})) {
@@ -872,6 +887,7 @@ export function desiredFromManifest(
           : {}),
       },
       env: resolveEnvFile(name, svc.env_template),
+      ...ownedFor("service", name),
     });
   }
   // Before the caller can diff it, and long before apply can write it: a

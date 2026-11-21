@@ -264,13 +264,21 @@ export async function applyPlan(
         : c.envDiffs.some((e) => e.state !== "remove-candidate");
     if (needsEnv && spec?.env) {
       // Keys the app owns (cast#177) are written on a CREATE — a stale value
-      // beats an empty one, and the app re-applies after — and never on an
-      // update: the bulk route upserts every listed key, so leaving them out of
-      // the payload is what keeps an existing resource's values the app's.
-      // (The diff already left them out of `envDiffs`, so they cannot be what
-      // triggers this write either.)
+      // beats an empty one, and the app re-applies after. On an update only
+      // the ones the diff found ABSENT live are written (its owned `add`s);
+      // every other owned key is left out of the payload, because the bulk
+      // route upserts every listed key and absence from it is what keeps the
+      // app's values.
+      const writeOwned = new Set(
+        c.envDiffs.filter((e) => e.owned).map((e) => e.key),
+      );
       const env =
-        c.op === "create" ? spec.env : withoutOwnedEnv(spec.env, spec.ownedEnv);
+        c.op === "create"
+          ? spec.env
+          : withoutOwnedEnv(
+              spec.env,
+              (spec.ownedEnv ?? []).filter((k) => !writeOwned.has(k)),
+            );
       await exec.syncEnv(uuid, c.kind, env);
       didMutate = true;
     }

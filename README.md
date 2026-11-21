@@ -790,20 +790,28 @@ apply to **every** template pointing at the file, filtered to the keys each one
 declares (`"_secretos": ["MAILGUN_API_KEY", …]`), and `_`-prefixed strings as
 comments (`"_why": "…"`).
 
-- **On an existing resource** `apply` never writes, updates or deletes an owned
-  key, and `diff --full` names them — never a value — without counting them as
-  drift:
+- **On an existing resource** `apply` never overwrites or deletes an owned key
+  the resource already carries, and `diff --full` names those — never a value —
+  without counting them as drift:
   `env on application admin: MAILGUN_API_KEY, MCP_ENABLED owned by the app — not compared`
+  An owned key **absent** live is written once (`env FOO: add — owned by the
+  app; absent live, written once`): that reverts nothing the app set, and
+  Coolify 4.1.2's single-key PATCH cannot create a key, so nothing else would.
 - **When `apply` creates the resource** (a first apply, a rebuild) it writes
   them from the template and the store like any other key — a stale value beats
   an empty one, and the app re-applies after — and the plan says so per key.
-- **`capture` is unchanged**: it still reads every templated key into the store,
-  owned or not. Run it before a break-glass apply that may create a resource.
+- **The store still holds every owned secret ref**, on an existing resource
+  too: the template resolves whole before anything is compared. **`capture` is
+  unchanged** — it still reads every templated key into the store, owned or
+  not; run it before a break-glass apply.
 - **Validated before anything runs**, by `apply`, `diff` and `capture`: a
-  declared key its template does not declare, a shared name no template pointing at the file declares, an
-  entry that is no pointing template's file name, or a missing file is a refusal
-  — the `generated_secrets` rule, checked across every environment of the
-  manifest. See [semantics.md](docs/semantics.md) → *Keys owned by the app*.
+  declared key its template does not declare, a shared name no template
+  pointing at the file declares, an entry that is no pointing template's file
+  name, or a missing file (or one that symlinks out of the repo) is a refusal —
+  the `generated_secrets` rule. Inline and per-template lists are checked for
+  the environment being run; only the shared lists are checked across
+  environments. A resource that resolves to no owned keys is a warning. See
+  [semantics.md](docs/semantics.md) → *Keys owned by the app*.
 
 ## Secrets, and attended applies
 

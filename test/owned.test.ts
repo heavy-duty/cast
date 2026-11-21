@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type Executor, applyPlan } from "../src/apply.js";
@@ -197,10 +197,17 @@ describe("owned_keys — the pointer file", () => {
     );
   });
   it("refuses a file that is not JSON, or not an object", () => {
-    const bad = checkout({ file: "{ nope" });
-    expect(() => resolveOwnedKeys(bad, load(bad), "prod")).toThrow(
-      /is not valid JSON/,
-    );
+    const bad = checkout({ file: '{ "SECRET_LOOKING": nope' });
+    let message = "";
+    try {
+      resolveOwnedKeys(bad, load(bad), "prod");
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toMatch(/is not valid JSON/);
+    // The parser's own message quotes the file; cast's never does.
+    expect(message).not.toContain("nope");
+    expect(message).not.toContain("SECRET_LOOKING");
     const arr = checkout({ file: ["MCP_ENABLED"] });
     expect(() => resolveOwnedKeys(arr, load(arr), "prod")).toThrow(
       /must be a JSON object/,
@@ -213,8 +220,12 @@ describe("owned_keys — the pointer file", () => {
         "admin.staging.env.template": ["MCP_ENABLD"],
       },
     });
-    // Manifest-wide: a staging typo refuses a prod run too.
-    expect(() => resolveOwnedKeys(dir, load(dir), "prod")).toThrow(
+    // Per environment: a staging typo does not refuse a prod run...
+    expect(resolveOwnedKeys(dir, load(dir), "prod")).toEqual({
+      "application:admin": ["MAILGUN_API_KEY", "MCP_ENABLED", "UMAMI_API_KEY"],
+    });
+    // ...and refuses staging's.
+    expect(() => resolveOwnedKeys(dir, load(dir), "staging")).toThrow(
       /manifest environment staging: application admin: owned_keys file \.infra\/admin-editable\.json \("admin\.staging\.env\.template"\) names MCP_ENABLD, which its env template admin\.staging\.env\.template does not declare/,
     );
   });
@@ -240,6 +251,62 @@ describe("owned_keys — the pointer file", () => {
       /"_secretos" must be an array of env var names/,
     );
   });
+  it("a prod run with inline lists never opens staging's template", () => {
+    const dir = checkout({
+      prodOwned: "[MCP_ENABLED]",
+      stagingOwned: "[MCP_ENABLED]",
+    });
+    rmSync(join(dir, ".infra", "env", "admin.staging.env.template"));
+    expect(resolveOwnedKeys(dir, load(dir), "prod")).toEqual({
+      "application:admin": ["MCP_ENABLED"],
+    });
+  });
+  it("the shared-list check names another environment's missing template, and why it opened it", () => {
+    const dir = checkout({ file: LA_FAMILIA_SHAPE });
+    rmSync(join(dir, ".infra", "env", "admin.staging.env.template"));
+    expect(resolveOwnedKeys(dir, load(dir), "prod")).toEqual({
+      "application:admin": ["MAILGUN_API_KEY", "MCP_ENABLED", "UMAMI_API_KEY"],
+    });
+    // MAILGUN_API_KEY is in prod's template, so it resolves without staging's;
+    // a name only staging could vouch for needs staging's template.
+    const onlyStaging = checkout({
+      file: { ...LA_FAMILIA_SHAPE, _secretos: ["MAILGUN_API_KEY", "NOPE"] },
+    });
+    rmSync(join(onlyStaging, ".infra", "env", "admin.staging.env.template"));
+    expect(() =>
+      resolveOwnedKeys(onlyStaging, load(onlyStaging), "prod"),
+    ).toThrow(
+      /env template missing: .*admin\.staging\.env\.template \(referenced by application admin in staging\) — opened because "_secretos" in \.infra\/admin-editable\.json is a shared list/,
+    );
+  });
+  it("refuses a pointer that symlinks out of the checkout", () => {
+    const dir = checkout({});
+    const outside = tmp("cast-outside-");
+    writeFileSync(join(outside, "x.json"), JSON.stringify(LA_FAMILIA_SHAPE));
+    symlinkSync(
+      join(outside, "x.json"),
+      join(dir, ".infra", "admin-editable.json"),
+    );
+    expect(() => resolveOwnedKeys(dir, load(dir), "prod")).toThrow(
+      /resolves outside the repo checkout/,
+    );
+  });
+  it("warns, and does not refuse, when a resource resolves to no owned keys", () => {
+    const dir = checkout({
+      file: {
+        _why: "nothing yet",
+        "admin.prod.env.template": [],
+        "admin.staging.env.template": [],
+      },
+    });
+    const warnings: string[] = [];
+    expect(
+      resolveOwnedKeys(dir, load(dir), "prod", (m) => warnings.push(m)),
+    ).toEqual({});
+    expect(warnings).toEqual([
+      "manifest environment prod: application admin: owned_keys resolves to no keys for env template admin.prod.env.template — cast manages every key of it as usual",
+    ]);
+  });
   it("checks an inline list against its own template", () => {
     const ok = checkout({
       prodOwned: "[MCP_ENABLED, TOKEN_SECRET]",
@@ -252,7 +319,10 @@ describe("owned_keys — the pointer file", () => {
       prodOwned: "[UMAMI_API_KEY]",
       stagingOwned: "[UMAMI_API_KEY]",
     });
-    expect(() => resolveOwnedKeys(dead, load(dead), "prod")).toThrow(
+    expect(resolveOwnedKeys(dead, load(dead), "prod")).toEqual({
+      "application:admin": ["UMAMI_API_KEY"],
+    });
+    expect(() => resolveOwnedKeys(dead, load(dead), "staging")).toThrow(
       /environment staging: application admin: owned_keys names UMAMI_API_KEY, which its env template admin\.staging\.env\.template does not declare/,
     );
   });
@@ -389,13 +459,29 @@ describe("owned_keys — diff and apply", () => {
     expect(calls).toEqual([]);
     expect(r.mutated).toEqual([]);
   });
-  it("an owned key absent live is not proposed, and a live one is no orphan", () => {
+  it("an owned key absent live is written once, alone; a present one is no orphan and not written", async () => {
     const report = computeDiff(
       desired,
       live({ NODE_ENV: "production", MAILGUN_API_KEY: "x" }),
       "full",
     );
-    expect(report.changes).toEqual([]);
+    expect(report.clean).toBe(false);
+    expect(report.changes[0].envDiffs).toEqual([
+      { key: "MCP_ENABLED", state: "add", secret: false, owned: true },
+    ]);
+    expect(report.ownedNotCompared).toEqual([
+      { kind: "application", name: "admin", keys: ["MAILGUN_API_KEY"] },
+    ]);
+    const text = renderDiff(report);
+    expect(text).toContain(
+      "  env MCP_ENABLED: add — owned by the app; absent live, written once, never overwritten after",
+    );
+    expect(text).not.toContain("true");
+    const { envs, exec } = recorder();
+    await applyPlan(report, desired, exec);
+    // NODE_ENV rides along (it matches live; the bulk route upserts it to the
+    // same value) — what matters is that the present owned key does not.
+    expect(envs.u1).toEqual(["MCP_ENABLED", "NODE_ENV"]);
   });
   it("a generated-secret placeholder in an owned key is no conflict: nothing would be written", () => {
     const d: Desired[] = [
@@ -420,10 +506,10 @@ describe("owned_keys — diff and apply", () => {
     const report = computeDiff(desired, [], "full");
     const text = renderDiff(report);
     expect(text).toContain(
-      "  env MCP_ENABLED: add — owned by the app; written now because apply creates the resource, never compared or written again",
+      "  env MCP_ENABLED: add — owned by the app; written now because apply creates the resource, never overwritten after",
     );
     expect(text).toContain(
-      "  env MAILGUN_API_KEY: add — owned by the app; written now because apply creates the resource, never compared or written again",
+      "  env MAILGUN_API_KEY: add — owned by the app; written now because apply creates the resource, never overwritten after",
     );
     expect(text).not.toContain("store-value");
     expect(report.ownedNotCompared).toEqual([]);
@@ -438,5 +524,68 @@ describe("owned_keys — diff and apply", () => {
   it("a structural diff says nothing about owned keys (no env is read)", () => {
     const report = computeDiff(desired, live({}), "structural");
     expect(report.ownedNotCompared).toEqual([]);
+  });
+});
+
+describe("owned_keys — services", () => {
+  const svc: Desired[] = [
+    {
+      kind: "service",
+      name: "umami",
+      fields: { type: "umami" },
+      env: {
+        vars: {
+          DISABLE_TELEMETRY: { value: "1", secret: false },
+          APP_SECRET: { value: "store-secret", secret: true },
+        },
+      },
+      ownedEnv: ["APP_SECRET"],
+    },
+  ];
+  const envsOf = async (report: ReturnType<typeof computeDiff>) => {
+    const envs: Record<string, string[]> = {};
+    await applyPlan(report, svc, {
+      createResource: async () => "svc-new",
+      updateFields: async () => {},
+      syncEnv: async (uuid, _k, env) => {
+        envs[uuid] = Object.keys(env.vars).sort();
+      },
+      redeploy: async () => {},
+    });
+    return envs;
+  };
+  it("an existing service: the owned key is not compared and not written", async () => {
+    const report = computeDiff(
+      svc,
+      [
+        {
+          kind: "service",
+          name: "umami",
+          uuid: "svc-1",
+          fields: { type: "umami" },
+          env: {
+            DISABLE_TELEMETRY: { value: "0" },
+            APP_SECRET: { value: "x", realValue: "set-by-the-app" },
+          },
+        },
+      ],
+      "full",
+    );
+    expect(report.changes[0].envDiffs.map((e) => e.key)).toEqual([
+      "DISABLE_TELEMETRY",
+    ]);
+    expect(renderDiff(report)).toContain(
+      "env on service umami: APP_SECRET owned by the app — not compared",
+    );
+    expect(await envsOf(report)).toEqual({ "svc-1": ["DISABLE_TELEMETRY"] });
+  });
+  it("a created service: the owned key is written", async () => {
+    const report = computeDiff(svc, [], "full");
+    expect(renderDiff(report)).toContain(
+      "  env APP_SECRET: add — owned by the app; written now because apply creates the resource",
+    );
+    expect(await envsOf(report)).toEqual({
+      "svc-new": ["APP_SECRET", "DISABLE_TELEMETRY"],
+    });
   });
 });

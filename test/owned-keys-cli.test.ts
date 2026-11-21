@@ -26,6 +26,7 @@ const stubs: Stub[] = [];
 async function stubCoolify(
   app: Record<string, unknown> | null,
   liveEnv: Record<string, string>,
+  service: Record<string, unknown> | null = null,
 ): Promise<Stub> {
   const hits: string[] = [];
   const bodies: Record<string, unknown> = {};
@@ -60,7 +61,10 @@ async function stubCoolify(
       if (path === "/projects/p1/environments")
         return json([{ name: "staging" }]);
       if (path === "/projects/p1/staging")
-        return json({ applications: app === null ? [] : [app] });
+        return json({
+          applications: app === null ? [] : [app],
+          services: service === null ? [] : [service],
+        });
       if (path === "/applications" && req.method === "GET") return json([]);
       if (path === "/applications/dockerimage" && req.method === "POST")
         return json({ uuid: "app-1" });
@@ -76,6 +80,20 @@ async function stubCoolify(
           })),
         );
       if (path === "/applications/app-1/envs/bulk") return json({});
+      if (path === "/services" && req.method === "POST")
+        return json({ uuid: "svc-1" });
+      if (path === "/services/svc-1" && req.method === "GET")
+        return json({ uuid: "svc-1", applications: [] });
+      if (path === "/services/svc-1/envs" && req.method === "GET")
+        return json(
+          Object.entries(liveEnv).map(([key, value]) => ({
+            key,
+            value,
+            real_value: value,
+          })),
+        );
+      if (path === "/services/svc-1/envs/bulk") return json({});
+      if (path === "/services/svc-1/restart") return json({});
       if (path === "/deploy") return json({});
       res.writeHead(404);
       res.end("{}");
@@ -144,10 +162,10 @@ const TEMPLATE = [
   "",
 ].join("\n");
 
-function fixture(url: string) {
+function fixture(url: string, manifest = MANIFEST) {
   const checkout = tmp("cast-co-");
   mkdirSync(join(checkout, ".infra", "env"), { recursive: true });
-  writeFileSync(join(checkout, ".infra", "manifest.yaml"), MANIFEST);
+  writeFileSync(join(checkout, ".infra", "manifest.yaml"), manifest);
   writeFileSync(join(checkout, ".infra", "admin-editable.json"), OWNED_FILE);
   writeFileSync(
     join(checkout, ".infra", "env", "admin.staging.env.template"),
@@ -204,9 +222,9 @@ function run(
   });
 }
 
-const bulkKeys = (stub: Stub) =>
+const bulkKeys = (stub: Stub, route = "/applications/app-1/envs/bulk") =>
   (
-    stub.bodies["PATCH /applications/app-1/envs/bulk"] as {
+    stub.bodies[`PATCH ${route}`] as {
       data: Array<{ key: string; value: string }>;
     }
   ).data
@@ -228,6 +246,23 @@ describe("cast apply — owned_keys never reach an existing resource (cast#177)"
       "env on application admin: MCP_ENABLED, RELEASE_TO owned by the app — not compared",
     );
     expect(r.output).not.toContain("admin-chose@example.com");
+  });
+  it("writes an owned key absent live, and only that one (cast#177 review)", async () => {
+    const stub = await stubCoolify(liveApp(), {
+      NODE_ENV: "production",
+      RELEASE_TO: "admin-chose@example.com",
+    });
+    const r = await run(["apply"], fixture(stub.url));
+    expect(r.code, r.output).toBe(0);
+    // NODE_ENV matches live and is upserted to the same value; RELEASE_TO,
+    // owned and present, is not in the body.
+    expect(bulkKeys(stub)).toEqual(["MCP_ENABLED", "NODE_ENV"]);
+    expect(r.output).toContain(
+      "env MCP_ENABLED: add — owned by the app; absent live, written once, never overwritten after",
+    );
+    expect(r.output).toContain(
+      "env on application admin: RELEASE_TO owned by the app — not compared",
+    );
   });
   it("issues no write at all when only owned keys differ", async () => {
     const stub = await stubCoolify(liveApp(), {
@@ -283,5 +318,59 @@ describe("cast diff --full — owned keys are named, never valued (cast#177)", (
       "owned_keys file missing: .infra/admin-editable.json (named by application admin in staging)",
     );
     expect(stub.hits.filter((h) => !h.startsWith("GET"))).toEqual([]);
+  });
+});
+
+const SERVICE_MANIFEST = `project: widget
+environments:
+  staging:
+    applications: {}
+    services:
+      umami:
+        type: umami
+        env_template: admin.staging.env.template
+        owned_keys: [MCP_ENABLED]
+`;
+const liveService = () => ({
+  name: "umami",
+  uuid: "svc-1",
+  service_type: "umami",
+  destination_id: 1,
+});
+
+describe("cast apply — owned_keys on a service (cast#177)", () => {
+  it("an existing service: the owned key stays out of the bulk write", async () => {
+    const stub = await stubCoolify(
+      null,
+      {
+        NODE_ENV: "development",
+        MCP_ENABLED: "false",
+        RELEASE_TO: "ops@example.com",
+      },
+      liveService(),
+    );
+    const r = await run(["apply"], fixture(stub.url, SERVICE_MANIFEST));
+    expect(r.code, r.output).toBe(0);
+    expect(bulkKeys(stub, "/services/svc-1/envs/bulk")).toEqual([
+      "NODE_ENV",
+      "RELEASE_TO",
+    ]);
+    expect(r.output).toContain(
+      "env on service umami: MCP_ENABLED owned by the app — not compared",
+    );
+  });
+  it("a created service: the owned key is written", async () => {
+    const stub = await stubCoolify(null, {}, null);
+    const r = await run(["apply"], fixture(stub.url, SERVICE_MANIFEST));
+    expect(r.code, r.output).toBe(0);
+    expect(stub.hits).toContain("POST /services");
+    expect(bulkKeys(stub, "/services/svc-1/envs/bulk")).toEqual([
+      "MCP_ENABLED",
+      "NODE_ENV",
+      "RELEASE_TO",
+    ]);
+    expect(r.output).toContain(
+      "env MCP_ENABLED: add — owned by the app; written now because apply creates the resource",
+    );
   });
 });

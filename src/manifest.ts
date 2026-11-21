@@ -177,10 +177,12 @@ const NETWORK_ALIAS = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 
 // Env keys OWNED BY THE APP (cast#177): variables the application sets on its
 // own Coolify resource, with its own write token, so cast is break-glass for
-// them. On an EXISTING resource `apply` never writes, updates or deletes one and
-// `diff` names it as not compared; when `apply` CREATES the resource it writes
-// them from the template and store like any other key (a stale value beats an
-// empty one, and the app re-applies after). `capture` is unchanged.
+// them. On an EXISTING resource `apply` never overwrites or deletes one the
+// resource carries and `diff` names it as not compared (one ABSENT live is
+// written once — Coolify 4.1.2's single-key PATCH cannot create it); when
+// `apply` CREATES the resource it writes them from the template and store like
+// any other key (a stale value beats an empty one, and the app re-applies
+// after). `capture` is unchanged.
 //
 // Two spellings, both declarative:
 //

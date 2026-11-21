@@ -35,6 +35,10 @@ export type Desired = {
   name: string;
   fields: Record<string, unknown>;
   env?: ResolvedEnv;
+  // Env keys the app sets on this resource itself (cast#177, `owned_keys:`),
+  // each one a key of `env`. On a live resource they are neither compared nor
+  // written; on a create they are written with the rest of `env`.
+  ownedEnv?: string[];
 };
 export type Live = {
   kind: ResourceKind;
@@ -130,6 +134,9 @@ export type EnvDiff = {
   // reads as an unexplained secret drift. Still `secret`, so the value itself is
   // never printed either way (#60).
   derived?: string;
+  // Set on a CREATE's `add` for a key the app owns (cast#177): written now,
+  // because the resource is new, and never compared or written again.
+  owned?: true;
 };
 export type Change = {
   kind: ResourceKind;
@@ -199,6 +206,11 @@ export type DiffReport = {
   // (cast#167). Same disposition as backupsNotCompared: printed, NOT counted
   // against `clean`.
   storagesNotCompared: { name: string; reason: string }[];
+  // Env keys owned by the app on an EXISTING resource (cast#177): left out of
+  // the comparison, never written by apply, and named — never with a value — on
+  // every full diff. Same disposition as basicAuthNotCompared: printed, NOT
+  // counted against `clean`, because cast deliberately did not look.
+  ownedNotCompared: { kind: ResourceKind; name: string; keys: string[] }[];
   // Live persistent storages on an application that declares `storages:`, but
   // not under any declared name (cast#167). Reported and NEVER deleted — an
   // orphan volume holds data, and apply never removes anything. Counted against
@@ -384,6 +396,7 @@ export function computeDiff(
   const basicAuthNotCompared: DiffReport["basicAuthNotCompared"] = [];
   const storagesNotCompared: DiffReport["storagesNotCompared"] = [];
   const storagesUndeclared: DiffReport["storagesUndeclared"] = [];
+  const ownedNotCompared: DiffReport["ownedNotCompared"] = [];
   // is_static is unreadable on Coolify 4.1.2's read path (cast#68); warn once
   // per run when the degradation actually bites (a manifest declares `static:`
   // on an app whose live value cast could not read), not per application.
@@ -409,6 +422,7 @@ export function computeDiff(
                 ...(v.derived !== undefined
                   ? { derived: v.derived.resource }
                   : {}),
+                ...(d.ownedEnv?.includes(key) ? { owned: true as const } : {}),
               }))
             : [],
       });
@@ -512,8 +526,26 @@ export function computeDiff(
         live: liveFields[field],
         updatable: !NON_UPDATABLE[d.kind].includes(field),
       }));
+    // Owned keys (cast#177) leave the comparison on BOTH sides: dropped from
+    // the desired env, so nothing is proposed for them, and from the live one,
+    // so a key the app set is not read as an orphan either. Named instead.
+    const owned = new Set(d.ownedEnv ?? []);
+    if (mode === "full" && d.env && owned.size > 0)
+      ownedNotCompared.push({
+        kind: d.kind,
+        name: d.name,
+        keys: [...owned].sort(),
+      });
     const envDiffs =
-      mode === "full" && d.env ? diffEnv(d.env, l.env ?? {}, d.kind) : [];
+      mode === "full" && d.env
+        ? diffEnv(
+            withoutOwnedEnv(d.env, d.ownedEnv),
+            Object.fromEntries(
+              Object.entries(l.env ?? {}).filter(([k]) => !owned.has(k)),
+            ),
+            d.kind,
+          )
+        : [];
     if (fieldDiffs.length > 0 || envDiffs.length > 0) {
       changes.push({
         kind: d.kind,
@@ -540,6 +572,7 @@ export function computeDiff(
     basicAuthNotCompared,
     storagesNotCompared,
     storagesUndeclared,
+    ownedNotCompared,
     // A split project is drift, and drift is not clean — the same disposition
     // as an orphan: reported, counted, and NOT repaired (apply moves nothing
     // between networks; see renderDiff).
@@ -571,6 +604,22 @@ export function computeDiff(
 // Names the key and the resource — NEVER the live value. Same rule as capture's
 // disposition table: the point of the report is what to fix, not what the secret
 // is, and a secret printed to a terminal is a secret in a scrollback buffer.
+// A resolved env without the keys the app owns (cast#177) — what diff compares
+// and what apply writes on a resource that already exists. The one place the
+// subtraction is spelled, so the comparison and the write cannot disagree.
+export function withoutOwnedEnv(
+  env: ResolvedEnv,
+  owned: readonly string[] | undefined,
+): ResolvedEnv {
+  if (!owned || owned.length === 0) return env;
+  const skip = new Set(owned);
+  return {
+    vars: Object.fromEntries(
+      Object.entries(env.vars).filter(([k]) => !skip.has(k)),
+    ),
+  };
+}
+
 export function placeholderConflicts(
   report: DiffReport,
 ): Array<{ kind: ResourceKind; name: string; key: string }> {
@@ -612,7 +661,14 @@ export function renderDiff(report: DiffReport): string {
       );
     }
     for (const e of c.envDiffs) {
-      if (e.state === "remove-candidate")
+      // Said on the plan, per key, because it is the one write to an owned key
+      // cast ever makes (cast#177). Never the value — an owned key is often a
+      // credential.
+      if (e.owned)
+        lines.push(
+          `  env ${e.key}: add — owned by the app; written now because apply creates the resource, never compared or written again`,
+        );
+      else if (e.state === "remove-candidate")
         lines.push(
           `  env ${e.key}: live-only (orphan var — apply never removes)`,
         );
@@ -687,6 +743,14 @@ export function renderDiff(report: DiffReport): string {
     lines.push(
       `basic_auth on application ${b.name} declared, ${b.fields.join(", ")} NOT compared — verify in the Coolify UI`,
       `  (${b.reason})`,
+    );
+  }
+  // Every full diff of a resource with owned keys says so, by name and never
+  // by value — the basic_auth password rule (cast#177).
+  for (const o of report.ownedNotCompared) {
+    lines.push(
+      `env on ${o.kind} ${o.name}: ${o.keys.join(", ")} owned by the app — not compared`,
+      "  (owned_keys: the app sets these in Coolify itself; apply never writes, updates or deletes them on an existing resource)",
     );
   }
   for (const st of report.storagesNotCompared) {

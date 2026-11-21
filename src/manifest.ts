@@ -175,6 +175,82 @@ const StorageSchema = z
 // cast holds each entry to the shape that survives that round trip unchanged.
 const NETWORK_ALIAS = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 
+// Env keys OWNED BY THE APP (cast#177): variables the application sets on its
+// own Coolify resource, with its own write token, so cast is break-glass for
+// them. On an EXISTING resource `apply` never writes, updates or deletes one and
+// `diff` names it as not compared; when `apply` CREATES the resource it writes
+// them from the template and store like any other key (a stale value beats an
+// empty one, and the app re-applies after). `capture` is unchanged.
+//
+// Two spellings, both declarative:
+//
+//   owned_keys: [MCP_ENABLED, MAILGUN_API_KEY]       # inline, by env var KEY
+//   owned_keys: { file: .infra/admin-editable.json } # a JSON file in the repo
+//
+// The file is the product's own list (owned.ts reads it): one array per env
+// template FILE NAME, `_`-prefixed arrays that apply to every template pointing
+// at the file (filtered to the keys each one mentions), and `_`-prefixed
+// strings as comments. The shape is checked here; what needs the checkout — the
+// file itself, and whether each name is a key the template carries — is checked
+// by owned.ts wherever a template is opened, in the generated_secrets voice.
+export const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const OwnedKeysSchema = z.union(
+  [z.array(z.string()), z.object({ file: z.string() }).strict()],
+  {
+    errorMap: (issue, ctx) =>
+      issue.code === "invalid_union"
+        ? {
+            message:
+              "owned_keys is a list of env var names, or { file: <path to a JSON file in the repo> }",
+          }
+        : { message: ctx.defaultError },
+  },
+);
+export type OwnedKeysDecl = z.infer<typeof OwnedKeysSchema>;
+
+// The checks owned_keys needs that are a property of the manifest alone, shared
+// by applications and services.
+function refineOwnedKeys(
+  spec: { owned_keys?: OwnedKeysDecl; env_template?: string },
+  ctx: z.RefinementCtx,
+): void {
+  const owned = spec.owned_keys;
+  if (owned === undefined) return;
+  // A key the app owns is a key its template declares — with no template there
+  // is nothing it could name, and the declaration guards nothing.
+  if (spec.env_template === undefined)
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "owned_keys needs an env_template (an owned key is a key the template declares; without one it names nothing)",
+    });
+  if (Array.isArray(owned)) {
+    const seen = new Set<string>();
+    for (const k of owned) {
+      if (!ENV_KEY.test(k))
+        ctx.addIssue({
+          code: "custom",
+          message: `owned_keys: ${JSON.stringify(k)} is not an env var name`,
+        });
+      if (seen.has(k))
+        ctx.addIssue({
+          code: "custom",
+          message: `owned_keys: ${k} is listed twice`,
+        });
+      seen.add(k);
+    }
+  } else if (
+    !/\.json$/.test(owned.file) ||
+    owned.file.startsWith("/") ||
+    owned.file.split("/").some((seg) => seg === ".." || seg === "")
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message: `owned_keys.file must be a relative path to a .json file inside the repo, such as .infra/admin-editable.json (got ${JSON.stringify(owned.file)})`,
+    });
+  }
+}
+
 // The packs Coolify clones a git source for. `dockerimage` is the one that does
 // not: its application is created from a registry image, through a different
 // route (POST /applications/dockerimage), and carries no `source`.
@@ -242,9 +318,11 @@ const AppSpecSchema = z
       )
       .optional(),
     env_template: z.string().optional(),
+    owned_keys: OwnedKeysSchema.optional(),
   })
   .strict()
   .superRefine((app, ctx) => {
+    refineOwnedKeys(app, ctx);
     if (app.network_aliases) {
       const seen = new Set<string>();
       for (const alias of app.network_aliases) {
@@ -446,8 +524,12 @@ const ServiceSpecSchema = z
     // `service.applications[].fqdn`, and diffed like any other field.
     service_domains: z.record(z.array(z.string())).optional(),
     env_template: z.string().optional(),
+    // Keys the service's own app sets in Coolify (cast#177) — the application
+    // rule, unchanged.
+    owned_keys: OwnedKeysSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(refineOwnedKeys);
 
 const EnvironmentSpecSchema = z
   .object({

@@ -766,6 +766,45 @@ is a tiebreak, not a filter — a project with only one populated environment is
 drafted from it either way, which is what keeps the client sites (each alone in
 Coolify's default `production`) in a blueprint that claims to describe the box.
 
+## Keys the app owns: `owned_keys`
+
+Some applications set env vars on their own Coolify resource — an admin screen
+with a write token that flips a config flag or takes a rotated credential. For
+those keys cast is **break-glass**, and a break-glass `apply` must not revert
+what the app changed. Declare them, per application (or service), as a list of
+env var names or as a pointer to a JSON file in the product repo:
+
+```yaml
+admin:
+  image: { name: ghcr.io/heavy-duty/la-familia-admin, tag: stable }
+  build: { pack: dockerimage }
+  port: 8787
+  domains: []
+  env_template: admin.prod.env.template
+  owned_keys: { file: .infra/admin-editable.json }   # or: [MCP_ENABLED, MAILGUN_API_KEY]
+```
+
+The file is the product's own list: one array per env template **file name**
+(`"admin.prod.env.template": ["MCP_ENABLED", …]`), `_`-prefixed arrays that
+apply to **every** template pointing at the file, filtered to the keys each one
+declares (`"_secretos": ["MAILGUN_API_KEY", …]`), and `_`-prefixed strings as
+comments (`"_why": "…"`).
+
+- **On an existing resource** `apply` never writes, updates or deletes an owned
+  key, and `diff --full` names them — never a value — without counting them as
+  drift:
+  `env on application admin: MAILGUN_API_KEY, MCP_ENABLED owned by the app — not compared`
+- **When `apply` creates the resource** (a first apply, a rebuild) it writes
+  them from the template and the store like any other key — a stale value beats
+  an empty one, and the app re-applies after — and the plan says so per key.
+- **`capture` is unchanged**: it still reads every templated key into the store,
+  owned or not. Run it before a break-glass apply that may create a resource.
+- **Validated before anything runs**, by `apply`, `diff` and `capture`: a
+  declared key its template does not declare, a shared name no template pointing at the file declares, an
+  entry that is no pointing template's file name, or a missing file is a refusal
+  — the `generated_secrets` rule, checked across every environment of the
+  manifest. See [semantics.md](docs/semantics.md) → *Keys owned by the app*.
+
 ## Secrets, and attended applies
 
 An environment's age identity is resolved in exactly two ways:

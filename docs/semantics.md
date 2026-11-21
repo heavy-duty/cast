@@ -513,6 +513,108 @@ Nothing here applies to cast's own config vars (`COOLIFY_BASE_URL`,
 `COOLIFY_ACCESS_TOKEN`, `COOLIFY_READ_ONLY`): those are read from the operator's
 local instance file and are never written to a resource.
 
+## Keys owned by the app (`owned_keys:`)
+
+An application or service can declare env keys **the app sets in Coolify
+itself** (cast#177) — an admin with a write token that changes a config literal
+or takes a rotated credential. cast is break-glass for those keys: before this,
+a break-glass `apply` wrote every key from the template and the store, so it
+**reverted** what the app had changed (a rotated secret back to the stale store
+value, a flag back to an unmerged template line).
+
+```yaml
+applications:
+  admin:
+    env_template: admin.prod.env.template
+    owned_keys: { file: .infra/admin-editable.json }
+    # or inline:  owned_keys: [MCP_ENABLED, MAILGUN_API_KEY]
+```
+
+Names are env var **keys** — the left-hand side of a template line — not store
+refs: `MAILGUN_API_KEY=${MAILGUN_API_KEY}` is owned as `MAILGUN_API_KEY` whatever
+its ref is called.
+
+### The pointer file
+
+The file lives in the product repo, at a path relative to its root (absolute
+paths, `..` and anything but `.json` are schema errors). It is the product's own
+list, read as it is written:
+
+```json
+{
+  "_why": "What the admin may change, by template.",
+  "_secretos": ["MAILGUN_API_KEY", "UMAMI_API_KEY"],
+  "admin.prod.env.template": ["MCP_ENABLED", "RELEASE_TO"],
+  "admin.staging.env.template": ["MCP_ENABLED", "RELEASE_TO"]
+}
+```
+
+| entry | means |
+| --- | --- |
+| an env template file name | the keys owned on a resource whose `env_template` is that file |
+| `_`-prefixed, an array | keys owned on **every** resource pointing at the file, filtered to the keys its template declares |
+| `_`-prefixed, a string | a comment |
+
+A resource's owned keys are its template's own list plus the shared lists'
+names its template declares. The filter is what lets one credential list cover
+prod and staging when staging does not carry every credential.
+
+### Refusals
+
+Checked by `apply`, `diff` and `capture`, before
+anything is read from or written to Coolify, in the voice of the
+dead-`generated_secrets` check — an owned key that matches nothing guards
+nothing, and if it is a typo, the key it meant to guard is overwritten by the
+next break-glass apply:
+
+- `owned_keys` without an `env_template`; a name that is not an env var name; a
+  name listed twice; an unknown key in the pointer (schema);
+- an inline or per-template name its own template does not declare;
+- a shared name no template pointing at the file declares;
+- a file entry that is not the `env_template` of any resource pointing at it (a
+  renamed template would otherwise leave its keys unguarded, silently);
+- a missing file, a file that is not JSON, not an object, or whose entries are
+  not arrays of names.
+
+**Manifest-wide, not per environment.** A shared list spans tiers, so whether
+one of its names is dead is a question about every template in every
+environment; the per-template and inline lists are checked in the same pass. A
+staging typo therefore refuses a prod run too — the price of one rule for all
+three spellings.
+
+### What each verb does
+
+- **`diff --full`, existing resource** — owned keys leave the comparison on
+  both sides: nothing is proposed for them, and a live one is not an orphan. They
+  are named, never valued, on every run, and **not** counted against `clean` (the
+  `basic_auth` password disposition: cast deliberately did not look):
+
+  ```
+  env on application admin: MAILGUN_API_KEY, MCP_ENABLED owned by the app — not compared
+    (owned_keys: the app sets these in Coolify itself; apply never writes, updates or deletes them on an existing resource)
+  ```
+
+  A generated-secret placeholder in an owned key is therefore no conflict
+  either: nothing would be written over the live value.
+- **`apply`, existing resource** — the bulk env write leaves owned keys out of
+  its payload. The route upserts listed keys only (what `cast smoke` proves), so
+  absence from the payload is what keeps the app's values. When only owned keys
+  differ, nothing is written and nothing is redeployed. `apply` never deletes an
+  env var, owned or not.
+- **`apply`, created resource** (a first apply, a rebuild from state) — owned
+  keys **are** written from the template and the store with every other key: a
+  stale value beats an empty one, and the app re-applies after. The plan says so
+  per key:
+
+  ```
+  create application admin
+    env MCP_ENABLED: add — owned by the app; written now because apply creates the resource, never compared or written again
+  ```
+- **`capture`** — unchanged. It still reads every templated key, owned or not,
+  into the store, because the store is what a created resource is written from.
+  That is the operator's rule before a break-glass apply: `cast capture` first.
+- **structural `diff`** — reads no env, so says nothing about owned keys.
+
 ## The registry (`projects:`)
 
 The top-level `projects:` block is the list of **which projects exist**, and in

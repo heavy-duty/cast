@@ -7,6 +7,10 @@ actually cutting it, and this file starts there.
 
 ## Unreleased
 
+### Added
+
+- `owned_keys:` on an application or service names env keys the app sets itself, inline or as `{ file: <json> }`: `apply` never writes them on an existing resource, writes them on create, and `diff` reports them as not compared (#177)
+
 ## 0.4.1 — 2026-09-25
 
 ### Added
